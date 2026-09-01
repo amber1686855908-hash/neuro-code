@@ -14,9 +14,10 @@ trees, background-task lifecycle support, and optional OS sandbox enforcement.
 Replacing it with a client call would make shell choice platform-dependent and
 could silently bypass an explicit sandbox.
 
-The standard ACP terminal surface is also narrower than an interactive PTY: it
-has no portable shell-selection contract, terminal input, resize, cursor reads,
-or a background-task lifecycle.
+At this ADR's acceptance, the standard ACP terminal surface was also narrower
+than an interactive PTY: it had no portable shell-selection contract, terminal
+input, resize, cursor reads, or a background-task lifecycle in the Neuro Code
+adapter.
 
 ## Decision
 
@@ -49,5 +50,6 @@ or a background-task lifecycle.
 - An explicit sandbox never gains an unconfined alternative execution path:
   `terminal_exec` is absent and direct calls fail closed.
 - The result remains intentionally smaller than a cross-platform shell or
-  interactive-terminal API. Those behaviors require separate capability and
-  lifecycle design.
+  interactive-terminal API. Interactive input, resize, PTY framing/backpressure,
+  and a general terminal protocol proxy remain outside this decision and require
+  separate capability and lifecycle design.

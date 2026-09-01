@@ -25,6 +25,10 @@ from typing import Protocol, runtime_checkable
 
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.runtime.agent import AgentRunResult, EventSink
+from neuro_code.application.workflows.subagent_capabilities import (
+    MAX_SUBAGENT_STEPS,
+    SubagentCapabilitySet,
+)
 from neuro_code.domain.execution import AgentExecutionOutcome
 from neuro_code.domain.session_tasks import (
     SessionTask,
@@ -36,7 +40,6 @@ from neuro_code.shared.errors import ConfigurationError, SubagentTimeoutError
 from neuro_code.shared.redaction import redact_sensitive_text
 
 MAX_SUBAGENT_PROMPT_BYTES = 16 * 1024
-MAX_SUBAGENT_STEPS = 12
 MAX_SUBAGENT_SESSION_ID_BYTES = 512
 MAX_SUBAGENT_TIMEOUT_SECONDS = 300.0
 MAX_SUBAGENT_RESULT_BYTES = 32 * 1024
@@ -78,14 +81,14 @@ class RunSubagentRequest:
 
 @runtime_checkable
 class SubagentExecutor(Protocol):
-    """Execute one isolated request without owning task persistence.
+    """Execute one legacy request without owning task persistence.
 
-    The implementation must create a fresh child runtime/context and must
-    not reuse the parent conversation.  Tool and permission capabilities are
-    selected by that implementation, not by this lifecycle service.
+    This is a compatibility/test seam only.  It is not a capability-aware
+    child-runtime boundary; production entrypoints use
+    :class:`IsolatedSubagentExecutionService` instead.
 
-    执行一次隔离请求但不负责任务持久化. 实现必须创建新的子运行时/上下文,
-    不得复用父会话;工具和权限能力由实现选择,而非由本生命周期服务决定.
+    执行一次旧版请求但不负责任务持久化. 这只是兼容/测试接缝,不是 capability-aware
+    子运行时边界;生产入口使用 `IsolatedSubagentExecutionService`.
     """
 
     async def run(
@@ -97,6 +100,17 @@ class SubagentExecutor(Protocol):
 
 
 SubagentExecutorFactory = Callable[[], SubagentExecutor]
+
+
+class SubagentCapabilityRequestFactory(Protocol):
+    """Build a child capability request from an actual parent manifest."""
+
+    def __call__(
+        self,
+        request: RunSubagentRequest,
+        *,
+        parent_capabilities: SubagentCapabilitySet,
+    ) -> SubagentCapabilitySet: ...
 
 
 @runtime_checkable
@@ -113,6 +127,9 @@ class IsolatedSubagentRuntime(Protocol):
     @property
     def child_session_id(self) -> str: ...
 
+    @property
+    def capability_fingerprint(self) -> str: ...
+
     async def run(
         self,
         prompt: str,
@@ -125,13 +142,21 @@ class IsolatedSubagentRuntime(Protocol):
 
 @runtime_checkable
 class IsolatedSubagentRuntimeFactory(Protocol):
-    """Create one fresh, capability-restricted child runtime."""
+    """Create one fresh child runtime after capability resolution."""
+
+    def requested_capabilities(
+        self,
+        request: RunSubagentRequest,
+        *,
+        parent_capabilities: SubagentCapabilitySet,
+    ) -> SubagentCapabilitySet: ...
 
     async def create(
         self,
         request: RunSubagentRequest,
         *,
         parent_task_id: str,
+        capabilities: SubagentCapabilitySet,
     ) -> IsolatedSubagentRuntime: ...
 
 
@@ -229,6 +254,7 @@ class SubagentExecutionController(Protocol):
         self,
         request: RunSubagentRequest,
         *,
+        parent_capabilities: SubagentCapabilitySet,
         sink: EventSink | None = None,
     ) -> SubagentRunResult: ...
 
@@ -262,12 +288,22 @@ class ReadOnlySubagentApplicationService:
         self._redaction_values = tuple(value for value in redaction_values if value)
         self._max_result_bytes = _validate_result_limit(max_result_bytes)
 
-    async def run_subagent(self, request: RunSubagentRequest) -> SubagentResultProjection:
+    async def run_subagent(
+        self,
+        request: RunSubagentRequest,
+        *,
+        parent_capabilities: SubagentCapabilitySet,
+    ) -> SubagentResultProjection:
         """Run once and return only the bounded, redacted child result."""
 
         if not isinstance(request, RunSubagentRequest):
             raise ValueError("run subagent request must be canonical")
-        run_result = await self._controller.run_subagent(request)
+        if not isinstance(parent_capabilities, SubagentCapabilitySet):
+            raise ConfigurationError("parent subagent capability metadata is required")
+        run_result = await self._controller.run_subagent(
+            request,
+            parent_capabilities=parent_capabilities,
+        )
         link = run_result.link
         if link is None or link.parent_session_id != request.parent_session_id:
             raise ConfigurationError("subagent result does not contain its parent link")
@@ -307,13 +343,22 @@ class IsolatedSubagentExecutionService:
     因此即使后续失败或取消,重启后仍能找到子会话.
     """
 
-    __slots__ = ("_lock", "_runtime_factory", "_store", "_timeout_seconds")
+    __slots__ = (
+        "_global_policy",
+        "_lock",
+        "_requested_capability_factory",
+        "_runtime_factory",
+        "_store",
+        "_timeout_seconds",
+    )
 
     def __init__(
         self,
         store: SessionStore,
         runtime_factory: IsolatedSubagentRuntimeFactory,
         *,
+        global_policy: SubagentCapabilitySet,
+        requested_capability_factory: SubagentCapabilityRequestFactory,
         timeout_seconds: float = 120.0,
     ) -> None:
         if (
@@ -328,8 +373,14 @@ class IsolatedSubagentExecutionService:
             )
         if not isinstance(runtime_factory, IsolatedSubagentRuntimeFactory):
             raise ConfigurationError("isolated subagent runtime factory is invalid")
+        if not isinstance(global_policy, SubagentCapabilitySet):
+            raise ConfigurationError("global subagent capability policy is required")
+        if not callable(requested_capability_factory):
+            raise ConfigurationError("subagent capability request factory is invalid")
         self._store = store
         self._runtime_factory = runtime_factory
+        self._global_policy = global_policy
+        self._requested_capability_factory = requested_capability_factory
         self._timeout_seconds = float(timeout_seconds)
         self._lock = asyncio.Lock()
 
@@ -337,12 +388,26 @@ class IsolatedSubagentExecutionService:
         self,
         request: RunSubagentRequest,
         *,
+        parent_capabilities: SubagentCapabilitySet,
         sink: EventSink | None = None,
     ) -> SubagentRunResult:
         """Create ownership, run once, and preserve failure/cancellation semantics."""
 
         if not isinstance(request, RunSubagentRequest):
             raise ValueError("run subagent request must be canonical")
+        if not isinstance(parent_capabilities, SubagentCapabilitySet):
+            raise ConfigurationError("parent subagent capability metadata is required")
+        requested_capabilities = self._requested_capability_factory(
+            request,
+            parent_capabilities=parent_capabilities,
+        )
+        if not isinstance(requested_capabilities, SubagentCapabilitySet):
+            raise ConfigurationError("subagent capability request is not canonical")
+        effective_capabilities = SubagentCapabilitySet.resolve_child(
+            parent=parent_capabilities,
+            requested=requested_capabilities,
+            global_policy=self._global_policy,
+        )
         async with self._lock:
             task = SessionTask(
                 f"subagent-{uuid.uuid4().hex}",
@@ -357,10 +422,15 @@ class IsolatedSubagentExecutionService:
                 runtime = await self._runtime_factory.create(
                     request,
                     parent_task_id=task.task_id,
+                    capabilities=effective_capabilities,
                 )
                 if not isinstance(runtime, IsolatedSubagentRuntime):
                     raise ConfigurationError(
                         "isolated subagent factory returned an invalid runtime"
+                    )
+                if runtime.capability_fingerprint != effective_capabilities.fingerprint:
+                    raise ConfigurationError(
+                        "isolated subagent runtime capability metadata is inconsistent"
                     )
                 link = SubagentLink(
                     request.parent_session_id,
@@ -560,6 +630,7 @@ __all__ = [
     "IsolatedSubagentRuntimeFactory",
     "ReadOnlySubagentApplicationService",
     "RunSubagentRequest",
+    "SubagentCapabilityRequestFactory",
     "SubagentExecutionController",
     "SubagentExecutionService",
     "SubagentExecutor",

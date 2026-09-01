@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,7 @@ class RawAcpProcess:
         self.stdin = process.stdin
         self.stdout = process.stdout
         self.stderr = process.stderr
+        self._readline_task: asyncio.Task[bytes] | None = None
 
     @classmethod
     async def start(cls, root: Path) -> RawAcpProcess:
@@ -69,8 +71,21 @@ proxy_mode = "direct"
         self.stdin.write(payload)
         await self.stdin.drain()
 
-    async def response(self, *, wait_seconds: float = 2.0) -> dict[str, Any]:
-        line = await asyncio.wait_for(self.stdout.readline(), timeout=wait_seconds)
+    def _next_line_task(self) -> asyncio.Task[bytes]:
+        if self._readline_task is None:
+            self._readline_task = asyncio.create_task(self.stdout.readline())
+        return self._readline_task
+
+    async def _next_line(self, *, wait_seconds: float) -> bytes:
+        task = self._next_line_task()
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=wait_seconds)
+        finally:
+            if task.done() and self._readline_task is task:
+                self._readline_task = None
+
+    async def response(self, *, wait_seconds: float = 5.0) -> dict[str, Any]:
+        line = await self._next_line(wait_seconds=wait_seconds)
         if not line:
             raise AssertionError("ACP process closed stdout before returning a response")
         parsed = json.loads(line)
@@ -80,9 +95,11 @@ proxy_mode = "direct"
 
     async def expect_no_response(self, *, wait_seconds: float = 0.15) -> None:
         try:
-            await asyncio.wait_for(self.stdout.readline(), timeout=wait_seconds)
+            line = await self._next_line(wait_seconds=wait_seconds)
         except TimeoutError:
             return
+        if not line:
+            raise AssertionError("ACP process closed stdout before returning a response")
         raise AssertionError("ACP process unexpectedly wrote a stdout frame")
 
     async def initialize(self, request_id: int = 1) -> dict[str, Any]:
@@ -111,6 +128,11 @@ proxy_mode = "direct"
         except TimeoutError:
             self.process.terminate()
             await self.process.wait()
+        if self._readline_task is not None and not self._readline_task.done():
+            self._readline_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._readline_task
+        self._readline_task = None
         return (await self.stderr.read()).decode("utf-8", "replace")
 
 

@@ -819,6 +819,7 @@ def test_canonical_shared_modules_are_the_only_shared_implementations() -> None:
         "neuro_code.shared",
         "neuro_code.shared.async_utils",
         "neuro_code.shared.errors",
+        "neuro_code.shared.limits",
         "neuro_code.shared.redaction",
         "neuro_code.shared.ui_language",
     }
@@ -837,21 +838,35 @@ def test_canonical_ports_are_the_only_port_modules() -> None:
     canonical_modules = {
         "neuro_code.application.ports",
         "neuro_code.application.ports.approval",
+        "neuro_code.application.ports.agent_swarm",
         "neuro_code.application.ports.background_tasks",
         "neuro_code.application.ports.client_filesystem",
         "neuro_code.application.ports.client_terminal",
+        "neuro_code.application.ports.checkpoints",
         "neuro_code.application.ports.http",
         "neuro_code.application.ports.instructions",
+        "neuro_code.application.ports.leader",
+        "neuro_code.application.ports.lsp",
+        "neuro_code.application.ports.mcp",
         "neuro_code.application.ports.model",
+        "neuro_code.application.ports.model_planning",
+        "neuro_code.application.ports.parent_context_relay",
+        "neuro_code.application.ports.task_dag",
+        "neuro_code.application.ports.task_dag_replan",
+        "neuro_code.application.ports.task_dag_recovery",
+        "neuro_code.application.ports.task_dag_result_relay",
         "neuro_code.application.ports.provider_catalog",
         "neuro_code.application.ports.provider_services",
         "neuro_code.application.ports.provider_settings",
+        "neuro_code.application.ports.result_adoption",
         "neuro_code.application.ports.routing",
         "neuro_code.application.ports.sandbox",
         "neuro_code.application.ports.skills",
         "neuro_code.application.ports.storage",
         "neuro_code.application.ports.terminal",
+        "neuro_code.application.ports.tool_pipeline",
         "neuro_code.application.ports.tools",
+        "neuro_code.application.ports.ultracode",
         "neuro_code.application.ports.user_interaction",
         "neuro_code.application.ports.web_fetch",
         "neuro_code.application.ports.ui_preferences",
@@ -859,6 +874,8 @@ def test_canonical_ports_are_the_only_port_modules() -> None:
         "neuro_code.application.ports.workspace",
         "neuro_code.application.ports.workspace_changes",
         "neuro_code.application.ports.windows_sandbox",
+        "neuro_code.application.ports.worktree",
+        "neuro_code.application.ports.writable_subagent",
     }
     assert {
         module for module in modules if module.startswith("neuro_code.application.ports")
@@ -875,6 +892,9 @@ def test_canonical_persistence_modules_are_the_only_persistence_implementations(
     canonical_modules = {
         "neuro_code.infrastructure.persistence",
         "neuro_code.infrastructure.persistence.output_artifacts",
+        "neuro_code.infrastructure.persistence.checkpoint_artifacts",
+        "neuro_code.infrastructure.persistence.managed_worktrees",
+        "neuro_code.infrastructure.persistence.workspace_checkpoints",
         "neuro_code.infrastructure.persistence.rust_session",
         "neuro_code.infrastructure.persistence.sqlite_session",
         "neuro_code.infrastructure.persistence.ui_preferences",
@@ -908,8 +928,10 @@ def test_canonical_workspace_modules_are_the_only_workspace_implementations() ->
     canonical_modules = {
         "neuro_code.infrastructure.workspace",
         "neuro_code.infrastructure.workspace.changes",
+        "neuro_code.infrastructure.workspace.checkpoints",
         "neuro_code.infrastructure.workspace.instructions",
         "neuro_code.infrastructure.workspace.paths",
+        "neuro_code.infrastructure.workspace.projection",
         "neuro_code.infrastructure.workspace.skills",
     }
     assert {
@@ -922,7 +944,10 @@ def test_canonical_provider_modules_are_the_only_provider_implementations() -> N
     canonical_modules = {
         "neuro_code.infrastructure.providers",
         "neuro_code.infrastructure.providers.anthropic",
+        "neuro_code.infrastructure.providers.catalog_cache",
         "neuro_code.infrastructure.providers.failover",
+        "neuro_code.infrastructure.providers.failure_conformance",
+        "neuro_code.infrastructure.providers.failure_policy",
         "neuro_code.infrastructure.providers.gemini",
         "neuro_code.infrastructure.providers.gemini_interactions",
         "neuro_code.infrastructure.providers.image_references",
@@ -931,6 +956,7 @@ def test_canonical_provider_modules_are_the_only_provider_implementations() -> N
         "neuro_code.infrastructure.providers.provider_catalog",
         "neuro_code.infrastructure.providers.provider_settings",
         "neuro_code.infrastructure.providers.hosted_web_search",
+        "neuro_code.infrastructure.providers.resilience",
     }
     assert {
         module for module in modules if module.startswith("neuro_code.infrastructure.providers")
@@ -946,6 +972,7 @@ def test_canonical_tool_modules_are_the_only_tool_implementations() -> None:
         "neuro_code.infrastructure.tools.client_terminal",
         "neuro_code.infrastructure.tools.filesystem",
         "neuro_code.infrastructure.tools.interaction",
+        "neuro_code.infrastructure.tools.lsp",
         "neuro_code.infrastructure.tools.plans",
         "neuro_code.infrastructure.tools.registry",
         "neuro_code.infrastructure.tools.skills",
@@ -1035,7 +1062,9 @@ def test_canonical_runtime_modules_are_the_only_runtime_implementations() -> Non
         "neuro_code.application.runtime.event_recorder",
         "neuro_code.application.runtime.finalization",
         "neuro_code.application.runtime.model_step",
+        "neuro_code.application.runtime.process_liveness",
         "neuro_code.application.runtime.supervision",
+        "neuro_code.application.runtime.tool_scheduler",
         "neuro_code.application.runtime.tool_pipeline",
     }
     assert {
@@ -1049,7 +1078,11 @@ def test_canonical_runtime_modules_are_the_only_runtime_implementations() -> Non
 
     expected_classes = {
         "neuro_code.application.runtime.agent": {"AgentRuntime"},
-        "neuro_code.application.runtime.agent_loop": {"AgentLoopRunner", "AgentRunResult"},
+        "neuro_code.application.runtime.agent_loop": {
+            "AgentLoopRunner",
+            "AgentRunResult",
+            "_ScheduledToolOutcome",
+        },
         "neuro_code.application.runtime.context_builder": {"ContextBuilder"},
         "neuro_code.application.runtime.event_recorder": {"TurnEventRecorder"},
         "neuro_code.application.runtime.model_step": {
@@ -1154,6 +1187,7 @@ def test_canonical_session_modules_are_the_only_session_implementations() -> Non
         "neuro_code.application.sessions.lifecycle",
         "neuro_code.application.sessions.item_queries",
         "neuro_code.application.sessions.profile_conversation",
+        "neuro_code.application.sessions.recovery",
         "neuro_code.application.sessions.selection",
         "neuro_code.application.sessions.service",
         "neuro_code.application.sessions.summary",
@@ -1182,9 +1216,15 @@ def test_canonical_session_modules_are_the_only_session_implementations() -> Non
         "neuro_code.application.sessions.profile_conversation": {
             "ProfileConversationController",
         },
+        "neuro_code.application.sessions.recovery": {
+            "TurnInputForRetry",
+            "TurnRecoveryInspection",
+            "TurnRecoveryService",
+        },
         "neuro_code.application.sessions.binding": {
             "ConversationRunner",
             "ConversationBinding",
+            "ConversationBindingResourceScope",
         },
         "neuro_code.application.sessions.catalog": {
             "ListSessionsPageRequest",
@@ -1380,10 +1420,25 @@ def test_canonical_runtime_consumers_use_explicit_submodules() -> None:
             "neuro_code.application.sessions.lifecycle",
             "neuro_code.application.sessions.service",
             "neuro_code.application.tools.service",
+            "neuro_code.interfaces.cli.sessions",
         },
         "neuro_code.interfaces.cli.serialization": {
             "neuro_code.application.sessions.catalog",
             "neuro_code.application.tools.service",
+        },
+        "neuro_code.interfaces.cli.sessions": {
+            "neuro_code.application.memory.compaction_runtime",
+            "neuro_code.application.ports.storage",
+            "neuro_code.application.ports.tools",
+            "neuro_code.application.runtime.agent",
+            "neuro_code.application.sessions.catalog",
+            "neuro_code.application.sessions.lifecycle",
+            "neuro_code.application.sessions.recovery",
+            "neuro_code.application.settings",
+            "neuro_code.application.tools.service",
+            "neuro_code.configuration.app",
+            "neuro_code.interfaces.cli.serialization",
+            "neuro_code.shared.errors",
         },
     }
 

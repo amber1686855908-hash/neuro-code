@@ -22,6 +22,7 @@ from neuro_code.application.permissions.policy import (
     PermissionEffect,
     PermissionManager,
 )
+from neuro_code.application.permissions.scopes import PermissionScopeContext
 from neuro_code.application.ports.approval import PermissionApprover
 from neuro_code.application.ports.sandbox import (
     LocalProcessEnvironmentPolicy,
@@ -325,6 +326,7 @@ class LocalInteractiveTerminalManager:
         workspace_path_resolver: WorkspacePathResolver,
         permissions: PermissionManager,
         approver: PermissionApprover | None = None,
+        permission_scope_context: PermissionScopeContext | None = None,
         sandbox_profile: SandboxProfile = SandboxProfile.OFF,
         local_process_sandbox: LocalProcessSandbox,
         protected_environment_variables: frozenset[str] = frozenset(),
@@ -338,6 +340,10 @@ class LocalInteractiveTerminalManager:
         self._workspace_path_resolver = workspace_path_resolver
         self._permissions = permissions
         self._approver = approver
+        self._permission_scope_context = permission_scope_context or PermissionScopeContext(
+            f"terminal-manager:{uuid.uuid4().hex}",
+            os.fspath(self._workspace),
+        )
         self._sandbox_profile = sandbox_profile
         self._local_process_sandbox = local_process_sandbox
         self._protected_environment = {name.casefold() for name in protected_environment_variables}
@@ -493,6 +499,7 @@ class LocalInteractiveTerminalManager:
             "create_terminal",
             arguments,
             decision.reason,
+            scope_context=self._permission_scope_context,
         )
         approval = await self._approver.request(request)
         if not approval.allowed:

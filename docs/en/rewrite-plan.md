@@ -86,12 +86,13 @@ terminal state or child processes.
 
 ### M4 — protocols and extensibility
 
-- Partial ACP v1 stdio core: official Python SDK framing/router,
+- Partial ACP v1 stdio/WebSocket core: official Python SDK framing/router and
+  the bounded WebSocket newline-JSON bridge,
   initialize/new/list/load/delete/fork/resume/prompt/cancel/close, durable
   external-to-internal session aliases, transactional durable fork/delete,
   replaying load versus silent resume, workspace-scoped bounded cursor discovery,
-  bounded/redacted visible-history replay, bounded Text/inline-Image/ResourceLink/
-  embedded-TextResource input,
+  bounded/redacted visible-history replay, bounded Text/inline-Image/inline-Audio/
+  ResourceLink/embedded-TextResource/BlobResource input,
   fail-closed permission requests, standard event updates, per-session
   concurrency, disconnect cleanup, bounded additional directories, and
   bounded session-owned stdio/Streamable HTTP/legacy SSE MCP tool servers,
@@ -101,15 +102,20 @@ terminal state or child processes.
   (`terminal_start`/`terminal_output`/`terminal_wait`/`terminal_kill`), durable
   native image context with safe ACP-history placeholders, and labeled bounded
   embedded text resources, are implemented.
-- Complete ACP conformance remains open: ACP MCP transport and non-tool MCP
-  features, interactive client terminal input/resize/PTY framing, audio prompt,
-  embedded binary-resource prompt content, binary multimedia-history replay,
-  WebSocket, and any advertised `x.ai/*` extensions.
+- The bounded private MCP session extension also implements
+  resource/resource-template discovery, resource reads, prompt
+  discovery/retrieval, sampling/elicitation callbacks, and dynamic tool-list
+  refresh; these are bounded projections rather than generic MCP parity.
+- Complete ACP conformance remains open: ACP-transport MCP server declarations,
+  MCP features outside the bounded private projections, interactive client
+  terminal input/resize/PTY framing, binary multimedia-history replay,
+  provider-native audio/video semantics, and any advertised `x.ai/*`
+  extensions.
 - Bounded exact-name `AGENTS.md` inheritance and read-only LOCAL/REPO/USER
   skill discovery/body loading are implemented, including dynamic session
   targets, content-change checks, and bounded variable substitution.
   Remote/server/bundled skills, agent profiles, hooks, and executable plugins
-  remain open alongside the remaining MCP features.
+  remain open alongside MCP features outside the bounded private projections.
 - A bounded provider-neutral plan mode is implemented: model-managed
   `update_plan` replacements persist per session, restore on resume, inherit on
   fork, and are shown through TUI `/plan DESCRIPTION` and `/view-plan`. A
@@ -124,8 +130,9 @@ terminal state or child processes.
   read-only reference. Task scheduling and subagents remain open.
 
 Exit: standard ACP clients pass the complete conformance scenarios and
-extension failures do not corrupt the primary session. The current partial
-stdio slice does not satisfy this exit condition.
+extension failures do not corrupt the primary session. The implementation
+remains partial; the original stdio-only slice did not satisfy this exit
+condition, and complete conformance remains open.
 
 ### M5 — advanced parity
 

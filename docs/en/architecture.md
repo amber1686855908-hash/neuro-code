@@ -73,6 +73,19 @@ its injected `run` function is invoked by the canonical bootstrap entrypoint.
 Importing the CLI does not load bootstrap, adapters, providers, or create
 resources.
 
+The parsed `sessions` command execution boundary is now canonically owned by
+`neuro_code.interfaces.cli.sessions`. Its `run_sessions_command` entrypoint
+uses the narrow `SessionCliServices` contract for configuration, session
+storage, bounded tool-output artifacts, and an opened application. It owns the
+existing list, search, rename, compact, artifacts, and recovery operations,
+including their validation, output, bounds, and cleanup behavior. The parser
+grammar and top-level dispatch remain in `neuro_code.cli`; its private
+`_sessions_command` name is an identity-preserving alias to the canonical
+entrypoint. The canonical command reuses
+`neuro_code.interfaces.cli.serialization`. This is an execution-boundary
+extraction only: `neuro_code.cli` is not yet a complete compatibility facade,
+and its remaining commands remain in place.
+
 Stage 2C keeps `neuro_code.acp` in place as the ACP/JSON-RPC inbound adapter,
 but gives it only `application.acp` contracts and an ACP-specific application
 service. The service exposes binding creation and safe resume preparation,
@@ -84,6 +97,41 @@ the concrete stdio MCP collection to those contracts, then starts the server.
 adapts an `ApplicationComposition` caller. ACP no longer imports MCP or workspace implementations, or reads composition
 configuration or storage directly; importing ACP does not load bootstrap, the
 MCP adapter, SQLite storage, or providers.
+
+ACP prompt/content validation and conversion is canonically owned by
+`neuro_code.interfaces.acp.content`, while durable history and live event
+projection are canonically owned by `neuro_code.interfaces.acp.updates`;
+`neuro_code.interfaces.acp.client_io` is now the canonical owner of the
+capability-gated client filesystem and terminal adapters, including their
+adapter-local bounds and terminal task lifecycle state. `neuro_code.acp`
+imports the same symbols as private compatibility aliases.
+`neuro_code.interfaces.acp.transport` is now the canonical owner of the ACP
+SDK connection adapter, stdio framing, WebSocket newline-JSON bridging,
+transport-local bounds, and outer transport close/shutdown lifecycle. The
+transport receives an already-constructed Agent or an Agent factory; it does
+not construct sessions or negotiate capabilities. `neuro_code.acp` retains
+the service-to-Agent public wrappers and imports the transport symbols as
+private compatibility aliases.
+`neuro_code.interfaces.acp.session.AcpSessionRuntime` is now the canonical
+owner of per-session mutable interface state, resource references, runtime
+locks, prompt/cancel/approval presentation state, identity transitions, and
+aggregate cleanup. `NeuroCodeAcpAgent` retains the protocol connection
+attachment, capabilities,
+registry, publication, outer lifecycle routing, extension dispatch, live MCP
+orchestration, and protocol-agent semantics; `SessionTurnService`/`ConversationRunner`
+remain the actual turn and recovery authorities.
+`neuro_code.interfaces.acp.mcp_config` is now the canonical owner of the
+stateless, bounded conversion from ACP MCP declarations to application MCP
+configuration contracts. `neuro_code.acp` supplies the protected-environment
+set and retains the caller, capability negotiation, session registry,
+publication and outer lifecycle routing, permission request coordination, live
+MCP, and the service-to-Agent compatibility wrappers. It is therefore still a
+mixed adapter rather than a facade. See [ADR 0145](adr/0145-acp-prompt-content-boundary.md),
+[ADR 0146](adr/0146-acp-update-and-event-projection-boundary.md),
+[ADR 0147](adr/0147-acp-client-io-adapter-boundary.md),
+[ADR 0148](adr/0148-acp-mcp-configuration-boundary.md),
+[ADR 0150](adr/0150-acp-session-runtime-ownership-boundary.md), and
+[ADR 0151](adr/0151-acp-transport-boundary.md).
 
 Agent harness behavior currently lives in the explicit canonical submodules of
 `neuro_code.application.runtime`: `background_task_reminders`, `agent`,
@@ -526,21 +574,71 @@ intermediate ancestors remain unique and `SkillTool` resolves them against
 one stable boundary. See
 [ADR 0044](adr/0044-repository-level-skill-discovery.md).
 
+## Canonical structured filesystem targets
+
+Structured local filesystem tools use one immutable `FilesystemAccessPlan` per
+call. The tool adapter extracts every target from the validated tool grammar,
+then `resolve_filesystem_access_targets()` canonicalizes each local path before
+permission evaluation. Each target records its canonical path, owning primary or
+additional workspace root, policy path, operation, existence state, and link-like
+component proof. Primary roots use workspace-relative POSIX-style policy paths;
+additional roots use absolute canonical policy paths normalized with platform case
+rules and forward slashes. The raw spelling remains diagnostic only.
+
+The authority chain is deliberately ordered:
+
+1. Resolve every target once, including all `apply_patch` source and destination
+   paths. Existing parents/ancestors are proven for missing create leaves, and
+   symlinks, junctions, Windows reparse traversal, parent escapes, and ambiguous
+   Windows device/extended/ADS namespaces are rejected.
+   Normal drive-absolute and UNC spellings remain eligible only when their
+   canonical target is inside a configured workspace root; drive-relative paths
+   are rejected before filesystem resolution.
+2. `PermissionManager.decide_targets()` evaluates every canonical target
+   independently. Explicit deny wins; an unresolved ask denies in headless mode;
+   a path-scoped allow is an allowlist. A structured call is allowed only when
+   every target is authorized.
+3. Tool execution receives the same immutable plan and consumes canonical target
+   entries by extraction index. It does not resolve the raw path again. A mixed
+   allowed/denied `apply_patch` therefore stops before journaling or mutation.
+
+The approval layer may derive a `WORKSPACE_EDITS` candidate only after this
+plan succeeds. The candidate covers only ordinary `search_replace` and
+`apply_patch` create/update targets in the primary canonical root, with no
+link-like component and no Neuro metadata, checkpoint/internal state, or
+obvious credential/key target. Deletes, moves, additional roots, protected
+targets, and failed or ambiguous plans never become a broad edit grant.
+
+This contract covers local structured tools: `read_file`, `read_files`, directory
+listing, glob/search, `search_replace`, and `apply_patch`. Workspace identity,
+permission, sandbox, and execution remain separate decisions; the plan does not
+turn arbitrary Bash path interpretation, MCP calls, delegated ACP execution, or
+opaque artifact handles into structured filesystem targets. ACP client paths stay
+under the separate client authority: Neuro Code performs only lexical session-root
+validation and never calls host `Path.resolve()`, existence, or link inspection for
+those remote paths. The plan closes the raw-path authority gap at the local
+structured tool boundary; it is not a blanket claim of race-free TOCTOU protection
+for every process or provider capability.
+
 ## Partial ACP v1 adapter
 
 `neuro-code acp` is a protocol adapter over `ApplicationComposition` and the
-official `agent-client-protocol` Python SDK. Production framing, JSON-RPC
-routing, newline-delimited stdio, `session/update` notifications, and
-`session/request_permission` requests remain SDK-owned. The adapter declares
+official `agent-client-protocol` Python SDK. The canonical
+`neuro_code.interfaces.acp.transport` boundary assembles the SDK connection,
+official stdio streams, newline-delimited WebSocket bridge, and outer
+connection/Agent shutdown lifecycle. The SDK continues to own production
+JSON-RPC framing, dispatch, schemas, and normalization. The adapter declares
 `loadSession: true` plus list/delete/fork/resume/close session capabilities and
 implements `initialize`, `session/new`, `session/list`, `session/load`,
 `session/delete`, `session/fork`, `session/resume`, `session/prompt`, the
 `session/cancel` notification, and `session/close`. SDK 0.11 gates fork,
 resume, and close behind `use_unstable_protocol`. Its generated schema includes
-stable delete models but its Agent router omits that route, so Neuro Code adds
-only the generated delete request to the official `MessageRouter`; SDK streams,
-`Connection`, dispatcher, schemas, framing, and error normalization remain
-unchanged.
+stable delete models but its Agent router omits that route, so the canonical
+transport adds only the generated delete request to the official
+`MessageRouter`; SDK streams, `Connection`, dispatcher, schemas, framing, and
+error normalization remain unchanged. The legacy `neuro_code.acp` server
+functions remain thin service-to-Agent wrappers and preserve their private
+transport aliases for existing integrations.
 
 One ACP connection is bound to the normalized launch workspace. Each accepted
 session owns a stable random ACP ID, one `AgentConversation`, one background
@@ -578,10 +676,10 @@ preserves the explicit sandbox boundary rather than adding late host mounts.
 
 When an ACP client explicitly advertises `fs.readTextFile`, a session receives
 a narrow `ClientFileSystem` application port bound to that ACP session. The
-existing `read_file` and `read_files` tools still resolve every path through the
-selected primary or additional workspace roots, then delegate each absolute path
-and its bounded line range to `fs/read_text_file`; they never fall back to an
-unadvertised client operation. The ACP filesystem capability does not expose a
+existing `read_file` and `read_files` tools apply only lexical session-root
+validation, then delegate the client-owned path and its bounded line range to
+`fs/read_text_file`; the host does not resolve or inspect that path and never
+falls back to a local operation. The ACP filesystem capability does not expose a
 directory walk or search operation, so `list_tree` and `grep_many` retain the
 same local workspace semantics as `list_dir` and `grep`. When the client
 advertises both text read and write, `search_replace`
@@ -606,9 +704,14 @@ timeout or session cleanup. Ordinary side-effect permissions still gate starts
 and kills. Every enabled sandbox omits the tools and direct use fails closed, so
 a client terminal cannot weaken an explicit local sandbox. Interactive
 input/resize, cursor streaming, and PTY framing/backpressure remain unsupported.
+The adapter implementation and its foreground/background lifecycle state are
+canonically owned by `neuro_code.interfaces.acp.client_io`; capability
+negotiation and session ownership remain in the top-level ACP adapter. See
+[ADR 0147](adr/0147-acp-client-io-adapter-boundary.md).
 
 Non-empty `mcpServers` accept ACP stdio, Streamable HTTP (`http`), and legacy
-SSE (`sse`) shapes; ACP-transport servers are rejected deterministically.
+SSE (`sse`) shapes; ACP-transport MCP server declarations are rejected
+deterministically.
 Every server is initialized and its bounded, paginated tool catalog is
 validated before the session is published; duplicate server names, invalid tool
 names, collisions between remote tools or with built-ins, protected environment
@@ -618,6 +721,19 @@ without embedded credentials or fragments. Header names, counts, values, and
 total bytes are bounded; framing and routing headers cannot be overridden. The
 same ephemeral MCP configuration may be supplied when loading a durable ACP
 session, but it is not persisted as session history or authority.
+
+The stateless MCP configuration conversion is canonically owned by
+`neuro_code.interfaces.acp.mcp_config`. It accepts the existing stdio,
+Streamable HTTP, and legacy SSE declarations, returns the existing
+`AcpMcpServerConfig` contracts, and preserves all bounded validation and
+`RequestError.invalid_params` reasons. It receives the protected-environment
+set from the ACP service; it does not scan environment state or obtain
+authority from bootstrap, infrastructure, providers, or stores. Configuration
+conversion performs no I/O. `MAX_MCP_SERVERS` remains an application contract
+because the MCP runtime adapters also consume that shared server-count bound;
+the URL and serialized-configuration bounds are reused by live ACP projection
+without moving live callback or MCP lifecycle code. See
+[ADR 0148](adr/0148-acp-mcp-configuration-boundary.md).
 
 The official `mcp>=1.28.1,<2` SDK owns MCP schemas, `ClientSession`, version
 negotiation, JSON-RPC dispatch, and tool result types. Stdio uses a
@@ -643,8 +759,15 @@ server, cancellation closes the SDK connection and makes it unavailable for
 later calls; no local process ownership is claimed, so an indeterminate remote
 side effect is never reported as successfully cancelled. Close, load failure,
 creation failure, EOF, and disconnect close the same session-owned collection
-idempotently. MCP resources, prompts, sampling, elicitation, dynamic tool-list
-refresh, and ACP transport remain unsupported.
+idempotently. The session-scoped private ACP MCP extension provides bounded
+resource and resource-template discovery, resource reads, prompt discovery and
+retrieval, forwards sampling and elicitation callbacks when the client supports
+them, and supports bounded dynamic tool-list refresh. These are bounded
+projections with the existing redaction, permission, and lifecycle rules, not
+generic MCP feature parity. The ACP server provides the official SDK stdio
+transport and the bounded WebSocket newline-JSON bridge; ACP-transport MCP
+server declarations remain unsupported. Persistent MCP configuration and
+multimedia/embedded MCP result bodies remain unsupported.
 
 List is discovery-only and remains scoped to the connection workspace even
 when `cwd` is omitted. It returns only durable ACP ID, absolute recorded cwd,
@@ -656,23 +779,28 @@ cursor tokens retain only the keyset position in memory, are capped at 256,
 and reveal no internal ID. List never opens a conversation/background scope or
 returns content, provider metadata, `_meta`, or additional directories.
 
-Prompt conversion accepts ACP baseline Text, inline Image, ResourceLink, and
-embedded `TextResourceContents` blocks in their supplied order. Text/resource
-counts, per-field sizes, annotation serialization, ResourceLink aggregate
-bytes, and total text bytes are bounded. An Image block accepts only validated
-base64 for a fixed raster MIME allowlist: at most eight images, 5 MiB decoded
-per image, and 10 MiB decoded in aggregate. Its optional URI, local files, and
-remote links are never read, downloaded, or dereferenced. An embedded text
-resource accepts only the supplied text: at most eight values, 64 KiB per
-value, and 128 KiB in aggregate. It becomes a labeled text `ContentPart` with
-a bounded URI and optional MIME type; its URI is never resolved, and block,
-resource, and annotation `_meta` values are omitted. The canonical ordered
-`ContentPart` values are persisted with the user message so provider adapters
-can apply their own role, MIME, and request-size validation on the current turn
-and a resumed session. Only `uri`, `name`, `title`, `description`, `mimeType`,
+Prompt conversion is canonically owned by `neuro_code.interfaces.acp.content`.
+It accepts ACP baseline Text, inline Image, inline Audio, ResourceLink, and
+embedded `TextResourceContents` or `BlobResourceContents` blocks in their
+supplied order. Text/resource counts, per-field sizes, annotation
+serialization, ResourceLink aggregate bytes, and total text bytes are bounded.
+An Image block accepts only validated base64 for a fixed raster MIME allowlist:
+at most eight images, 5 MiB decoded per image, and 10 MiB decoded in
+aggregate. Audio accepts validated base64 with an `audio/*` MIME type, with at
+most eight blocks, 5 MiB decoded per block, and 10 MiB decoded in aggregate.
+An embedded text or binary resource accepts only the supplied value: at most
+eight of each kind, 64 KiB per text value or 5 MiB per binary value, and 128
+KiB or 10 MiB in the respective aggregate. Resource and embedded-resource
+URIs, optional local files, and remote links are never read, downloaded, or
+dereferenced. Embedded text becomes a labeled text `ContentPart`, while
+embedded binary data remains a typed blob `ContentPart`; block, resource, and
+annotation `_meta` values are omitted. The canonical ordered `ContentPart`
+values are persisted with the user message so provider adapters can apply
+their own role, MIME, and request-size validation on the current turn and a
+resumed session. Only `uri`, `name`, `title`, `description`, `mimeType`,
 `size`, and standard annotation fields reach a model-visible ResourceLink
-description; `_meta` is ignored. Audio and embedded `BlobResourceContents`
-prompt blocks remain rejected.
+description; `_meta` is ignored. See
+[ADR 0145](adr/0145-acp-prompt-content-boundary.md).
 
 Load history uses a second explicit projection. Visible user and assistant text
 become standard message chunks with fresh UUID message IDs. Ordered image parts
@@ -684,6 +812,13 @@ updates. System messages, reasoning, preserved provider context, arbitrary
 arguments, `_meta`, and raw input/output are omitted. The complete replay is
 validated before its first update and is bounded by stored-item, update-count,
 per-field, and aggregate serialized-byte limits.
+
+The history projection and the live `AgentEvent` allowlist are implemented in
+`neuro_code.interfaces.acp.updates`. The top-level ACP adapter retains the
+session-bound wiring, lifecycle, client-capability, and MCP responsibilities
+that invoke these projections; canonical transport owns the SDK connection
+and wire framing. The extraction is structural and preserves the existing ACP
+wire behavior; it does not add event kinds or move permission authority.
 
 The event projection is an explicit allowlist:
 
@@ -1044,6 +1179,31 @@ bounded UTF-8 size and control characters. Invalid owner results or aliases
 fail closed without changing valid wire responses. See
 [ADR 0082](adr/0082-fail-closed-acp-subagent-lifecycle-projection.md).
 
+## Subagent capability closure
+
+The canonical parent authority for every production child-runtime creation
+path is the actual `ConversationBinding.capabilities` manifest. The headless
+CLI opens a parent binding before starting its explicit child; TUI reads the
+active binding; and the private ACP child extension requires an active parent
+binding. Missing metadata fails closed. The composition-owned global policy is
+shared by the scheduler and explicit service.
+
+The explicit read-only workflow treats
+`READ_ONLY_SUBAGENT_TOOL_NAMES` as a requested capability only. It resolves
+`parent ∩ requested ∩ global_policy` through
+`SubagentCapabilitySet.resolve_child()` before creating the child task or
+binding, passes that exact manifest into the factory and
+`ApplicationComposition.create_binding(capabilities=...)`, and verifies the
+runtime fingerprint. This prevents a restricted child from regaining root
+workspace roots, tools, sandbox strength, MCP, terminal, or network authority.
+The legacy arbitrary `SubagentExecutor` binding remains only as a marked
+test/internal compatibility seam and is rejected by the normal composition
+boundary. Subagent relationship `resume`, `fork`, and `delete` do not recreate
+a runtime; a normal ACP fork is an independent session binding. This closure
+proves only `child capability <= actual parent capability`, not the complete
+permission, workspace, sandbox, MCP, provider-transport, or agent-security
+system. See [ADR 0125](adr/0125-subagent-capability-closure.md).
+
 `ProfileConversationController` in
 `neuro_code.application.sessions.profile_conversation` wraps the active
 `AgentConversation` for the interactive composition. The former
@@ -1059,18 +1219,22 @@ metadata, and profile-affine context. See
 The controller also owns one process-local `ReasoningEffort` selection and
 serializes changes with turns. It reapplies the requested value whenever a
 profile or session replacement installs a new conversation binding. `low`,
-`medium`, `high`, and `xhigh` map to application review guidance;
-`ultracode` has an explicit effective value of `xhigh` until workflow
-orchestration exists. The TUI exposes the selection through `Ctrl+E`, `/effort`,
-and `/reasoning`; the CLI exposes `--effort`. Selection does not rewrite
-provider configuration or session identity.
+`medium`, `high`, `xhigh`, and `max` map to application review guidance;
+`max` remains the deepest ordinary single-agent policy. An explicit
+`ultracode` selection enters the application-owned bounded delegation service,
+which durably selects exactly one `MAIN_MAX` or `BOUNDED_SWARM` branch. The
+provider-compatible projection remains `max` for the ordinary main path; no
+provider receives a fabricated native `ultracode` value. The TUI exposes the
+selection through `Ctrl+E`, `/effort`, and `/reasoning`; the CLI exposes
+`--effort`. Selection does not rewrite provider configuration or session
+identity.
 
 At each model step, `AgentRuntime` adds the selected guidance to a request-only
 system message and places the typed requested value on `ModelContext`. The
 guidance is not added to canonical `SessionItem` history. Provider adapters may
-inspect the typed value, but the current adapters do not translate it into
-provider-private reasoning parameters. A future native mapping must declare and
-test its capability explicitly. See
+inspect the typed value. The explicit Kimi K3 and GLM 5.3/5.2 dialect mappings
+send the configured native `max` field for `max`; other dialects omit a native
+effort field while retaining the application guidance. See
 [ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md).
 
 The same controller exposes a workspace-scoped `SessionOption` catalog and
@@ -1114,11 +1278,18 @@ Permission policy and user interaction are separate boundaries.
 `PermissionManager` first returns a deterministic decision. An `ask` may then
 flow through the optional asynchronous `PermissionApprover` port; the runtime
 emits request/resolution audit events and cannot emit `tool_started` before an
-allowed response. The TUI's session broker remembers only hashes of exact
-tool/argument pairs in memory, and every later call is re-evaluated by policy so
-deny precedence remains intact. Headless composition provides no approver and
-continues to fail closed. See
-[ADR 0015](adr/0015-async-interactive-tool-approval.md).
+allowed response. The TUI's session broker keeps exact-action hashes plus
+typed, runtime-generated `WORKSPACE_EDITS` and conservative `COMMAND_FAMILY`
+grants in memory. Every grant is bound to the trusted session identity and
+canonical primary workspace, and every later call is re-evaluated by policy.
+Only the ordinary interactive default `ASK` can produce a broad candidate;
+explicit deny/ask, mode decisions, headless requests, high-risk operations,
+and model/provider/planner/worker input cannot create one. Equivalent queued
+requests re-check the grant after the first decision; allow-once, denial, and
+cancellation do not authorize waiters. Headless composition provides no
+approver and continues to fail closed. See
+[ADR 0015](adr/0015-async-interactive-tool-approval.md) and
+[ADR 0142](adr/0142-scoped-session-permission-grants.md).
 
 ## Stable ports
 
@@ -1256,6 +1427,39 @@ This behavior is independent of whether a candidate reaches a direct endpoint
 or a CC Switch gateway. See
 [ADR 0011](adr/0011-safe-pre-output-provider-failover.md).
 
+Provider transport and protocol failures cross a typed boundary before they
+reach resilience. `ProviderFailure` in `shared.errors` is an immutable,
+redacted, bounded fact containing kind, safe detail, optional status/
+`Retry-After`, provider/model identity, lifecycle phase, and evidence origin
+(`provider`, `transport`, `local`, or `unknown`). It never contains retry,
+circuit, or failover decisions. The five model HTTP adapters use a conservative
+generic HTTP fallback and then classify exact provider-owned structured fields;
+generic 404 is not asserted to be a missing model, generic 429 is not made
+retryable without an explicit rate code, and generic 413 is an invalid request.
+Timeout/network failures are transport facts, malformed provider streams are
+protocol facts, and unexpected non-transport runtime failures are local facts.
+`ConfigurationError` remains separate, and cancellation propagates unchanged.
+
+`ProviderFailurePolicy` owns retry, circuit, and failover independently. Server,
+timeout, and network facts are transient circuit inputs; an unambiguous rate
+limit may retry or isolate a candidate without marking it unhealthy; permanent
+request, authentication, authorization, model, and context failures do not
+poison the transient circuit. Provider/transport unknown facts do not retry or
+count toward the circuit but may fail over before output; local unknown facts
+stop at the current candidate. Invalid requests do not fail over, while
+protocol failures use their explicit conservative policy. After the first model
+event, both retry and failover are disabled. `consecutive_failures` means the
+number of consecutive pre-output circuit-eligible failures since the last
+success or circuit-ineligible failure. `ProviderHealth.last_failure_kind` and
+the optional `failure_kind`/`status_code` fields on attempt events expose
+stable bounded facts while retaining `last_error_type` and the original event
+fields for compatibility. The protocol-owned Anthropic `rate_limit_error` and
+Gemini Generate Content `RESOURCE_EXHAUSTED` envelopes are explicit rate-limit
+facts; Anthropic `billing_error` remains authorization, and an unstructured or
+future generic 429 remains unknown. Offline fixtures cover the listed official
+envelopes; this does not claim full provider compatibility or live validation.
+See [ADR 0126](adr/0126-provider-typed-failure-taxonomy.md).
+
 Each profile also resolves one `HttpClientPolicy` at adapter construction.
 Environment mode delegates standard proxy/certificate variables to HTTPX,
 direct mode disables HTTPX environment trust, and explicit mode reads one proxy
@@ -1296,8 +1500,11 @@ pair from terminal backend output when intermediate events were absent.
 - Deny rules override allow rules and bypass modes.
 - Headless execution converts an unresolved `ask` into denial.
 - A side-effecting tool cannot start while approval is pending or after denial
-  or cancellation. Session approvals cover only an identical tool/argument
-  digest, remain memory-only, and are subordinate to a fresh policy decision.
+  or cancellation. Exact session approvals cover only an identical
+  tool/argument digest; broad approvals cover only a trusted typed candidate in
+  the same session and canonical workspace. All remain memory-only and
+  subordinate to a fresh policy decision; explicit deny and explicit ask are
+  never bypassed.
 - Every local tool call persisted in an assistant message has exactly one tool
   result before the context is reused. Cancellation records an error result for
   the active call and every remaining call in the same model batch.
@@ -1438,6 +1645,66 @@ requested workspaces by filesystem identity, with canonical normalized paths as
 a fallback, so platform aliases are accepted without admitting a different
 workspace. Source session files are never opened for writing.
 
+## Durable turn crash recovery
+
+Each persisted `AgentRuntime.run()` allocates a unique opaque `turn_id` and
+accepts a small row in `session_turn_attempts` before a provider request or
+tool body can start. The row is the canonical recovery index; the ordered
+`events` table remains append-only audit evidence. Recovery facts and their
+events are written together, so restart classification is derived from sticky
+facts rather than from the absence of an event.
+For plan execution, acceptance and task ownership are one SQLite transaction.
+A new `RUNNING` plan task is inserted with the exact `attempt.task_id`, or the
+exact `QUEUED` task is validated and transitioned to `RUNNING` with that same
+identity. The recovery projection never infers ownership from the latest task,
+an input fingerprint, or an event. If the transaction fails, neither the
+attempt nor the task activation is visible.
+
+The write-ahead boundaries are explicit. `MODEL_REQUEST_STARTED` is committed
+before entering the Provider stream. On the first observable text, reasoning,
+backend-tool, tool-call, or completion event, `MODEL_OUTPUT_STARTED` is
+committed before the event is handled. `TOOL_STARTED` is committed before the
+tool body and records whether the tool is side-effecting. Provider request
+bodies, headers, credentials, full context, tool arguments, and unbounded
+outputs are not copied into this recovery index.
+
+The existing `SessionStore.finalize_turn()` and
+`finalize_turn_with_compaction()` transaction is the only `COMMITTED` point:
+completion event, final session items, title/search projection, optional
+execution record, task terminalization, and attempt resolution share the same
+SQLite transaction. Failure and cancellation use the corresponding atomic
+terminalization path. A normal `FAILED` or `CANCELLED` attempt is execution
+history, not an orphaned crash attempt, and is excluded from recovery UX. The
+default recovery inspect view is unresolved/open only; committed and explicitly
+abandoned history is available through an audit-specific view.
+
+The derived statuses are `COMMITTED`, `SAFELY_RETRYABLE`, `INDETERMINATE`, and
+`ABANDONED`. Exact user-owned input is stored only when it is reconstructable
+and at most 256 KiB; background wake input is deliberately not reconstructable.
+An open attempt with no observable output, no tool start, exact input, and no
+fact conflict may be explicitly retried when it is a non-plan user attempt.
+Observable output, any tool start, possible side effects, missing input,
+background wake, or contradictory facts are `INDETERMINATE` and never
+auto-replayed. Plan attempts may remain `SAFELY_RETRYABLE` when no output or
+tool effect was observed, but `retry_available` is false because plan execution
+retry is unsupported; their explicit recovery action is abandon. `ABANDONED`
+is written only by an explicit recovery action. A retry abandons the old
+attempt and creates a new turn identity rather than continuing the old one.
+
+CLI and TUI expose bounded recovery metadata and explicit `inspect`, `retry`,
+and `abandon` operations. For a linked `RUNNING` plan task, abandon atomically
+transitions the task to `CANCELLED` and writes `SESSION_TASK_CANCELLED` before
+`TURN_ABANDONED`; ordinary user attempts without a task keep the existing path.
+ACP exposes the same application service through
+the private `neuro-code/session/recovery` extension and returns machine-readable
+bounded projections. Resume blocks a new turn while an unresolved attempt is
+present. This layer does not implement mid-turn continuation, tool
+compensation, background-child reconciliation, plan execution retry, or
+workspace rollback. In particular, `EXECUTION_SEGMENT_CHECKPOINTED` remains a
+progress/audit marker: crash recovery is not a workspace rollback point.
+
+See [ADR 0127](adr/0127-durable-turn-crash-recovery.md).
+
 The canonical sequence is a union of ordinary `Message` values and opaque but
 validated `PreservedContextItem` values. Message content parts retain text/image
 ordering and image URLs. Reasoning and backend-tool payloads retain their
@@ -1481,6 +1748,651 @@ assistant. A stream-scoped set of standalone backend-tool IDs suppresses only
 duplicate embedded copies; reasoning items remain ordered and are never
 collapsed. Malformed and unknown embedded entries are counted separately
 without rejecting an otherwise valid assistant row.
+
+## Explicit serialized writable-subagent workspace
+
+The existing `/subagent` capability and the explicit CLI/TUI/ACP subagent
+entrypoints remain read-only. The standalone writable-subagent service is a
+separate internal vertical slice constructed by
+`ApplicationComposition.create_writable_subagent_service()`. It is not itself
+exposed as a public subagent surface and does not start checkpoint/rollback
+orchestration. The standalone service remains serialized; bounded Task DAG
+execution creates separate worker services through its typed factory, and the
+later bounded `Ultracode -> Bounded Swarm` composition reaches those workers
+only through the existing Swarm, Leader, and Task DAG factories.
+
+`WritableSubagentApplicationService` serializes one child at a time. It first
+records an `ALLOCATING` lease, reads the parent's exact committed HEAD, creates
+a Neuro-owned managed branch worktree outside the parent's workspace roots, and
+captures a `READY` baseline checkpoint. Only then does it derive the typed
+`ManagedChildWorkspaceGrant`, whose fingerprint binds the parent capability,
+repository identity, exact base SHA, immutable `WorktreeHandle`, managed
+worktree ID/path, creation time, and baseline checkpoint. The child receives a
+fresh session and binding with exactly that worktree as cwd and sole root.
+
+The derived child has only the bounded read set (`read_file`, `read_files`,
+`list_dir`, `list_tree`, `glob`, `grep`, `grep_many`, `skill`, and optional
+read-only `lsp`) plus `search_replace` and `apply_patch`. `lsp` is present only
+in the actual-parent/global/worker-policy intersection. The child has no Bash,
+terminal, background, MCP, network, Git/worktree/checkpoint/rollback, or
+subagent authority. Parent and global policy must both prove write tools, write
+authority, and a writable sandbox. Generic
+`SubagentCapabilitySet.is_subset_of()` is unchanged; the typed grant is the
+narrow boundary that binds the child to a new managed workspace. The normal
+Permission, canonical filesystem-target, execution, and sandbox pipeline
+remains active for every child write.
+
+The durable lease uses `ALLOCATING`, `WORKTREE_READY`, `BASELINE_READY`,
+`ACTIVE`, `PRESERVED`, `ORPHANED`, and `FAILED`, with immutable identity,
+insert-only ownership, and generation CAS. Success, provider failure,
+cancellation, or uncertain final inspection preserve the worktree and
+baseline; there is no automatic removal, rollback, merge, commit, copy-back,
+or cleanup. Reconciliation verifies worktree and checkpoint evidence after a
+crash without deleting uncertain data. The bounded result projection exposes
+only lifecycle/workspace identities, redacted response, bounded outcome and
+fingerprints, not a diff, transcript, raw arguments, or file contents. The
+composition root captures parent authority from the actual active
+`ConversationBinding`, including its runner session ID and capability
+fingerprint; a caller-reported parent manifest is not trusted, and a request
+whose parent ID differs from the binding is rejected before allocation.
+Session-store schema 16 rebuilds and preserves schema-15 lease rows, uses
+`RESTRICT` for both lease session foreign keys, and refuses recursive session
+deletion whenever any session in the deletion closure is referenced by a
+writable lease. Shared owner liveness uses a real POSIX probe or a Windows
+process-handle wait and treats unproven access/API failures as alive. The
+complete contract is in [ADR 0131](adr/0131-managed-writable-subagent-workspace.md).
+
+### Worker-scoped read-only LSP runtime
+
+The managed grant derives a `WorktreeWorkspaceBinding` from its immutable
+handle. Writable runtime composition rejects unless the binding cwd, effective
+capability cwd, workspace-binding primary root, LSP manager root, and canonical
+managed child root are equal and additional roots are empty. The existing
+per-binding instruction and skill trackers therefore also discover only from
+the managed child root.
+
+Each worker keeps the existing per-binding `LanguageServerManager`; managers,
+clients, routes, document/diagnostics caches, versions, and restart counters
+are not shared with the parent or another worker. The manager re-reads the
+canonical child document before a semantic request, so an explicit
+`search_replace`/`apply_patch` write is followed by `didOpen` or versioned
+`didChange` using the new child bytes. Input paths and server-returned URIs
+still pass through the LSP canonical target and visibility boundary.
+
+`ConversationBindingResourceScope` gives the binding one idempotent,
+cancellation-safe asynchronous close task. Worker success, provider failure,
+cancellation, and timeout close the LSP client/process and release its caches;
+application shutdown remains a fallback for still-open bindings. Worktree,
+checkpoint, lease, and session evidence remain durable and preserved. LSP
+process/cache state is ephemeral, is not stored in SQLite, and is reconstructed
+by a future binding. See
+[ADR 0132](adr/0132-worker-scoped-lsp-runtime-integration.md).
+
+### Bounded parent context relay
+
+The writable workflow now derives one `ParentContextRelay` only from the
+durable items of the session bound to the actual parent `ConversationBinding`.
+It deterministically selects recent genuine plain-text USER/ASSISTANT content,
+applies the composition-owned configured redaction, and enforces 10-item,
+4-KiB-per-item, 24-KiB-projected, and 32-KiB-rendered UTF-8 bounds. System,
+tool-role, synthetic, tool-call-bearing, media-bearing, preserved reasoning,
+and preserved backend-call structures are excluded; assistant visible prose is
+separable from and never carries its `reasoning_content`.
+
+Session schema 29 retains the schema-17 one-to-one insert-only READY relay per
+writable lease, the durable Task DAG tables described below, the schema-20
+predecessor-result relay table, and the schema-21 Task DAG recovery-claim
+fence; schema 22 adds bounded DAG capacity and scoped Writable lease policy,
+and schema 23 adds per-node execution-owner identity; schema 24 adds the
+parallel-aware Leader decision projection; schema 25 adds the bounded model
+planning attempt/proposal projections described below, schema 26 adds the
+bounded DAG replan attempt/proposal projections, and schema 27 adds the bounded
+Agent Swarm run projection described below; schema 28 adds the durable
+Ultracode delegation projection described below, and schema 29 adds the
+durable Result Adoption projection described below. It also retains the
+durable Leader attempt/decision projections described after the DAG. Its
+identity binds the parent/task/child, lease, worktree, baseline checkpoint,
+base commit, capability/grant fingerprints, and child-task digest. Source,
+content, and complete-record fingerprints are verified on load; inconsistent
+rows fail closed. Projection and durable verification happen after the
+`SubagentLink` and before child runtime creation, so no child model request can
+occur before relay publication. Failure preserves the existing durable worker
+identities rather than deleting or rolling back them.
+
+`ContextBuilder` injects exactly one immutable
+`SyntheticReason.PARENT_RELAY` USER message after project instructions and
+skills and before genuine child history on every model request. It is not
+stored as child conversation history and remains byte-stable across model,
+tool, and LSP steps. Relay strings are evidence only: they are not parsed into
+tools, roots, sandbox, network, LSP, worktree, or checkpoint authority. The
+existing capability intersection and child-root instruction/skill discovery
+remain the sole authority owners. Durable compaction-summary reuse, live
+context sharing, and unbounded parallel workers remain absent. Bounded Swarm
+and Ultracode entry orchestration are defined below. The bounded Task DAG, Leader, and model-planning
+slices are specified separately by [ADR 0134](adr/0134-durable-serialized-task-dag.md), [ADR 0135]
+(adr/0135-bounded-serialized-leader-controller.md), and [ADR 0137]
+(adr/0137-parallel-aware-leader-bounded-wave-scheduling.md), with model-generated
+planning defined by [ADR 0138](adr/0138-bounded-model-generated-dag-planning.md) and
+bounded DAG revision/replan defined by [ADR 0139](adr/0139-bounded-dag-revision-replan.md).
+See [ADR 0133](adr/0133-bounded-parent-context-relay.md) for the relay
+boundary.
+
+### Bounded durable Task DAG
+
+ADR 0134 adds an explicit internal orchestration boundary for one bounded DAG
+whose node definitions are supplied by the caller as typed values. The first
+slice admits at most eight nodes, sixteen dependency edges, four dependencies
+per node, and only `WRITABLE_SUBAGENT` nodes. Definition validation rejects
+unknown references, duplicate edges, self-dependencies, and cycles before
+publication. Topological order and ready-node selection are deterministic by
+declaration ordinal and node ID; dependency edges are control-only and never
+forward predecessor prompts, transcripts, tool output, or workspace data.
+
+The DAG service derives the parent session only from the actual
+`ConversationBinding`. It reuses the existing `SessionTask` owner and the
+existing `WritableSubagentApplicationService` for every node. `max_parallel`
+is immutable, defaults to one, and is bounded by the shared application limit
+of four. Before a worker starts, the node durably records one generated parent
+task ID plus an execution owner PID/token. A single `BEGIN IMMEDIATE`
+transaction counts durable `RUNNING` node rows, checks capacity, and performs
+the exact generation CAS from `READY` to `RUNNING`. Ready selection is
+ordinal/node-ID deterministic. The DAG uses a structured `TaskGroup`, never
+`SubagentScheduler.run_many()` or an unbounded gather over nodes.
+
+The canonical active execution model is the set of node rows with
+`state=RUNNING`. The legacy `task_dags.active_node_id` column is a compatibility
+projection only: it is populated only when exactly one node is running and is
+never used for scheduling or capacity. A live per-node owner PID is observed
+during the short pre-evidence allocation window; only a dead owner enters
+per-node crash classification.
+
+Parallel nodes receive fresh Writable application services from a typed
+`TaskDagWritableWorkerFactory`. This preserves the frozen per-worker
+`asyncio.Lock` while giving each node independent binding, lease, worktree,
+checkpoint, child session, Parent Relay, and worker-scoped LSP state.
+
+The current Session schema 29 stores immutable DAG definitions and bounded node runtime
+projections in `task_dags` and `task_dag_nodes`, plus insert-only
+`task_dag_dependency_relays` and the separate `task_dag_recovery_claims`
+cross-process ownership fence. Definitions and relay publications are
+insert-only; graph and node lifecycle updates use generation CAS. A successful
+node records the exact worker task, child session, writable lease, worktree,
+baseline checkpoint, Parent Relay, and bounded result projection. A missing or
+inconsistent success correlation is not treated as success.
+
+The three orchestration context channels remain separate. The Parent Context
+Relay carries a bounded parent-session snapshot into one child. The DAG
+predecessor-result relay carries only completed direct-predecessor projections
+into the dependent worker. The Leader evidence envelope carries bounded DAG
+state into the zero-tool Leader. A root node receives no predecessor relay;
+for a dependent node, the relay follows the declaration order of its direct
+edges and is published after the node's exact `RUNNING` generation claim but
+before child runtime or provider execution. Each entry is bound to the exact
+predecessor generation, parent task, child session, preserved writable lease,
+worktree, baseline checkpoint, and Parent Relay. The relay is limited to a
+4-KiB UTF-8 result per predecessor, 16 KiB of aggregate source content, and a
+24-KiB rendered message. It contains redacted result text and opaque
+fingerprints only: no transcript, reasoning, tool calls, workspace bytes,
+capability grants, paths, or authority instructions cross the edge. Missing,
+stale, tampered, non-completed, or mismatched evidence fails closed before a
+worker request; an exact duplicate publication is idempotent, while a
+different publication for the same target generation is rejected.
+
+The lifecycle is `PENDING -> READY -> RUNNING -> COMPLETED/FAILED/CANCELLED/
+INDETERMINATE`; dependency-blocked descendants become `SKIPPED`. A failed or
+cancelled dependency blocks only its descendants while independent branches
+continue. Restart reconciliation is non-worker-starting and classifies an
+active node as `ACTIVE_WORKER`, `SAFE_NOT_STARTED`, `RECOVERY_OWNED`, or
+`INDETERMINATE`.
+`SAFE_NOT_STARTED` requires the exact active `RUNNING` node and `parent_task_id`,
+the same READY relay loaded by DAG/target/generation with exact definitions,
+direct dependencies, and fingerprints, no matching `SessionTask`, writable
+lease, or subagent link, and no live recovery owner. A later DAG step first
+acquires the exact durable claim; only the winner may call Writable.
+`RECOVERY_OWNED` is the read-only classification for a live or unproven claim
+owner, including the partial window where a lease exists but `SessionTask` does
+not. The loser performs no provider/resource allocation and does not write
+`FAILED` or `INDETERMINATE`. A dead owner proven before the first lease insert
+may be replaced by version CAS with the same generation, parent task, and relay
+identity. After lease ownership begins, existing Writable reconciliation is
+fail-closed and never automatically reruns the worker. Missing relay, stale
+identity, or other uncertainty remains `INDETERMINATE` and is never
+automatically rerun.
+Completed/failed/cancelled worker tasks map to the same DAG terminal meaning.
+No automatic retry, crash rerun, merge, copy-back, rollback, cleanup, dynamic
+or unbounded dataflow execution, UI surface, Swarm, or Ultracode behavior is
+added. Bounded independent-node execution is supported; the bounded direct
+predecessor-result relay described above remains the only
+dataflow behavior in this slice; it does not transfer authority or workspace
+state. The bounded Leader controller is specified separately by [ADR 0135]
+(adr/0135-bounded-serialized-leader-controller.md).
+Existing Worktree,
+Checkpoint, Parent Relay, and worker-scoped read-only LSP contracts remain the
+authority owners. See [ADR 0134](adr/0134-durable-serialized-task-dag.md).
+
+### Bounded serialized Leader controller (historical compatibility path)
+
+ADR 0135 adds one explicit Leader controller over one already-published Task
+DAG. The Leader is a decision authority only: it reconciles the current DAG,
+constructs a bounded redacted deterministic evidence envelope, asks a
+dedicated zero-tool model for one typed decision, and calls the existing
+Task-DAG one-step seam. It never creates or mutates the graph definition,
+dependencies, prompts, capabilities, roots, worker, Worktree, Checkpoint,
+Relay, LSP process, or child session directly.
+
+The serialized compatibility path accepts `SELECT_NODE`, whose node ID must be
+in the exact current READY set, and terminal-only `FINALIZE`. The model response
+is strict JSON; prose, unknown actions, extra fields, blocked/stale node IDs,
+and instructions embedded in node text are data or fail closed. Evidence
+contains only bounded node definitions and durable outcome metadata, with
+redacted previews and fingerprints; it never carries raw
+transcript/reasoning/tool arguments/output, Relay payloads, workspace bytes,
+checkpoint bytes, Git diffs, secrets, or arbitrary paths. The current
+parallel-aware extension is specified by ADR 0137 below.
+
+The current Session Store schema 29 retains the schema-19 `leader_attempts` and
+`leader_decisions` projections. An attempt binds the exact DAG generation,
+definition/evidence/objective fingerprints, Leader session, controller owner,
+turn identity, and durable lifecycle. SQLite write transactions and CAS-like
+state transitions ensure one controller owns a model request for one exact
+snapshot. The controller must durably fence `CLAIMED` as
+`PROVIDER_FENCED` with the exact owner/session/turn immediately before the
+provider call, and that session must equal the actual model binding's session.
+An expired claim is rebased to a fresh session/turn only when no output,
+decision, or matching old-session turn evidence exists; lease expiry alone is
+not proof of process death. A live stale controller therefore fails its fence,
+while a post-fence restart fails closed rather than guessing whether the
+provider ran. A committed model response is parsed and reused after restart;
+historical session/turn provenance is retained and the Leader never
+automatically replays a provider request after an observable turn. An
+unresolved session turn is conservatively `INDETERMINATE` and needs explicit
+recovery. A published decision may be applied through the DAG CAS by another
+controller, so a crash after decision publication does not create a second
+model request or worker allocation.
+
+The historical Leader loop is bounded and serialized. It selects one ready node, waits
+for the existing Writable Subagent/DAG result, then constructs the next
+snapshot. It does not auto-execute a second node inside the one-step seam.
+Final synthesis is requested only after a terminal DAG snapshot and is kept
+in the dedicated Leader session rather than appended to the parent transcript.
+Model-generated DAG creation is handled by the separate planning slice below;
+this historical Leader slice does not perform planning. Bounded failed-DAG
+revision/replan is a separate internal slice below; retry, recursive replan,
+dynamic/unbounded dataflow,
+merge, rollback, UI/ACP exposure, Swarm, Ultracode, and automatic delegation
+remain outside this slice. Bounded parallel-aware Leader waves are implemented
+as the internal extension in [ADR 0137]
+(adr/0137-parallel-aware-leader-bounded-wave-scheduling.md).
+
+### Parallel-aware Leader / bounded wave scheduling
+
+ADR 0137 extends the zero-tool Leader without changing authority ownership. The
+Leader may publish typed `SELECT_NODE` for the serialized compatibility path or
+typed `SELECT_NODES` for one bounded wave; only a terminal DAG may receive
+`FINALIZE`. `SELECT_NODES` is non-empty, unique, bounded by immutable
+`max_parallel`, and must use canonical `(ordinal, node_id)` order. Non-canonical,
+unknown, stale-generation, overflow, and running-node finalization decisions
+fail closed; the model output is never silently reordered or replayed.
+
+The evidence envelope includes parent session, graph/definition identity,
+generation, immutable `max_parallel`, durable running IDs, available capacity,
+canonical READY IDs, node generations/dependencies, and deterministic
+completed/failed/cancelled/skipped/indeterminate state buckets. It remains
+bounded, redacted, and evidence-only. `RunTaskDagWaveRequest` carries the exact
+graph and selected node generations to the Task DAG authority. SQLite counts
+durable RUNNING rows and performs the capacity check plus graph/node CAS; the
+wave seam claims only the selected IDs, creates independent Writable services,
+and uses a structured `TaskGroup`. It never fills unused capacity with an
+unselected node. `max_parallel=1` remains compatible with the one-node path.
+
+Session schema 24 added parent-session, selected-node, and selected-generation
+decision projections and migrated populated schema-23 rows; current schema 29
+retains them. A durable wave
+decision can be reused after a crash only when each selected node is still at
+its recorded READY generation or has advanced durably to RUNNING/terminal;
+provider replay is never inferred. Partial claims, controller races, failure,
+cancellation, skipped descendants, and indeterminate branches retain the
+existing Task DAG recovery semantics. The Leader still never owns Writable,
+Worktree, Checkpoint, Relay, LSP, capability, or graph mutation authority.
+See [ADR 0137](adr/0137-parallel-aware-leader-bounded-wave-scheduling.md).
+
+### Bounded model-generated DAG planning
+
+ADR 0138 adds one explicit internal planning boundary: a single objective from
+the actual parent `ConversationBinding` is converted by a dedicated zero-tool
+provider-backed Planner into one immutable, bounded Task DAG proposal. The
+Planner owns proposal data only. It cannot create or claim nodes, invoke
+Writable workers, create Worktrees or Checkpoints, run LSP/Bash, modify files,
+or change capabilities, roots, sandbox policy, providers, retries, merges, or
+the graph after publication. TaskDagApplicationService remains the canonical
+owner of node, edge, dependency, acyclic, parallelism, and immutable graph
+validation and publication; the existing parallel-aware Leader remains the
+owner of READY-wave selection, and Writable remains the worker authority.
+
+The Planner binding is a dedicated persisted one-step session with no local
+or provider-hosted tools, filesystem, Bash, terminal, network, MCP, LSP,
+Worktree, Checkpoint, worker, or background capability. Its input consists of
+the explicit objective plus a separate `PlanningContextEnvelope` derived from
+the actual parent runner session. Only bounded redacted genuine USER and
+visible ASSISTANT plain text may be selected. System/tool messages, synthetic
+items, reasoning, tool calls and results, media, arbitrary workspace bytes,
+and other authority-bearing structures are excluded. The envelope is
+order-preserving, byte-bounded, rendered deterministically, and fingerprinted;
+it is evidence only and is not a Parent Context Relay because no worker lease,
+Worktree, Checkpoint, or child identity exists yet.
+
+The provider response is strict JSON with only `nodes`, `max_parallel`, and
+bounded `reason`; each node has exactly `id`, `prompt`, and `depends_on`.
+Node declaration order is canonical, dependency IDs must follow the same
+declaration order, and the proposal fingerprint is derived from canonical
+sorted-key JSON without sorting away semantic graph differences. The parser
+retains the frozen Task DAG limits: at most 8 nodes, 16 edges, 4 dependencies
+per node, 8-KiB prompts, and `max_parallel` from 1 through 4. Unknown
+dependencies, self-dependencies, cycles, duplicate IDs, edge overflow, and
+other graph rules are still rejected by the canonical Task DAG service. Model
+text is data and contains no authority fields.
+
+Schema 25 added insert-only `orchestration_planning_attempts` and
+`orchestration_plan_proposals`; current schema 29 retains them. A planning attempt binds the caller's exact
+planning ID, actual parent session, objective/context fingerprints, dedicated
+planner session and turn, a preallocated intended DAG ID, provider lifecycle,
+proposal fingerprint, and published DAG identity. Its lifecycle is
+`CLAIMED -> PROVIDER_FENCED -> MODEL_COMMITTED -> PROPOSAL_PUBLISHED ->
+DAG_PUBLISHED -> COMPLETED`, with typed stale/indeterminate terminal
+classification. Exact owner/CAS checks fence concurrent controllers; a live
+or unproven owner is not stolen. Proposal records are immutable and an exact
+duplicate is idempotent, while a conflicting record or tampered canonical JSON
+fails closed.
+
+Every fresh `ApplicationComposition.create_model_planning_service()` creates a
+new persisted Planner session. The service `planning_session_id` identifies the
+current recovery controller, while the attempt's historical Planner session and
+turn remain immutable provenance; recovery under L2 therefore does not rewrite
+the L1/T1 identity recorded by the original controller.
+
+The provider replay rule follows the existing durable turn contract. An
+observable provider turn is never automatically replayed. A fresh process
+reuses committed model output, then the exact proposal and preallocated DAG
+identity; it never changes nodes, prompts, dependencies, or `max_parallel`,
+and an insert-only Task DAG publication cannot create a second graph. Fresh
+composition crash acceptance uses spawned processes and covers output-committed,
+proposal-published, DAG-inserted, and provider-turn-evidence boundaries while
+preserving L1/T1 provenance under L2 recovery. An independent controller race
+also verifies that the losing process does not mutate the winner's provenance.
+Invalid observable JSON is recorded as stale and is not sent to the provider again. Bounded failed-DAG
+revision/replan is implemented as the separate [ADR 0139](adr/0139-bounded-dag-revision-replan.md)
+slice below. Retry, node resurrection, recursive planning, automatic delegation, dynamic or
+unbounded dataflow, merge/copy-back, rollback, cleanup, public CLI/TUI/ACP
+orchestration, Swarm, Ultracode, and distributed scheduling remain outside
+this slice. See [ADR 0138](adr/0138-bounded-model-generated-dag-planning.md).
+
+### Bounded DAG revision / replan
+
+ADR 0139 adds one explicit revision boundary after a published Task DAG has
+reached a quiescent `FAILED` state. The request names one source DAG and one
+revision identity. The source must have no `RUNNING` or unresolved
+`INDETERMINATE` nodes and all nodes must be terminal. A successful, cancelled,
+active, foreign-parent, missing, or tampered source is rejected. The source
+definition and runtime projection remain immutable; replan creates a distinct
+successor DAG through the existing `TaskDagApplicationService`.
+
+Replan depth is bounded by `MAX_DAG_REPLAN_DEPTH=1`, so this slice supports one
+explicit successor only. It is not automatic retry, recursive planning, node
+resurrection, or publication-time mutation. Completed source work is evidence
+only; the successor owns a new set of pending/ready node definitions and never
+reuses source leases, sessions, worktrees, checkpoints, relays, or worker
+runtime identities.
+
+The replan model receives a deterministic, redacted, immutable evidence
+envelope containing only the source identity, canonical node state/dependency
+projection, bounded completed-result projections, typed failure summaries, and
+safe bounded metadata. It excludes transcript, tool arguments/results, logs,
+environment, secrets, workspace bytes, checkpoints, diffs, arbitrary paths,
+and authority instructions. UTF-8 budgets are 4 KiB per completed result,
+16 KiB for completed-result evidence, 8 KiB for failure/state evidence, and
+32 KiB rendered. Redaction happens before fingerprinting.
+
+`ApplicationComposition.create_task_dag_replan_service()` creates a fresh
+persisted one-step zero-tool binding. It has no local/provider-hosted tools,
+filesystem, Bash, terminal, network, MCP, LSP, Worktree, Checkpoint, worker,
+or background authority. The model returns only the existing typed
+`ModelDagProposal`; revision, source, successor, depth, and authority fields
+remain application-owned. Schema 26 stores insert-only
+`orchestration_dag_replan_attempts` and
+`orchestration_dag_replan_proposals` with exact source/evidence/proposal/
+successor identity and `FOREIGN KEY ... ON DELETE RESTRICT` preservation.
+
+The lifecycle is `CLAIMED -> PROVIDER_FENCED -> MODEL_COMMITTED ->
+PROPOSAL_PUBLISHED -> SUCCESSOR_DAG_PUBLISHED -> COMPLETED`, with typed
+`STALE` and `INDETERMINATE` terminal classifications. Source snapshot fencing
+is repeated before provider invocation and successor publication. A canonical
+source/revision identity has at most one provider call, proposal, and
+successor; duplicate recovery is idempotent and divergent evidence or
+publication is rejected without blind upsert.
+
+Fresh composition recovery reuses committed output, durable proposal, and an
+already inserted exact successor without provider replay. Observable generic
+provider-turn evidence before model commit becomes explicit recovery-required
+`INDETERMINATE`; the system never fabricates a successor. Independent spawned
+controllers have one durable owner/CAS winner and the loser neither calls the
+provider nor changes provenance. The slice is covered by fixture-provider
+focused tests, real `ApplicationComposition` process-death tests, a two-process
+race, and an end-to-end path into the existing parallel-aware Leader and
+Writable worker authorities. It has no public CLI/TUI/ACP orchestration API.
+
+### Bounded Agent Swarm / durable orchestration run
+
+ADR 0140 adds one internal bounded composition over the existing Planner,
+parallel-aware Leader, Task DAG, Writable Subagent, Parent Context Relay,
+predecessor-result Relay, Worktree, Checkpoint, worker-scoped LSP, and bounded
+Replan services. The Swarm owns only one parent-bound orchestration identity,
+its durable lifecycle, and exact DAG lineage. `ApplicationComposition` creates
+the lower-layer services through their existing factories; the Swarm does not
+create tools, sessions, workers, worktrees, checkpoints, LSP managers, or relay
+records directly.
+
+The durable lifecycle is `CLAIMED -> PLANNING -> PLANNED -> EXECUTING`, with
+`REPLANNING` for one eligible failed source DAG, `FINALIZING`, and terminal
+`COMPLETED`, `FAILED`, or `INDETERMINATE` states. The normal path is one
+model-generated A/B,C/D DAG, a real bounded Leader wave with B and C
+overlapping, isolated Writable workers with distinct managed resources, durable
+predecessor-result fan-in, D after B and C, and Leader finalization. The
+original graph definition and every successor identity remain immutable.
+
+Replan is allowed only after a source DAG is `FAILED`, quiescent, fully
+terminal, and free of `INDETERMINATE` nodes. The existing Replan service creates
+one exact immutable successor at `MAX_DAG_REPLAN_DEPTH=1`; the Swarm verifies
+source, evidence, proposal, revision, parent, and successor lineage before
+resuming execution. It never retries a worker or provider, resurrects source
+nodes, replans an uncertain/cancelled DAG, or creates a second successor.
+
+Schema 27 adds the insert-once, foreign-key-protected
+`orchestration_swarm_runs` projection. `BEGIN IMMEDIATE`, process-liveness
+ownership, generation CAS, and immutable identity fields give one-controller
+ownership. A losing or live-stale controller performs no provider call, DAG
+publication, worker allocation, or result mutation. Observable provider-turn
+uncertainty and cancellation are fail-closed as `INDETERMINATE`; fresh
+controllers reuse only durable terminal results or the lower-layer recovery
+contracts and never infer safe replay. The Swarm projection and all relays
+remain bounded and redacted: raw transcript, hidden reasoning, provider
+requests, tool arguments, environment, credentials, checkpoint blobs, and
+workspace contents do not cross this boundary.
+
+This representative `multiprocessing`-spawn recovery matrix proves four
+explicit process boundaries: completed Planner state before the Swarm
+`PLANNED` transition, a terminal lower Leader/DAG result before `FINALIZING`,
+a durable Replan successor before the Swarm current-DAG switch with an
+immutable failed source, and a durable `FINALIZING` result before `COMPLETED`.
+Each L1 process exits with `os._exit`; fresh composition L2 verifies exact
+durable identities, provider/resource counts, and no replay. The matrix is
+intentionally representative and does not claim every arbitrary kill timing
+or live-provider coverage. A composition-level lower-layer `INDETERMINATE`
+result is terminal and does not enter Replan.
+
+This is an internal vertical slice only. It does not add recursive Swarms,
+unbounded agents or queues, generic retry, shared writable worktrees,
+merge/copy-back/cherry-pick/patch adoption, public CLI/TUI/ACP orchestration,
+remote execution, marketplace integration, or a new Checkpoint/Rollback
+implementation. Automatic Ultracode delegation is the separate bounded entry
+described below. See [ADR 0140](adr/0140-bounded-agent-swarm-durable-orchestration-run.md).
+
+### Automatic Ultracode delegation / durable branch entry
+
+ADR 0141 adds the first application-owned Ultracode entry. `max` remains the
+deepest ordinary single-agent reasoning/review policy. Only an explicit
+`ReasoningEffort.ULTRACODE` user turn enters this service; `low`, `medium`,
+`high`, `xhigh`, and `max` retain the ordinary ConversationRunner path.
+
+The entry uses a bounded deterministic local policy rather than a second model
+classifier call. In this slice the policy is a fixed marker heuristic for
+parallel/decomposition, cross-file, and research wording; it is not semantic
+task classification or model-level routing intelligence. It makes only the
+typed choice `MAIN_MAX` or `BOUNDED_SWARM`. It cannot choose tools, worker
+count, DAG definitions, sandbox, workspace roots, network, MCP, retry, merge,
+or provider credentials. The `MAIN_MAX` branch invokes the existing parent
+`ConversationRunner` with its normal single-agent `max` semantics. The
+`BOUNDED_SWARM` branch invokes the existing
+`ApplicationComposition.create_agent_swarm_service()` with one deterministic
+`swarm_run_id`; no second Planner, Leader, DAG, Writable worker, or Swarm is
+introduced.
+
+Interactive TUI composition binds this application entry once as a dormant
+delegate. `SessionTurnService` reads the controller's current effort for every
+user turn, so a long-lived service can switch `max` → `ultracode` → `max` →
+`ultracode` without service recreation; ordinary efforts never call the
+delegate.
+
+Session schema 28 added the insert-once
+`orchestration_ultracode_executions` projection; current schema 29 retains it.
+Its immutable identity binds
+the actual parent session, exact parent turn, input/context fingerprints,
+provider/model/context provenance, one decision, and one downstream identity.
+`BEGIN IMMEDIATE`, process-liveness ownership, and generation CAS protect the
+`DECIDED -> MAIN_MAX_RUNNING` or `DECIDED -> BOUNDED_SWARM_RUNNING` choice.
+The bounded lifecycle then records `FINALIZING`, `COMPLETED`, or
+`INDETERMINATE`; a failed, cancelled, fenced, or observable-uncertain branch
+never switches to the other branch.
+
+`MAIN_MAX` and `BOUNDED_SWARM` both publish exactly one parent-visible
+assistant result through the existing conversation finalization contract.
+Committed output is matched only by exact `(session_id, turn_id,
+ultracode_execution_id)` evidence. The raw A–E matrix directly exercises
+durable lifecycle seams and is not, by itself, full composition proof. Two
+additional `multiprocessing`-spawn acceptances use fresh
+`ApplicationComposition` instances: MAIN_MAX exits after the exact parent
+`TURN_COMPLETED` result is durable but before the Ultracode terminal transition,
+while BOUNDED_SWARM exits after the existing Swarm is `COMPLETED` but before
+the parent external-turn commit. Recovery reuses the exact durable result and
+identity without another provider, Planner, Leader, Worker, or Swarm
+execution, and resource counts remain unchanged. A crash with an open parent
+attempt fails closed unless the exact lower Swarm identity already exists and
+can be resumed by the existing Swarm service. There is no latest-row lookup,
+timestamp correlation, text matching, silent fallback, or duplicate assistant
+append.
+
+The parent `ConversationBinding` remains the capability ceiling. The entry
+adds no filesystem, Bash, LSP, MCP, network, Worktree, Checkpoint, or Writable
+authority, and provider adapters never receive a fabricated native
+`ultracode` value. The CLI and TUI may enter this internal service; the first
+slice exposes only bounded orchestration progress plus the final answer and
+does not add an ACP effort surface. Recursive Ultracode, automatic delegation
+for ordinary efforts, generic retry, merge/copy-back, checkpoint rollback,
+remote/cloud execution, and a public Swarm dashboard remain outside the
+Ultracode slice. The bounded internal Result Adoption core is specified
+separately below, and its only automatic composition seam is the stacked
+integration in [ADR 0144](adr/0144-automatic-ultracode-result-adoption-integration.md).
+See [ADR 0141](adr/0141-automatic-ultracode-delegation.md).
+
+### Bounded durable result adoption core
+
+ADR 0143 adds an explicit internal application service for adopting a bounded
+set of preserved writable-worker results into the actual parent checkout. A
+worker result is evidence about its own managed Worktree, not permission to
+mutate the parent. The service receives only an adoption identity and a
+completed Swarm identity, then generates an immutable application-owned
+`ResultAdoptionPlan` from the actual active parent `ConversationBinding`, the
+completed Task DAG, preserved Writable leases, managed READY Worktrees, READY
+baseline Checkpoints, and live worker projections. Response text, Leader or
+Relay text, `git diff`, model-provided paths, and caller-provided parent
+manifests are never sources of authority.
+
+Every eligible source is bound to the exact parent session/task, child session,
+lease, Worktree, baseline Checkpoint, base commit, final workspace fingerprint,
+capability fingerprint, grant fingerprint, and repository identity. Before a
+plan is created, the canonical live preserved-worker fingerprint must equal
+both the completed DAG node and the preserved lease. The parent binding's
+actual repository and current committed HEAD must match every source base
+commit; unrelated parent dirty paths remain outside the target set.
+
+The plan performs conservative three-way classification: baseline absent plus
+desired present is `CREATE`, baseline and desired present with a baseline
+difference is `UPDATE`, and baseline present plus desired absent is `DELETE`.
+The parent must be absent or exactly equal to the baseline as appropriate.
+Same-path parent changes are durable `CONFLICT` before `APPLYING`; overlap
+between eligible workers is rejected before plan publication. Symlinks,
+link-like traversal, special files, mode-only changes, protected Neuro state,
+credential/key paths, checkpoint/worktree storage, and outside-root targets fail
+closed. The first slice is bounded to 8 source workers, 64 target files,
+32 MiB total target images, 8 MiB per file image, and 4 KiB per relative path.
+
+Session schema 29 adds insert-only `result_adoptions` and per-target
+`result_adoption_targets` projections. Their durable lifecycle is
+`CLAIMED -> VERIFIED -> APPLYING -> VERIFYING -> COMPLETED`, with terminal
+`CONFLICT`, `FAILED`, and `INDETERMINATE` outcomes. Each target records
+`NOT_STARTED`, `APPLYING`, `RETRYABLE`, `APPLIED`, `CONFLICT`, `FAILED`, or
+`INDETERMINATE`. Before any observable target mutation, its expected pre-image,
+desired image, operation, path, and fingerprints are durable. Recovery retries
+only when the actual image is still expected, marks `APPLIED` without rewriting
+when the desired image is already present, and never overwrites a third image.
+Multi-file filesystem mutation is not atomic; partial application recovers
+forward and external modification after an attempted effect becomes
+`INDETERMINATE` without rollback.
+
+Parent writes use the mutation port captured from the active binding and retain
+the normal canonical filesystem target, Permission/scoped-approval,
+workspace/instruction, sandbox/profile, and exact regular-file execution
+layers. `CREATE` and `UPDATE` may use the existing `WORKSPACE_EDITS` candidate
+only when ordinary canonical rules produce it; `DELETE` never inherits that
+broad candidate. Explicit deny, a foreign session/root, model or worker text,
+and memory-only grants cannot authorize adoption. Completed adoption is
+idempotent with zero writes on a fresh invocation. Worker Worktrees, leases,
+READY Checkpoints, DAG rows, and Swarm resources remain preserved. This core
+does not add model merge/conflict resolution, cleanup, rollback, commit/push,
+remote execution, TUI/ACP entrypoints, or a general merge/copy-back engine.
+Automatic Ultracode wiring is provided only by the separate composition slice
+in [ADR 0144](adr/0144-automatic-ultracode-result-adoption-integration.md).
+See [ADR 0143](adr/0143-bounded-durable-result-adoption.md).
+
+The production-shaped acceptance covers real temporary-Git A/B/C/D process
+boundaries. A durable plan survives controller death without duplicate writes;
+an attempted write followed by death is acknowledged from the desired image;
+a third-party image after durable `APPLYING` becomes `INDETERMINATE` with its
+bytes preserved and no retry write; and a completed adoption re-entered by a
+fresh composition returns the same durable result with no new filesystem,
+plan, target, worker, Worktree, Checkpoint, or approval side effects. Schema
+28-to-29 migration and repeated schema-29 initialization preserve existing
+rows and the adoption projections.
+
+### Automatic Ultracode result adoption integration
+
+[ADR 0144](adr/0144-automatic-ultracode-result-adoption-integration.md) adds
+the one bounded composition seam between the explicit `ULTRACODE` entry and
+the internal Result Adoption core. `MAIN_MAX` retains ordinary single-agent
+semantics and performs zero adoption activity. `BOUNDED_SWARM` must first
+produce the exact canonical terminal `AgentSwarmResult`, then passes that
+typed result and the actual parent `ConversationBinding` to Result Adoption.
+The parent external turn is committed only after adoption reaches
+`COMPLETED`; Ultracode reaches `COMPLETED` only after that parent commit.
+
+Adoption identity is derived deterministically from the exact Ultracode
+execution and Swarm run identities. `CONFLICT`, `FAILED`, and
+`INDETERMINATE` remain bounded parent-visible outcomes; there is no
+`MAIN_MAX` fallback, provider/Swarm replay, model merge, overwrite, or silent
+success. Fresh-process A/B/C/D recovery reuses exact durable identities,
+preserves worker resources, and avoids replaying completed lower work. The
+integration uses the existing permission, workspace, sandbox, and
+`ULTRACODE_DELEGATION_PROGRESS` contracts; it does not expose raw patches,
+workspace bytes, secrets, or a new model tool.
 
 ## Platform policy
 
@@ -1570,7 +2482,7 @@ zero skips and prove final-child identity, filesystem/network enforcement,
 binary/protocol transport, normal wait, explicit termination, controller-loss
 cleanup, and runner kill-on-close ownership. PTY/ConPTY remains W4, and the
 existing `off` path is unchanged. The accepted W5 workload matrix (run
-`32194952573`) passes Python and child Python, PowerShell, Git, Node/npm, curl,
+`32374860136`) passes Python and child Python, PowerShell, Git, Node/npm, curl,
 NUL read/write modes, and dynamic BCrypt startup through both W3 and W4; future
 developer tools still require their own bounded evidence rows.
 
@@ -2028,3 +2940,114 @@ can advance with an append-only Agent conversation and preserves cache
 creation/read usage, and Gemini preserves reported implicit cached-content usage.
 Unreported fields remain `None`; the Runtime never infers a cache split or
 claims a cache hit from an aggregate input total.
+
+## Read-only Language Server Protocol boundary
+
+The LSP vertical slice is an application-owned semantic read path. The stable
+`lsp` tool is registered by `ToolRegistry` and executed by the ordinary
+`ToolExecutor`, so its input path uses the same canonical
+`FilesystemAccessPlan` and permission decision as other structured read tools.
+The tool is never journaled as a mutation and its cross-file result projection
+does not open an approval prompt.
+
+`ApplicationComposition` creates one `LanguageServerManager` per binding. A
+binding-owned resource scope closes short-lived worker managers immediately;
+application shutdown closes any managers that remain. The manager routes by
+canonical workspace root plus explicit `LanguageServerProfile`; it is not a
+TUI singleton and does not own a second configuration system. Profile commands
+are argv-only and are started through `LocalProcessSandbox` with
+`LocalProcessPurpose.LSP_SERVER`, read-only workspace roots, explicit
+environment, and bounded process lifecycle.
+
+The MCP stdio adapter remains MCP-owned and newline-framed. LSP has a separate
+Content-Length JSON-RPC framer and its own request correlation, cancellation,
+server-request safety responses, diagnostics cache, bounded stderr, and close
+handshake. LSP output is untrusted: only safe local file URIs within the
+canonical workspace roots are projected, and permission DENY/ASK plus invalid,
+outside, or link-like locations are omitted.
+
+The implemented operations are definition, references, hover, document
+symbols, workspace symbols, diagnostics, status, and bounded restart. Rename,
+format, code actions, `workspace/applyEdit`, and arbitrary server edits remain
+outside the LSP slice. Worktree and checkpoint capabilities are application-
+owned seams described below. The LSP manager never mutates them; ADR 0132
+composes a read-only manager into the explicit managed-worktree worker binding.
+
+## Application-owned managed Git worktrees
+
+The first worktree capability is an explicit application service rather than a
+model-facing arbitrary Git tool. `ApplicationComposition` can construct one
+`WorktreeApplicationService` backed by `GitWorktreePort` and a separate,
+versioned `worktrees.db` ownership store. The service uses the existing
+canonical filesystem resolver only for workspace binding; Git repository
+identity is a separate value based on the canonical common Git directory,
+source worktree, Git directory, and observed HEAD.
+
+Managed paths live below the state directory at
+`worktrees/<repository-id>/<worktree-id>`, outside the source checkout. A
+create request names an explicit base revision, which is resolved to an exact
+commit and preflighted for applicable external checkout filters before a
+detached or `neuro/worktree/<id>` branch worktree is added.
+Source dirty changes remain exclusively in the source checkout. Additional
+workspace roots are not inherited by a worktree binding.
+
+The local Git adapter submits argv-safe requests through the canonical local
+process sandbox port, with bounded output, timeouts, and cancellation cleanup;
+it does not create subprocesses directly. Every invocation overrides
+`core.hooksPath` with an empty Neuro Code-owned directory and sets
+`core.fsmonitor=false`. It also asks Git, using the exact target commit,
+whether an applicable checkout filter has a configured `smudge` or `process`
+driver; such a driver is rejected before checkout. The existing
+`ProcessTreeLocalProcessSandbox` bridge with `SandboxProfile.OFF` is a
+lifecycle bridge, not OS-enforced filesystem or network isolation, so the
+capability does not claim that guarantee. Explicit remote operations remain
+absent: it performs no fetch/pull/push/clone or repo-wide prune. Removal
+requires durable managed ownership plus matching repository/path/HEAD/branch
+identity and uses `git worktree remove` without `--force`; dirty and locked
+worktrees refuse removal, while managed branches are retained.
+The managed worktree capability requires Git 2.40.0 or newer because its
+fail-closed filter preflight relies on `git check-attr --source=<tree-ish>`;
+older Git is rejected during initialization.
+
+SQLite intent and Git metadata are not treated as one transaction. The
+worktree schema uses an insert-only ownership claim plus a durable generation
+CAS: `WorktreeId` conflicts cannot overwrite an existing row, canonical paths
+remain unique, and every later mutation requires the expected generation/state
+and increments the generation. A stale writer receives
+`CONCURRENT_MODIFICATION`; reconciliation rereads the winner instead of
+overwriting it. Durable `CREATING`/`REMOVING` records are reconciled against
+actual Git records after process death. Exact matches can become `READY`, an
+absent record after a remove intent becomes `REMOVED`, and path reuse, missing
+repositories, and identity mismatches become `ORPHANED` without filesystem
+deletion. See [ADR 0129](adr/0129-managed-git-worktree-capability.md).
+
+## Managed workspace checkpoint and rollback
+
+Workspace checkpointing is a separate explicit internal capability and does
+not reuse execution segment checkpoints or `session_turn_attempts`. The
+segment event is a progress/audit marker; turn recovery is request/output/tool
+durability; a workspace checkpoint is a source projection owned by one ready
+managed worktree. `WorkspaceCheckpointApplicationService` is constructed only
+through `ApplicationComposition.create_workspace_checkpoint_service()` and is
+not a model-facing tool or an automatic policy.
+
+Capture accepts a `WorktreeHandle`, proves the durable managed-worktree record,
+and stores the exact per-worktree Git index plus tracked and non-ignored
+untracked regular files/symlinks under a separate `checkpoints.db` and
+state-owned content-addressed artifacts. It includes staged and unstaged
+content, tracked deletions, binary bytes, modes, and safe symlink targets;
+ignored files are out of scope. Unmerged stages, intent-to-add, sparse/split
+indexes, submodules, nested repositories, special files, and unsafe link-like
+parents fail closed. A deterministic SHA-256 fingerprint covers identity,
+HEAD, index, modes, paths, and in-scope content.
+
+Rollback is restricted to the same owned managed worktree and exact checkpoint
+HEAD. It persists a separate `RollbackAttempt` before mutation, acquires a
+unique Neuro Code Git worktree lock, enumerates exact checkpoint-after paths,
+restores files and the index through the workspace adapter, and verifies the
+final fingerprint. It never uses broad `git clean`, stash, reset, checkout,
+branch-ref rewrite, history rewind, or arbitrary recursive deletion. Ignored
+files remain untouched. Partial or uncertain operations are durable
+`INDETERMINATE` and can be reconciled after process death; READY checkpoint
+targets are immutable and CAS-protected. See [ADR
+0130](adr/0130-managed-workspace-checkpoint-rollback.md).

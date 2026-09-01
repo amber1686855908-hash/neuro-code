@@ -5,12 +5,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from neuro_code.domain.conversation.messages import ContentPart
+from neuro_code.domain.conversation.reasoning import ReasoningEffort
 from neuro_code.domain.execution import TurnCancellationPolicy, TurnSource
+from neuro_code.shared.errors import ConfigurationError
 
 if TYPE_CHECKING:
     from neuro_code.application.runtime.agent import AgentRunResult, EventSink
@@ -34,6 +36,7 @@ class RunTurnRequest:
     cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN
     turn_source: TurnSource = TurnSource.USER
     expected_session_id: str | None = None
+    turn_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.prompt, str):
@@ -50,6 +53,10 @@ class RunTurnRequest:
             not isinstance(self.expected_session_id, str) or not self.expected_session_id.strip()
         ):
             raise ValueError("expected_session_id must be non-empty when provided")
+        if self.turn_id is not None and (
+            not isinstance(self.turn_id, str) or not self.turn_id.strip()
+        ):
+            raise ValueError("turn_id must be non-empty when provided")
 
 
 class SessionTurnRunner(Protocol):
@@ -61,6 +68,9 @@ class SessionTurnRunner(Protocol):
     @property
     def session_id(self) -> str | None: ...
 
+    @property
+    def reasoning_effort(self) -> ReasoningEffort: ...
+
     async def run(
         self,
         prompt: str,
@@ -69,7 +79,14 @@ class SessionTurnRunner(Protocol):
         content_parts: Sequence[ContentPart] = (),
         cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
         turn_source: TurnSource = TurnSource.USER,
+        turn_id: str | None = None,
+        ultracode_execution_id: str | None = None,
     ) -> AgentRunResult: ...
+
+
+type UltracodeDelegate = Callable[
+    ["RunTurnRequest", "EventSink | None"], "Awaitable[AgentRunResult]"
+]
 
 
 class SessionTurnService:
@@ -78,10 +95,16 @@ class SessionTurnService:
     将回合契约绑定到现有会话运行器.
     """
 
-    __slots__ = ("_runner",)
+    __slots__ = ("_runner", "_ultracode_delegate")
 
-    def __init__(self, runner: SessionTurnRunner) -> None:
+    def __init__(
+        self,
+        runner: SessionTurnRunner,
+        *,
+        ultracode_delegate: UltracodeDelegate | None = None,
+    ) -> None:
         self._runner = runner
+        self._ultracode_delegate = ultracode_delegate
 
     @property
     def session_id(self) -> str | None:
@@ -105,13 +128,23 @@ class SessionTurnService:
             and self._runner.session_id != request.expected_session_id
         ):
             raise ValueError("conversation runner is bound to a different session")
+        effort = getattr(self._runner, "reasoning_effort", None)
+        if request.turn_source is TurnSource.USER and effort is ReasoningEffort.ULTRACODE:
+            if self._ultracode_delegate is None:
+                raise ConfigurationError("Ultracode delegation entry is not configured")
+            return await self._ultracode_delegate(request, sink)
+        kwargs: dict[str, Any] = {
+            "sink": sink,
+            "content_parts": request.content_parts,
+            "cancellation_policy": request.cancellation_policy,
+            "turn_source": request.turn_source,
+        }
+        if request.turn_id is not None:
+            kwargs["turn_id"] = request.turn_id
         return await self._runner.run(
             request.prompt,
-            sink=sink,
-            content_parts=request.content_parts,
-            cancellation_policy=request.cancellation_policy,
-            turn_source=request.turn_source,
+            **kwargs,
         )
 
 
-__all__ = ["RunTurnRequest", "SessionTurnRunner", "SessionTurnService"]
+__all__ = ["RunTurnRequest", "SessionTurnRunner", "SessionTurnService", "UltracodeDelegate"]

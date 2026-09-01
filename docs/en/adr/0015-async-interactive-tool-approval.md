@@ -27,16 +27,22 @@ tool starts while approval is pending or after denial/cancellation.
   after an allowed resolution. A missing handler denies; cancellation aborts
   the turn, records a paired error result under ADR 0016, and never starts the
   tool.
-- The TUI uses `SessionApprovalBroker` and a modal with three outcomes: allow
-  once, allow an identical action for this process session, or deny. Deny is the
-  initially focused option; `Esc`, `Ctrl+C`, and `D` also deny. Modal `Ctrl+C`
-  denies this request rather than cancelling the whole turn.
-- A session approval is scoped to the SHA-256 digest of the canonical tool name
-  and complete argument mapping. The digest is kept in memory only. Every call
-  still passes through `PermissionManager` first, so a later explicit deny
-  cannot be bypassed by an earlier session approval. Arguments that cannot be
-  canonicalized as JSON and Bash commands that cannot be safely decomposed both
-  downgrade a session choice to allow-once.
+- The TUI uses `SessionApprovalBroker` and a modal with the exact-action
+  outcome plus only runtime-generated typed scope candidates. The initial
+  focus remains deny; `Esc`, `Ctrl+C`, and `D` also deny. A user may approve
+  ordinary `search_replace`/`apply_patch` targets as a primary-workspace edit
+  scope, or one of the conservative `test`, `static_check`, or `git_read`
+  command families. There is no “allow all” outcome, and modal `Ctrl+C` denies
+  this request rather than cancelling the whole turn.
+- Exact-action session approval remains scoped to the SHA-256 digest of the
+  canonical tool name and complete argument mapping. Broad approvals are
+  separate typed grants, bound to the trusted session identity and canonical
+  workspace root. They are generated only after canonical filesystem planning
+  or conservative Bash classification; a model cannot invent a candidate.
+  Every call still passes through `PermissionManager` first, so explicit deny,
+  explicit ask, mode decisions, and high-risk operations cannot be bypassed by
+  an earlier broad grant. Arguments that cannot be canonicalized as JSON and
+  Bash commands that cannot be safely classified downgrade to allow-once.
 - The modal receives a bounded policy-generated summary, not the general raw
   argument mapping. Bash displays a bounded command because that is the action
   being authorized. Search/replace displays its workspace path and operation
@@ -52,9 +58,11 @@ session caching avoids repeated prompts without granting an entire tool or
 command family.
 
 Approvals do not survive process restart and cannot yet create reviewed
-persistent allow/deny rules. Rich argument diffs, queued approvals from multiple
-concurrent agents, user-provided rejection feedback, and ACP permission mapping
-remain future vertical slices.
+persistent allow/deny rules. The broker re-checks queued equivalent requests
+after the first decision, but an allow-once, denial, or cancellation never
+grants a waiting request. Rich argument diffs, user-provided rejection
+feedback, and ACP scoped-option presentation remain future vertical slices;
+ACP still exposes only its existing exact-action options.
 
 ## Validation
 

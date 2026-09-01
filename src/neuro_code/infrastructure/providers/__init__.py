@@ -15,6 +15,7 @@ from neuro_code.shared.errors import ConfigurationError
 
 if TYPE_CHECKING:
     from neuro_code.infrastructure.providers.anthropic import AnthropicProvider
+    from neuro_code.infrastructure.providers.catalog_cache import PersistentProviderCatalog
     from neuro_code.infrastructure.providers.failover import (
         FailoverModelProvider,
         ProviderCandidate,
@@ -29,6 +30,10 @@ if TYPE_CHECKING:
     from neuro_code.infrastructure.providers.openai_responses import OpenAIResponsesProvider
     from neuro_code.infrastructure.providers.provider_catalog import HttpProviderCatalog
     from neuro_code.infrastructure.providers.provider_settings import JsonProviderSettingsStore
+    from neuro_code.infrastructure.providers.resilience import (
+        ProviderHealth,
+        ResilientModelProvider,
+    )
 
 __all__ = [
     "AnthropicProvider",
@@ -39,7 +44,10 @@ __all__ = [
     "JsonProviderSettingsStore",
     "OpenAICompatibleProvider",
     "OpenAIResponsesProvider",
+    "PersistentProviderCatalog",
     "ProviderCandidate",
+    "ProviderHealth",
+    "ResilientModelProvider",
     "create_provider",
     "create_routed_provider",
 ]
@@ -162,8 +170,10 @@ def create_routed_provider(config: AppConfig, *, failover: bool = True) -> Model
     route = config.main_route
     primary = _route_profile(config, route.provider_profile, route.model)
     fallback_names = route.fallback_profiles
+    from neuro_code.infrastructure.providers.resilience import ResilientModelProvider
+
     if not failover or not fallback_names:
-        return create_provider(primary)
+        return ResilientModelProvider(create_provider(primary))
     from neuro_code.infrastructure.providers.failover import (
         FailoverModelProvider,
         ProviderCandidate,
@@ -179,15 +189,21 @@ def create_routed_provider(config: AppConfig, *, failover: bool = True) -> Model
             profile.name,
             profile.model,
             profile.context_affinity,
-            partial(create_provider, profile),
+            partial(_create_resilient_provider, profile),
             context_window_tokens=profile.context_window_tokens,
             capabilities=_runtime_capabilities(profile),
         )
         for profile in profiles
     )
     if len(candidates) == 1:
-        return create_provider(primary)
+        return ResilientModelProvider(create_provider(primary))
     return FailoverModelProvider(candidates)
+
+
+def _create_resilient_provider(profile: ProviderProfile) -> ModelProvider:
+    from neuro_code.infrastructure.providers.resilience import ResilientModelProvider
+
+    return ResilientModelProvider(create_provider(profile))
 
 
 def _route_profile(config: AppConfig, profile_name: str, model: str) -> ProviderProfile:
@@ -250,6 +266,18 @@ def __getattr__(name: str) -> object:
         from neuro_code.infrastructure.providers.provider_catalog import HttpProviderCatalog
 
         return HttpProviderCatalog
+    if name == "PersistentProviderCatalog":
+        from neuro_code.infrastructure.providers.catalog_cache import PersistentProviderCatalog
+
+        return PersistentProviderCatalog
+    if name == "ResilientModelProvider":
+        from neuro_code.infrastructure.providers.resilience import ResilientModelProvider
+
+        return ResilientModelProvider
+    if name == "ProviderHealth":
+        from neuro_code.infrastructure.providers.resilience import ProviderHealth
+
+        return ProviderHealth
     if name == "JsonProviderSettingsStore":
         from neuro_code.infrastructure.providers.provider_settings import JsonProviderSettingsStore
 

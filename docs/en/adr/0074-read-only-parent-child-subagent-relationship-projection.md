@@ -37,9 +37,9 @@ typed request and projection values:
   arguments, or raw child context.
 - SQLite reuses the existing `subagent_links` table with a bounded ordered
   read. No schema migration or new persistence record is introduced.
-- No CLI, TUI, ACP, scheduler, replay, automatic resume, or execution call is
-  added. Future interfaces may consume this projection through the
-  application boundary.
+- At this slice, no CLI, TUI, ACP, scheduler, replay, automatic resume, or
+  execution call is added. Later bounded interface slices may consume this
+  projection through the application boundary.
 
 ## Rejected alternatives
 
@@ -57,6 +57,7 @@ typed request and projection values:
 ## Consequences
 
 Callers can render or audit parent-child relationships without depending on
-SQLite or reading a child transcript. The projection deliberately does not
-provide a user-facing command yet; that remains a later vertical slice with
-its own authorization, concurrency, and protocol tests.
+SQLite or reading a child transcript. At this ADR's acceptance, the projection
+deliberately did not provide a user-facing command; later bounded CLI, TUI, and
+ACP slices consume it through their own authorization, concurrency, and
+protocol-tested entrypoints.

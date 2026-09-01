@@ -12,7 +12,11 @@ from neuro_code.domain.background_tasks.models import BackgroundWakeState
 from neuro_code.domain.conversation.compaction import DurableCompactionItem
 from neuro_code.domain.conversation.events import AgentEvent
 from neuro_code.domain.conversation.messages import Message, SessionItem
-from neuro_code.domain.execution import SessionExecutionRecord
+from neuro_code.domain.execution import (
+    SessionExecutionRecord,
+    TurnRecoveryAttempt,
+    TurnRecoveryFact,
+)
 from neuro_code.domain.plans import PlanComment, SessionPlan
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.session_tasks import SessionTask, SubagentLink
@@ -63,12 +67,34 @@ class SessionStore(Protocol):
 
     async def save_session_items(self, session_id: str, items: Sequence[SessionItem]) -> None: ...
 
+    async def start_turn_attempt(self, attempt: TurnRecoveryAttempt) -> None: ...
+
+    async def start_plan_turn_attempt(
+        self,
+        attempt: TurnRecoveryAttempt,
+        *,
+        task: SessionTask | None = None,
+        queued_task_id: str | None = None,
+        started_at: datetime | None = None,
+    ) -> SessionTask: ...
+
+    async def append_turn_recovery_fact(
+        self,
+        session_id: str,
+        turn_id: str,
+        event: AgentEvent,
+        fact: TurnRecoveryFact,
+    ) -> None: ...
+
     async def finalize_turn(
         self,
         session_id: str,
         event: AgentEvent,
         items: Sequence[SessionItem],
         record: SessionExecutionRecord | None,
+        turn_id: str | None = None,
+        task: SessionTask | None = None,
+        task_event: AgentEvent | None = None,
     ) -> None: ...
 
     async def finalize_turn_with_compaction(
@@ -78,7 +104,37 @@ class SessionStore(Protocol):
         items: Sequence[SessionItem],
         record: SessionExecutionRecord | None,
         compaction_item: DurableCompactionItem,
+        turn_id: str | None = None,
+        task: SessionTask | None = None,
+        task_event: AgentEvent | None = None,
     ) -> None: ...
+
+    async def finalize_turn_failure(
+        self,
+        session_id: str,
+        turn_id: str | None,
+        event: AgentEvent,
+        items: Sequence[SessionItem],
+        *,
+        resolution: str,
+        task: SessionTask | None = None,
+        task_event: AgentEvent | None = None,
+    ) -> None: ...
+
+    async def abandon_turn_attempt(
+        self,
+        session_id: str,
+        turn_id: str,
+        event: AgentEvent,
+        reason: str,
+        *,
+        task: SessionTask | None = None,
+        task_event: AgentEvent | None = None,
+    ) -> None: ...
+
+    async def load_turn_attempts(self, session_id: str) -> list[TurnRecoveryAttempt]: ...
+
+    async def load_open_turn_attempts(self, session_id: str) -> list[TurnRecoveryAttempt]: ...
 
     async def save_session_plan(self, session_id: str, plan: SessionPlan | None) -> None: ...
 

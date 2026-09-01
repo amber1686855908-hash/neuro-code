@@ -35,5 +35,6 @@ Provider 失败和子运行失败会映射为有界 ACP internal-error reason；
 
 ## 后果
 
-不需要 schema 或普通 ACP 会话生命周期变更. 客户端必须明确知道该私有方法；标准 ACP 客户端继续看到
-现有方法和 capability 集合. TUI 调用、自动委派以及可写/递归子代理仍属于后续工作.
+不需要 schema 或普通 ACP 会话生命周期变更。客户端必须明确知道该私有方法；标准 ACP 客户端继续看到
+现有方法和 capability 集合。后续有界切片增加了 TUI 入口和有界 Automatic Ultracode delegation；本扩展
+仍是显式只读操作。通用或无界调度、重试、递归或并行子代理以及可写子代理仍在支持边界之外。

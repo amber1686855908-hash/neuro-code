@@ -24,6 +24,9 @@ class ReasoningEffortSelectionResult:
     requested: ReasoningEffort
     effective: ReasoningEffort
     changed: bool
+    # True means the selected application strategy routes eligible user turns
+    # through the workflow entry; it does not mean a downstream workflow is
+    # currently running.
     workflow_orchestration_active: bool = False
 
 

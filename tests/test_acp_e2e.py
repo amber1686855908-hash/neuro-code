@@ -327,6 +327,11 @@ context_window_tokens = 32000
                     capabilities,
                     {
                         "loadSession": True,
+                        "promptCapabilities": {
+                            "image": True,
+                            "audio": True,
+                            "embeddedContext": True,
+                        },
                         "mcpCapabilities": {"http": True, "sse": True},
                         "sessionCapabilities": {
                             "list": {},

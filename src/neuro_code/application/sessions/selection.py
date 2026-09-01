@@ -12,13 +12,17 @@ profile 会话控制器仍负责会话绑定替换、锁、工作区检查和恢
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from neuro_code.application.sessions.contracts import (
     SessionOption,
     SessionSelectionResult,
 )
+from neuro_code.application.sessions.recovery import TurnRecoveryInspection
 from neuro_code.domain.sessions import SessionSummary
+
+if TYPE_CHECKING:
+    from neuro_code.application.runtime.agent_loop import AgentRunResult, EventSink
 
 
 class SessionSelectionController(Protocol):
@@ -32,6 +36,22 @@ class SessionSelectionController(Protocol):
     async def select_session(self, session_id: str) -> SessionSelectionResult: ...
 
     async def rename_session(self, title: str) -> SessionSummary: ...
+
+    async def inspect_recovery(self) -> tuple[TurnRecoveryInspection, ...]: ...
+
+    async def abandon_recovery(
+        self,
+        turn_id: str,
+        *,
+        reason: str = "explicit_user_resolution",
+    ) -> TurnRecoveryInspection: ...
+
+    async def retry_recovery(
+        self,
+        turn_id: str,
+        *,
+        sink: EventSink | None = None,
+    ) -> AgentRunResult: ...
 
 
 class SessionSelectionService:
@@ -74,6 +94,25 @@ class SessionSelectionService:
         """
 
         return await self._controller.rename_session(title)
+
+    async def inspect_recovery(self) -> tuple[TurnRecoveryInspection, ...]:
+        return await self._controller.inspect_recovery()
+
+    async def abandon_recovery(
+        self,
+        turn_id: str,
+        *,
+        reason: str = "explicit_user_resolution",
+    ) -> TurnRecoveryInspection:
+        return await self._controller.abandon_recovery(turn_id, reason=reason)
+
+    async def retry_recovery(
+        self,
+        turn_id: str,
+        *,
+        sink: EventSink | None = None,
+    ) -> AgentRunResult:
+        return await self._controller.retry_recovery(turn_id, sink=sink)
 
 
 __all__ = ["SessionSelectionController", "SessionSelectionService"]

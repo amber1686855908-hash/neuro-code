@@ -23,6 +23,11 @@ from neuro_code.application.permissions.contracts import (
     PermissionApprovalKind,
     build_permission_request,
 )
+from neuro_code.application.permissions.scopes import (
+    PermissionScopeCandidate,
+    PermissionScopeContext,
+    PermissionScopeKind,
+)
 from neuro_code.application.ports.http import HttpClientPolicy
 from neuro_code.application.ports.provider_catalog import (
     ProviderCatalogError,
@@ -77,6 +82,7 @@ from neuro_code.application.workflows import (
     RunSubagentRequest,
     SubagentResultProjection,
 )
+from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
 from neuro_code.domain.background_tasks import (
     BackgroundTaskSnapshot,
     BackgroundTaskStatus,
@@ -119,6 +125,7 @@ from neuro_code.tui import (
     AssistantMarkdown,
     AssistantMessage,
     BackgroundWakeSettingsScreen,
+    CollapsingPulseAnimation,
     ConversationMessage,
     LanguageSettingsScreen,
     NetworkProxySettingsScreen,
@@ -303,7 +310,13 @@ class ProviderFailureThenSuccessTuiConversation(TuiConversation):
             self._fail_first_request = False
             self.prompts.append(prompt)
             self._session_id = "provider-failure-session"
-            raise ProviderError("Responses API request failed with HTTP 402: insufficient balance")
+            raise ProviderError.from_http(
+                402,
+                "insufficient balance; api_key=provider-secret-value; "
+                "Authorization: Bearer bearer-fixture-token; "
+                "https://user:password@example.invalid/v1",
+                redaction_values=("provider-secret-value",),
+            )
         return await super().run(
             prompt,
             sink=sink,
@@ -332,6 +345,15 @@ class TypedTuiConversation(TuiConversation):
             sink=sink,
             cancellation_policy=cancellation_policy,
         )
+
+
+class SwitchingTuiConversation(TypedTuiConversation):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reasoning_effort = ReasoningEffort.HIGH
+
+    def set_reasoning_effort(self, effort: ReasoningEffort) -> None:
+        self.reasoning_effort = effort
 
 
 class AutoWakeTuiConversation:
@@ -427,6 +449,36 @@ class ApprovalTuiConversation:
             "search_replace",
             {"path": "note.txt", "old": "private-old", "new": "private-new"},
             "interactive approval required",
+        )
+        approval = await self._broker.request(request)
+        self.approvals.append(approval)
+        self.executed = approval.allowed
+        self._session_id = "approval-session"
+        response = "approved" if approval.allowed else "denied"
+        return AgentRunResult(self._session_id, response, (), (), (), 1)
+
+
+class ScopedApprovalTuiConversation(ApprovalTuiConversation):
+    async def run(
+        self,
+        prompt: str,
+        *,
+        sink: EventSink | None = None,
+        cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
+    ) -> AgentRunResult:
+        del prompt, sink, cancellation_policy
+        workspace_root = str(Path.cwd().resolve(strict=False))
+        candidate = PermissionScopeCandidate(
+            PermissionScopeKind.WORKSPACE_EDITS,
+            workspace_root,
+        )
+        request = build_permission_request(
+            "edit",
+            "search_replace",
+            {"path": "src/note.txt", "old": "private-old", "new": "private-new"},
+            "interactive approval required",
+            scope_candidates=(candidate,),
+            scope_context=PermissionScopeContext("approval-session", workspace_root),
         )
         approval = await self._broker.request(request)
         self.approvals.append(approval)
@@ -773,6 +825,7 @@ class ProfileTuiController:
         *,
         plan_comments: tuple[PlanComment, ...] = (),
         session_tasks: tuple[SessionTask, ...] = (),
+        runner: object | None = None,
     ) -> None:
         self._selected_profile = "first"
         self.selections: list[str] = []
@@ -784,6 +837,7 @@ class ProfileTuiController:
         self._plan = plan
         self._plan_comments = plan_comments
         self._session_tasks = session_tasks
+        self._runner = runner
         self._options = (
             ProviderOption(
                 "first",
@@ -858,10 +912,15 @@ class ProfileTuiController:
         changed = effort is not self._reasoning_effort
         self.effort_selections.append(effort)
         self._reasoning_effort = effort
+        if self._runner is not None:
+            setter = getattr(self._runner, "set_reasoning_effort", None)
+            if callable(setter):
+                setter(effort)
         return ReasoningEffortSelectionResult(
             requested=effort,
             effective=effort.effective,
             changed=changed,
+            workflow_orchestration_active=effort.requires_workflow_orchestration,
         )
 
     async def set_interaction_mode(
@@ -1132,12 +1191,29 @@ class FailingTaskTuiController:
         del state
 
 
+def _tui_parent_capability() -> SubagentCapabilitySet:
+    return SubagentCapabilitySet.from_runtime(
+        tool_names=("read_file",),
+        cwd=Path("/workspace"),
+        sandbox_profile=SandboxProfile.OFF,
+        enable_background_tasks=False,
+        max_steps=8,
+    )
+
+
 class ReadOnlySubagentTuiService:
     def __init__(self, projection: SubagentResultProjection) -> None:
         self.projection = projection
         self.requests: list[RunSubagentRequest] = []
 
-    async def run_subagent(self, request: RunSubagentRequest) -> SubagentResultProjection:
+    async def run_subagent(
+        self,
+        request: RunSubagentRequest,
+        *,
+        parent_capabilities: SubagentCapabilitySet,
+    ) -> SubagentResultProjection:
+        if not isinstance(parent_capabilities, SubagentCapabilitySet):
+            raise AssertionError("fixture parent capability is missing")
         self.requests.append(request)
         return self.projection
 
@@ -1194,6 +1270,86 @@ class SubagentRelationshipLifecycleTuiService:
             action=request.action,
             forked_session_id=("forked-session" if request.action.value == "fork" else None),
         )
+
+
+class CollapsingPulseAnimationTests(unittest.TestCase):
+    def test_forward_cycle_holds_collapses_and_reverses_at_right_boundary(self) -> None:
+        animation = CollapsingPulseAnimation()
+
+        for expected_position in range(1, animation.width):
+            animation.advance()
+            expected_phase = "edge-hold" if expected_position == animation.width - 1 else "moving"
+            self.assertEqual(animation.peak_position, expected_position)
+            self.assertEqual(animation.phase, expected_phase)
+            self.assertEqual(animation.merged_trail_count, 0)
+
+        animation.advance()
+        self.assertEqual(animation.phase, "collapsing")
+        self.assertEqual(animation.merged_trail_count, 1)
+
+        animation.advance()
+        self.assertEqual(animation.phase, "collapsing")
+        self.assertEqual(animation.merged_trail_count, 2)
+
+        animation.advance()
+        self.assertEqual(animation.phase, "merged-hold")
+        self.assertEqual(animation.merged_trail_count, 3)
+        self.assertEqual(animation.direction, 1)
+        self.assertEqual(animation.peak_position, animation.width - 1)
+
+        animation.advance()
+        self.assertEqual(animation.phase, "moving")
+        self.assertEqual(animation.direction, -1)
+        self.assertEqual(animation.peak_position, animation.width - 2)
+        self.assertEqual(animation.merged_trail_count, 0)
+
+        animation.advance()
+        self.assertEqual(animation.phase, "moving")
+        self.assertEqual(animation.direction, -1)
+        self.assertEqual(animation.peak_position, animation.width - 3)
+
+    def test_reverse_cycle_reaches_left_boundary_with_symmetric_phases(self) -> None:
+        animation = CollapsingPulseAnimation()
+        animation.peak_position = animation.width - 1
+        animation.direction = -1
+
+        for expected_position in reversed(range(animation.width - 1)):
+            animation.advance()
+            expected_phase = "edge-hold" if expected_position == 0 else "moving"
+            self.assertEqual(animation.peak_position, expected_position)
+            self.assertEqual(animation.phase, expected_phase)
+            self.assertEqual(animation.merged_trail_count, 0)
+
+        animation.advance()
+        self.assertEqual(animation.phase, "collapsing")
+        self.assertEqual(animation.merged_trail_count, 1)
+
+        animation.advance()
+        self.assertEqual(animation.phase, "collapsing")
+        self.assertEqual(animation.merged_trail_count, 2)
+
+        animation.advance()
+        self.assertEqual(animation.phase, "merged-hold")
+        self.assertEqual(animation.merged_trail_count, 3)
+        self.assertEqual(animation.direction, -1)
+        self.assertEqual(animation.peak_position, 0)
+
+        animation.advance()
+        self.assertEqual(animation.phase, "moving")
+        self.assertEqual(animation.direction, 1)
+        self.assertEqual(animation.peak_position, 1)
+        self.assertEqual(animation.merged_trail_count, 0)
+
+    def test_levels_render_forward_and_reverse_trails(self) -> None:
+        forward = CollapsingPulseAnimation(peak_position=3, direction=1)
+        self.assertEqual(forward.levels(), (1, 3, 5, 7, 0, 0, 0))
+        forward.merged_trail_count = 1
+        self.assertEqual(forward.levels(), (0, 1, 3, 7, 0, 0, 0))
+
+        reverse = CollapsingPulseAnimation(peak_position=3, direction=-1)
+        self.assertEqual(reverse.levels(), (0, 0, 0, 7, 5, 3, 1))
+        reverse.merged_trail_count = 1
+        self.assertEqual(reverse.levels(), (0, 0, 0, 7, 3, 1, 0))
 
 
 def background_snapshot(
@@ -3105,7 +3261,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             )
             await pilot.press("ctrl+c")
 
-    async def test_effort_picker_switches_all_levels_and_marks_ultracode_fallback(
+    async def test_effort_picker_switches_all_levels_and_marks_ultracode_delegation(
         self,
     ) -> None:
         profiles = ProfileTuiController()
@@ -3136,25 +3292,27 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("\N{SINGLE RIGHT-POINTING ANGLE QUOTATION MARK}", current_text)
             self.assertIn("✓", current_text)
             self.assertFalse(any(effort.glyph in current_text for effort in ReasoningEffort))
-            ultracode = app.screen.query_one("#effort-choice-4", Button)
+            max_effort = app.screen.query_one("#effort-choice-4", Button)
+            self.assertIn("maximum", rendered_text(app, max_effort.render(), width=72).lower())
+            ultracode = app.screen.query_one("#effort-choice-5", Button)
             ultracode_segments = list(
                 app.console.render(ultracode.render(), app.console.options.update(width=72))
             )
-            coming_soon = next(
-                segment for segment in ultracode_segments if "coming soon" in segment.text
+            bounded_path = next(
+                segment for segment in ultracode_segments if "bounded path" in segment.text
             )
-            self.assertIn(TEXT_DISABLED.lower(), str(coming_soon.style).lower())
-            clicked = await pilot.click("#effort-choice-3")
+            self.assertNotIn(TEXT_DISABLED.lower(), str(bounded_path.style).lower())
+            clicked = await pilot.click("#effort-choice-4")
             self.assertTrue(clicked)
             for _ in range(20):
                 await pilot.pause(0.01)
                 if profiles.effort_selections:
                     break
 
-            self.assertEqual(profiles.effort_selections, [ReasoningEffort.XHIGH])
-            self.assertEqual(preferences.saved_efforts, [ReasoningEffort.XHIGH])
+            self.assertEqual(profiles.effort_selections, [ReasoningEffort.MAX])
+            self.assertEqual(preferences.saved_efforts, [ReasoningEffort.MAX])
             self.assertIn(
-                "xhigh",
+                "max",
                 rendered_text(app, app.query_one("#runtime-primary", Static).renderable),
             )
 
@@ -3163,16 +3321,70 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("enter")
             await pilot.pause()
             self.assertEqual(profiles.effort_selections[-1], ReasoningEffort.ULTRACODE)
-            self.assertIn("workflow orchestration is not implemented", app.entries[-1].text)
+            self.assertIn("one durable MAIN_MAX", app.entries[-1].text)
             self.assertIn(
-                "ultracode → xhigh",
+                "ultracode → max",
                 rendered_text(app, app.query_one("#runtime-primary", Static).renderable),
             )
 
             prompt.value = "/status"
             await pilot.press("enter")
             await pilot.pause()
-            self.assertIn("Effort: ⚡ ultracode → ⬤ xhigh", app.entries[-1].text)
+            self.assertIn("Effort: ⚡ ultracode → ◆ max", app.entries[-1].text)
+
+    async def test_tui_effort_switch_reaches_the_dormant_ultracode_entry(self) -> None:
+        runner = SwitchingTuiConversation()
+        profiles = ProfileTuiController(runner=runner)
+        delegate_started = asyncio.Event()
+        delegate_finished = asyncio.Event()
+        delegate_calls: list[str] = []
+
+        async def delegate(request, sink) -> AgentRunResult:
+            del sink
+            delegate_calls.append(request.prompt)
+            delegate_started.set()
+            result = AgentRunResult(
+                "session-fixture",
+                "delegated after runtime switch",
+                (),
+                (),
+                (),
+                1,
+            )
+            delegate_finished.set()
+            return result
+
+        turn_service = SessionTurnService(runner, ultracode_delegate=delegate)
+        app = NeuroCodeApp(
+            runner,
+            turn_service=turn_service,
+            provider_controller=profiles,
+            provider_name="first",
+            model_name="first-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(90, 24)) as pilot:
+            prompt = app.query_one("#prompt", PromptInput)
+            prompt.value = "/effort ultracode"
+            await pilot.press("enter")
+            self.assertEqual(runner.reasoning_effort, ReasoningEffort.ULTRACODE)
+            self.assertEqual(profiles.effort_selections, [ReasoningEffort.ULTRACODE])
+
+            prompt.value = "execute after the runtime switch"
+            await pilot.press("enter")
+            await asyncio.wait_for(delegate_started.wait(), timeout=1)
+            await asyncio.wait_for(delegate_finished.wait(), timeout=1)
+            await pilot.pause()
+
+            self.assertEqual(delegate_calls, ["execute after the runtime switch"])
+            self.assertEqual(runner.prompts, [])
+            self.assertNotIn(
+                "entry is not configured", "\n".join(entry.text for entry in app.entries)
+            )
+            self.assertIn(
+                "delegated after runtime switch", "\n".join(entry.text for entry in app.entries)
+            )
 
     async def test_effort_validation_and_running_turn_guard_do_not_change_policy(self) -> None:
         runner = CancellableTuiConversation()
@@ -3664,6 +3876,10 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(0.01)
                 if runner.wake_count == 2:
                     break
+            self.assertEqual(runner.wake_count, 2)
+            # The retry is intentionally manual; disable the short test cooldown
+            # before leaving the app so teardown cannot schedule a third failure.
+            await app._apply_background_task_wake_policy("off")
 
         self.assertEqual(runner.wake_count, 2)
         self.assertEqual(tasks.wake_state.pending_task_ids, ("task-fast",))
@@ -3899,6 +4115,9 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("balance is insufficient", recoverable.text)
             self.assertIn("session is still open", recoverable.text)
             self.assertNotIn("ProviderError", recoverable.text)
+            self.assertNotIn("provider-secret-value", recoverable.text)
+            self.assertNotIn("bearer-fixture-token", recoverable.text)
+            self.assertNotIn("password@example.invalid", recoverable.text)
             self.assertFalse(prompt.disabled)
             self.assertTrue(prompt.has_focus)
 
@@ -4527,6 +4746,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
         app = NeuroCodeApp(
             runner,
             read_only_subagent_service=cast(ReadOnlySubagentApplicationService, service),
+            subagent_parent_capability_provider=_tui_parent_capability,
             provider_name="fixture",
             model_name="fixture-model",
             cwd=Path("/workspace"),
@@ -5507,7 +5727,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             approval_controller=broker,
             provider_name="fixture",
             model_name="fixture-model",
-            cwd=Path("/workspace"),
+            cwd=Path.cwd(),
         )
 
         async with app.run_test(size=(110, 35)) as pilot:
@@ -5535,6 +5755,47 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(runner.executed)
             self.assertEqual(runner.approvals[0].kind, PermissionApprovalKind.ALLOW_ONCE)
+
+    async def test_permission_modal_shows_only_runtime_generated_scoped_edit_option(self) -> None:
+        broker = SessionApprovalBroker()
+        runner = ScopedApprovalTuiConversation(broker)
+        app = NeuroCodeApp(
+            runner,
+            approval_controller=broker,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(120, 38)) as pilot:
+            prompt = app.query_one("#prompt", PromptInput)
+            prompt.value = "edit the file"
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if isinstance(app.screen, PermissionApprovalScreen):
+                    break
+
+            self.assertIsInstance(app.screen, PermissionApprovalScreen)
+            approval_screen = app.screen
+            assert isinstance(approval_screen, PermissionApprovalScreen)
+            self.assertEqual(app.focused.id if app.focused is not None else None, "approval-deny")
+            self.assertIsNotNone(approval_screen.query_one("#approval-allow-scope-workspace-edits"))
+            self.assertNotIn("private-old", approval_screen.request.summary)
+            self.assertNotIn("private-new", approval_screen.request.summary)
+
+            self.assertTrue(await pilot.click("#approval-allow-scope-workspace-edits"))
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if runner.approvals:
+                    break
+
+            self.assertTrue(runner.executed)
+            self.assertEqual(runner.approvals[0].kind.value, "allow_scope")
+            self.assertEqual(
+                runner.approvals[0].scope_candidate is not None,
+                True,
+            )
 
     async def test_permission_modal_defaults_to_deny(self) -> None:
         broker = SessionApprovalBroker()

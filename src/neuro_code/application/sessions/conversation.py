@@ -14,15 +14,19 @@ from typing import TypeVar
 
 from neuro_code.application.memory.compaction import ProviderContextWindow
 from neuro_code.application.memory.compaction_runtime import (
+    ContextCompactionCommandResult,
     ContextCompactionRuntimeBoundary,
     ContextCompactionRuntimeRequest,
     ContextCompactionRuntimeResult,
+    ContextCompactionSafePoint,
     ContextCompactionTurnProjection,
+    project_context_compaction_command_result,
     project_context_compaction_failure,
     project_context_compaction_result,
 )
 from neuro_code.application.memory.compaction_trigger import ContextCompactionTriggerMode
 from neuro_code.application.ports.storage import SessionStore
+from neuro_code.application.ports.tools import Tool
 from neuro_code.application.ports.workspace import WorkspaceIdentity
 from neuro_code.application.runtime.agent import AgentRunResult, AgentRuntime, EventSink
 from neuro_code.application.sessions.execution_queries import (
@@ -32,6 +36,11 @@ from neuro_code.application.sessions.execution_queries import (
 from neuro_code.application.sessions.item_queries import (
     LoadSessionItemsRequest,
     SessionItemQueryService,
+)
+from neuro_code.application.sessions.lifecycle import SessionLifecycleService, StartSessionRequest
+from neuro_code.application.sessions.recovery import (
+    TurnRecoveryInspection,
+    TurnRecoveryService,
 )
 from neuro_code.application.sessions.service import (
     ListPlanCommentsRequest,
@@ -50,15 +59,29 @@ from neuro_code.application.sessions.task_queries import (
 from neuro_code.domain.background_tasks.models import BackgroundWakeState
 from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
 from neuro_code.domain.conversation.interaction_mode import InteractionMode
-from neuro_code.domain.conversation.messages import ContentPart, SessionItem
+from neuro_code.domain.conversation.messages import ContentPart, Message, Role, SessionItem
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
-from neuro_code.domain.execution import SessionExecutionRecord, TurnCancellationPolicy, TurnSource
+from neuro_code.domain.execution import (
+    AgentExecutionOutcome,
+    AgentExecutionStatus,
+    SessionExecutionRecord,
+    TurnCancellationPolicy,
+    TurnInput,
+    TurnRecoveryAttempt,
+    TurnRecoveryResolution,
+    TurnRecoveryStatus,
+    TurnSource,
+)
 from neuro_code.domain.plans import PlanComment, SessionPlan
 from neuro_code.domain.session_tasks import (
     MAX_QUEUED_SESSION_TASKS,
     SessionTask,
     SessionTaskKind,
     SessionTaskStatus,
+)
+from neuro_code.domain.ultracode import (
+    MAX_ULTRACODE_RESULT_BYTES,
+    UltracodeDelegationDecision,
 )
 from neuro_code.shared.errors import ConfigurationError
 
@@ -282,6 +305,8 @@ class AgentConversation:
         content_parts: Sequence[ContentPart] = (),
         cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
         turn_source: TurnSource = TurnSource.USER,
+        turn_id: str | None = None,
+        ultracode_execution_id: str | None = None,
     ) -> AgentRunResult:
         async with self._turn_lock:
 
@@ -305,8 +330,329 @@ class AgentConversation:
                     source_model=self._source_model,
                     source_context_affinity=self._source_context_affinity,
                     session_id=self._session_id,
+                    turn_id=turn_id,
+                    ultracode_execution_id=ultracode_execution_id,
                     cancellation_policy=cancellation_policy,
                     turn_source=turn_source,
+                )
+            except asyncio.CancelledError:
+                await self._reload_persisted_state()
+                raise
+            except Exception:
+                await self._reload_persisted_state()
+                raise
+            self._items = result.items
+            self._session_id = result.session_id
+            await self._reload_plan_state()
+            await self._reload_provider_origin()
+            await self._reload_execution_record()
+            return result
+
+    async def ensure_persisted_session(self) -> str:
+        """Create the parent session before an application-owned delegation."""
+
+        async with self._turn_lock:
+            if self._session_id is not None:
+                return self._session_id
+            summary = await SessionLifecycleService(self._store).start_session(
+                StartSessionRequest(
+                    str(self._runtime.cwd),
+                    self._runtime.provider_name,
+                    self._runtime.model_name,
+                    self._runtime.context_affinity,
+                    self._runtime.sandbox_profile,
+                )
+            )
+            self._session_id = summary.id
+            self._source_provider = summary.provider
+            self._source_model = summary.model
+            self._source_context_affinity = summary.context_affinity
+            return summary.id
+
+    async def commit_external_turn(
+        self,
+        prompt: str,
+        *,
+        response: str,
+        turn_id: str,
+        execution_id: str,
+        decision: UltracodeDelegationDecision,
+        content_parts: Sequence[ContentPart] = (),
+        sink: EventSink | None = None,
+    ) -> AgentRunResult:
+        """Commit one already-produced bounded result without calling a Provider.
+
+        The exact turn identity is reused for idempotent recovery; a committed
+        turn never appends a second assistant message.
+
+        在不调用 Provider 的前提下提交一个已生成的有界结果.恢复时复用精确回合身份,
+        已提交回合绝不会再次追加 assistant 消息。
+        """
+
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("external turn prompt must not be empty")
+        if (
+            not isinstance(response, str)
+            or not response.strip()
+            or len(response.encode("utf-8")) > MAX_ULTRACODE_RESULT_BYTES
+        ):
+            raise ConfigurationError(
+                "external turn response is outside the bounded result contract"
+            )
+        if not isinstance(turn_id, str) or not turn_id.strip():
+            raise ValueError("external turn id must not be empty")
+        if not isinstance(execution_id, str) or not execution_id.strip():
+            raise ValueError("external execution id must not be empty")
+        if not isinstance(decision, UltracodeDelegationDecision):
+            raise TypeError("external turn decision must be canonical")
+        parts = tuple(content_parts)
+        if not all(isinstance(part, ContentPart) for part in parts):
+            raise TypeError("external turn content parts must be canonical")
+
+        async with self._turn_lock:
+            session_id = self._session_id
+            if session_id is None:
+                summary = await SessionLifecycleService(self._store).start_session(
+                    StartSessionRequest(
+                        str(self._runtime.cwd),
+                        self._runtime.provider_name,
+                        self._runtime.model_name,
+                        self._runtime.context_affinity,
+                        self._runtime.sandbox_profile,
+                    )
+                )
+                session_id = summary.id
+                self._session_id = session_id
+                self._source_provider = summary.provider
+                self._source_model = summary.model
+                self._source_context_affinity = summary.context_affinity
+
+            turn_input = TurnInput(prompt, parts, TurnSource.USER)
+            attempts = await self._store.load_turn_attempts(session_id)
+            attempt = next((item for item in attempts if item.turn_id == turn_id), None)
+            if attempt is not None:
+                if attempt.input_fingerprint != turn_input.fingerprint:
+                    raise ConfigurationError("external turn identity is bound to different input")
+                if attempt.resolution is TurnRecoveryResolution.COMMITTED:
+                    stored_response = await self._load_external_response(
+                        session_id,
+                        turn_id,
+                        execution_id,
+                    )
+                    if stored_response is not None and stored_response != response:
+                        raise ConfigurationError("external turn result identity conflicts")
+                    await self._reload_execution_record()
+                    return await self._external_result(
+                        session_id,
+                        response if stored_response is None else stored_response,
+                        turn_id,
+                        sink=sink,
+                        emit_completion=True,
+                    )
+                if (
+                    attempt.resolution is not None
+                    or attempt.status is TurnRecoveryStatus.INDETERMINATE
+                ):
+                    raise ConfigurationError(
+                        "external turn is already resolved or indeterminate; replay is disabled"
+                    )
+            else:
+                if any(item.resolution is None for item in attempts):
+                    raise ConfigurationError(
+                        "session has another unresolved turn; external replay is disabled"
+                    )
+                await self._store.start_turn_attempt(
+                    TurnRecoveryAttempt.create(
+                        turn_id=turn_id,
+                        session_id=session_id,
+                        input=turn_input,
+                        accepted_at=datetime.now(UTC),
+                    )
+                )
+
+            current_items = tuple(
+                await SessionItemQueryService(self._store).load_session_items(
+                    LoadSessionItemsRequest(session_id)
+                )
+            )
+            if not any(isinstance(item, Message) for item in current_items):
+                current_items = (*current_items, Message(Role.SYSTEM, self._runtime.system_prompt))
+            user_message = Message(Role.USER, prompt, content_parts=parts)
+            assistant_message = Message(Role.ASSISTANT, response)
+            result_items = (*current_items, user_message, assistant_message)
+            sequence = await self._store.next_event_sequence(session_id)
+            event = AgentEvent.create(
+                sequence,
+                AgentEventKind.TURN_COMPLETED,
+                {
+                    "turn_id": turn_id,
+                    "ultracode_execution_id": execution_id,
+                    "ultracode_decision": decision.value,
+                    "external_execution": True,
+                    "response": response,
+                    "step": 0,
+                },
+            )
+            outcome = AgentExecutionOutcome(
+                AgentExecutionStatus.COMPLETED,
+                None,
+                finalized=False,
+                recoverable=False,
+            )
+            record = SessionExecutionRecord(outcome, sequence, event.created_at)
+            await self._store.finalize_turn(
+                session_id,
+                event,
+                result_items,
+                record,
+                turn_id,
+            )
+            self._items = tuple(result_items)
+            self._execution_record = record
+            await self._reload_provider_origin()
+            return await self._external_result(
+                session_id,
+                response,
+                turn_id,
+                sink=sink,
+                completion_event=event,
+            )
+
+    async def _load_external_response(
+        self,
+        session_id: str,
+        turn_id: str,
+        execution_id: str,
+    ) -> str | None:
+        for raw_event in await self._store.load_events(session_id):
+            if raw_event.get("kind") != AgentEventKind.TURN_COMPLETED.value:
+                continue
+            data = raw_event.get("data")
+            if not isinstance(data, dict):
+                continue
+            if data.get("turn_id") != turn_id or data.get("ultracode_execution_id") != execution_id:
+                continue
+            response = data.get("response")
+            if isinstance(response, str) and response.strip():
+                return response
+        return None
+
+    async def _external_result(
+        self,
+        session_id: str,
+        response: str,
+        turn_id: str,
+        *,
+        sink: EventSink | None,
+        completion_event: AgentEvent | None = None,
+        emit_completion: bool = False,
+    ) -> AgentRunResult:
+        delta = AgentEvent.create(0, AgentEventKind.TEXT_DELTA, {"text": response})
+        events: list[AgentEvent] = [delta]
+        if sink is not None:
+            outcome = sink(delta)
+            if inspect.isawaitable(outcome):
+                await outcome
+        if completion_event is not None:
+            events.append(completion_event)
+            if sink is not None:
+                outcome = sink(completion_event)
+                if inspect.isawaitable(outcome):
+                    await outcome
+        elif emit_completion and sink is not None:
+            replay_event = AgentEvent.create(
+                0,
+                AgentEventKind.TURN_COMPLETED,
+                {"turn_id": turn_id, "external_replay": True},
+            )
+            events.append(replay_event)
+            outcome = sink(replay_event)
+            if inspect.isawaitable(outcome):
+                await outcome
+        items = tuple(
+            await SessionItemQueryService(self._store).load_session_items(
+                LoadSessionItemsRequest(session_id)
+            )
+        )
+        self._items = items
+        return AgentRunResult(
+            session_id,
+            response,
+            tuple(item for item in items if isinstance(item, Message)),
+            items,
+            tuple(events),
+            0,
+            self.plan,
+            self._execution_record.outcome if self._execution_record is not None else None,
+            turn_id,
+        )
+
+    async def inspect_recovery(self) -> tuple[TurnRecoveryInspection, ...]:
+        """Return bounded durable recovery state without taking action."""
+
+        if self._session_id is None:
+            return ()
+        async with self._turn_lock:
+            return await TurnRecoveryService(self._store).inspect(self._session_id)
+
+    async def abandon_recovery(
+        self,
+        turn_id: str,
+        *,
+        reason: str = "explicit_user_resolution",
+    ) -> TurnRecoveryInspection:
+        """Explicitly resolve one interrupted attempt as abandoned."""
+
+        if self._session_id is None:
+            raise ConfigurationError("recovery requires a persisted session")
+        async with self._turn_lock:
+            return await TurnRecoveryService(self._store).abandon(
+                self._session_id,
+                turn_id,
+                reason=reason,
+            )
+
+    async def retry_recovery(
+        self,
+        turn_id: str,
+        *,
+        sink: EventSink | None = None,
+    ) -> AgentRunResult:
+        """Explicitly retry an exact, pre-output user turn with a new identity."""
+
+        if self._session_id is None:
+            raise ConfigurationError("recovery requires a persisted session")
+        async with self._turn_lock:
+            service = TurnRecoveryService(self._store)
+            handoff = await service.require_safe_retry(self._session_id, turn_id)
+            if handoff.input.plan_execution_requested:
+                raise ConfigurationError("explicit retry is unavailable for plan execution")
+            await service.abandon(
+                self._session_id,
+                turn_id,
+                reason="retry_requested",
+            )
+
+            async def capture_session(event: AgentEvent) -> None:
+                if event.kind is AgentEventKind.SESSION_STARTED:
+                    session_id = event.data.get("session_id")
+                    if isinstance(session_id, str) and session_id:
+                        self._session_id = session_id
+                if sink is not None:
+                    outcome = sink(event)
+                    if inspect.isawaitable(outcome):
+                        await outcome
+
+            try:
+                result = await self._runtime.run(
+                    handoff.input.prompt,
+                    sink=capture_session,
+                    content_parts=handoff.input.content_parts,
+                    initial_items=self._items,
+                    source_provider=self._source_provider,
+                    source_model=self._source_model,
+                    source_context_affinity=self._source_context_affinity,
+                    session_id=self._session_id,
                 )
             except asyncio.CancelledError:
                 await self._reload_persisted_state()
@@ -342,6 +688,50 @@ class AgentConversation:
         async with self._turn_lock:
             self._validate_context_compaction_request(request)
             return await self._runtime.trigger_context_compaction(request)
+
+    async def compact_now(
+        self,
+        *,
+        boundary: ContextCompactionRuntimeBoundary | None = None,
+        provider_window: ProviderContextWindow | None = None,
+        protected_item_count: int = 0,
+    ) -> ContextCompactionCommandResult:
+        """Expose one safe, user-invoked compaction command.
+
+        The command owns the live-context snapshot and returns only the bounded
+        public projection. It never starts an ordinary model turn.
+        """
+
+        effective_boundary = boundary or ContextCompactionRuntimeBoundary(
+            ContextCompactionSafePoint.BEFORE_MODEL_REQUEST,
+            0,
+        )
+        effective_window = (
+            provider_window
+            if provider_window is not None
+            else self._runtime.provider_context_window
+        )
+
+        async def owner(
+            projection: ContextCompactionTurnProjection,
+        ) -> ContextCompactionCommandResult:
+            return project_context_compaction_command_result(projection)
+
+        return await self.run_explicit_context_compaction_with_owner(
+            boundary=effective_boundary,
+            provider_window=effective_window,
+            owner=owner,
+            protected_item_count=protected_item_count,
+        )
+
+    def replace_external_tools(
+        self,
+        tools: Sequence[Tool],
+        previous_names: Sequence[str],
+    ) -> None:
+        """Refresh session-owned extension tools without changing the transcript."""
+
+        self._runtime.replace_external_tools(tools, previous_names)
 
     async def run_context_compaction_with_owner(
         self,

@@ -68,10 +68,12 @@
 
 ### M4 — 协议与扩展能力
 
-- Partial ACP v1 stdio 核心：已实现官方 Python SDK framing/router、
+- Partial ACP v1 stdio/WebSocket 核心：已实现官方 Python SDK framing/router 和
+  有界 WebSocket newline-JSON bridge、
   initialize/new/list/load/delete/fork/resume/prompt/cancel/close、持久化外部到内部
   session alias、事务持久 fork/delete、回放 load 与静默 resume、工作区范围有界 cursor
-  发现、有界/脱敏可见历史回放、有界 Text/内嵌 Image/ResourceLink/内嵌 TextResource 输入、
+  发现、有界/脱敏可见历史回放、有界 Text/内嵌 Image/内嵌 Audio/ResourceLink/内嵌 TextResource/
+  BlobResource 输入、
   失败关闭权限请求、标准
   事件 update、session 级并发、断连清理、有界额外目录，以及有界且由 session 持有的
   stdio/Streamable HTTP/legacy SSE MCP 工具 server，以及由能力协商控制的
@@ -79,12 +81,15 @@
   终端方法执行直接前台 `terminal_exec` 及有界后台生命周期
   （`terminal_start`/`terminal_output`/`terminal_wait`/`terminal_kill`），以及持久化原生图片
   上下文和安全 ACP 历史占位符、带标签的有界内嵌文本资源。
-- 完整 ACP 一致性仍待完成：ACP MCP 传输与非工具 MCP 能力、客户端
-  交互式终端输入/resize/PTY framing、音频 prompt、内嵌二进制资源 prompt、二进制多媒体历史回放、WebSocket，
+- 有界私有 MCP session 扩展还实现了 resource/resource-template 发现、resource 读取、prompt
+  发现/获取、sampling/elicitation callback 和动态工具目录刷新；这些是有界投影，不等于通用
+  MCP parity。
+- 完整 ACP 一致性仍待完成：ACP-transport MCP server declaration、有界私有投影之外的 MCP 能力、
+  客户端交互式终端输入/resize/PTY framing、二进制多媒体历史回放、Provider 原生音频/视频语义，
   以及任何明确声明的 `x.ai/*` 扩展。
 - 已实现有界精确名称 `AGENTS.md` 继承，以及只读 LOCAL/REPO/USER 技能发现与正文加载，
   包括动态会话目标、内容变化检查和有界变量替换。远程/服务器/捆绑技能、代理配置、
-  钩子和可执行插件仍待完成，其他 MCP 能力也仍待完成。
+  钩子和可执行插件仍待完成，有界私有投影之外的 MCP 能力也仍待完成。
 - 已实现有界、供应商中立的计划模式：模型管理的 `update_plan` 整体替换会按会话持久化，
   在恢复时载入、在分叉时继承，并通过 TUI `/plan DESCRIPTION` 和 `/view-plan` 显示。经用户确认的
   `/execute-plan`/`/run-plan` 交接会持久化执行事件、创建一条有界持久会话任务记录，并且只切换到
@@ -93,8 +98,8 @@
   子代理仍待完成。每条执行任务还会保存被交接的不可变计划修订：`/tasks` 只显示紧凑审计摘要，而显式、
   限当前会话的 `/view-task TASK_ID` 只会把已保存快照作为只读参考渲染。
 
-退出条件：标准 ACP 客户端通过完整一致性场景；扩展失败不会破坏主会话。当前 partial
-stdio 切片尚未满足该退出条件。
+退出条件：标准 ACP 客户端通过完整一致性场景；扩展失败不会破坏主会话。当前实现仍是 partial；
+最初的 stdio-only 切片尚未满足该退出条件，完整一致性仍待完成。
 
 ### M5 — 高级能力对齐
 

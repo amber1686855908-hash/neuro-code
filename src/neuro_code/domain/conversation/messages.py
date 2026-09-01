@@ -7,6 +7,10 @@ from types import MappingProxyType
 from typing import Any
 
 IMAGE_MODEL_PLACEHOLDER = "[image content preserved in session; binary replay is unavailable]"
+AUDIO_MODEL_PLACEHOLDER = "[audio content preserved in session; binary replay is unavailable]"
+BLOB_MODEL_PLACEHOLDER = (
+    "[embedded binary content preserved in session; binary replay is unavailable]"
+)
 
 
 class Role(StrEnum):
@@ -19,6 +23,8 @@ class Role(StrEnum):
 class ContentPartKind(StrEnum):
     TEXT = "text"
     IMAGE = "image"
+    AUDIO = "audio"
+    BLOB = "blob"
 
 
 class ContextItemKind(StrEnum):
@@ -42,6 +48,8 @@ class SyntheticReason(StrEnum):
 
     PROJECT_INSTRUCTIONS = "project-instructions"
     AVAILABLE_SKILLS = "available-skills"
+    PARENT_RELAY = "parent-relay"
+    DAG_PREDECESSOR_RESULTS = "dag-predecessor-results"
     COMPACTION_SUMMARY = "compaction-summary"
     RUNTIME_PLAN = "runtime-plan"
     RUNTIME_BUDGET = "runtime-budget"
@@ -82,13 +90,51 @@ class ContentPart:
     kind: ContentPartKind
     text: str | None = None
     url: str | None = None
+    data: str | None = None
+    mime_type: str | None = None
 
     def __post_init__(self) -> None:
         if self.kind is ContentPartKind.TEXT:
-            if self.text is None or self.url is not None:
-                raise ValueError("text content parts require text and forbid url")
-        elif self.url is None or not self.url or self.text is not None:
-            raise ValueError("image content parts require a non-empty url and forbid text")
+            if (
+                self.text is None
+                or self.url is not None
+                or self.data is not None
+                or self.mime_type is not None
+            ):
+                raise ValueError("text content parts require text and forbid media fields")
+        elif self.kind is ContentPartKind.IMAGE:
+            if (
+                self.url is None
+                or not self.url
+                or self.text is not None
+                or self.data is not None
+                or self.mime_type is not None
+            ):
+                raise ValueError(
+                    "image content parts require a non-empty url and forbid other fields"
+                )
+        elif self.kind is ContentPartKind.AUDIO:
+            if (
+                self.data is None
+                or not self.data
+                or self.text is not None
+                or self.url is not None
+                or self.mime_type is None
+                or not self.mime_type.startswith("audio/")
+            ):
+                raise ValueError("audio content parts require audio data and an audio MIME type")
+        elif self.kind is ContentPartKind.BLOB:
+            if (
+                self.data is None
+                or not self.data
+                or self.url is None
+                or not self.url
+                or self.text is not None
+                or self.mime_type is None
+            ):
+                raise ValueError("blob content parts require a URI, data, and MIME type")
+        else:
+            raise ValueError("unsupported content part kind")
 
     @classmethod
     def from_text(cls, text: str) -> ContentPart:
@@ -98,12 +144,36 @@ class ContentPart:
     def from_image(cls, url: str) -> ContentPart:
         return cls(ContentPartKind.IMAGE, url=url)
 
+    @classmethod
+    def from_audio(cls, data: str, mime_type: str) -> ContentPart:
+        return cls(ContentPartKind.AUDIO, data=data, mime_type=mime_type)
+
+    @classmethod
+    def from_blob(cls, uri: str, data: str, mime_type: str) -> ContentPart:
+        return cls(ContentPartKind.BLOB, url=uri, data=data, mime_type=mime_type)
+
+    @property
+    def model_placeholder(self) -> str:
+        return {
+            ContentPartKind.IMAGE: IMAGE_MODEL_PLACEHOLDER,
+            ContentPartKind.AUDIO: AUDIO_MODEL_PLACEHOLDER,
+            ContentPartKind.BLOB: BLOB_MODEL_PLACEHOLDER,
+        }.get(self.kind, "[binary content preserved in session]")
+
     def to_dict(self) -> dict[str, str]:
         if self.kind is ContentPartKind.TEXT:
             assert self.text is not None
             return {"type": self.kind.value, "text": self.text}
-        assert self.url is not None
-        return {"type": self.kind.value, "url": self.url}
+        if self.kind is ContentPartKind.IMAGE:
+            assert self.url is not None
+            return {"type": self.kind.value, "url": self.url}
+        assert self.data is not None
+        assert self.mime_type is not None
+        result = {"type": self.kind.value, "data": self.data, "mime_type": self.mime_type}
+        if self.kind is ContentPartKind.BLOB:
+            assert self.url is not None
+            result["url"] = self.url
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,7 +250,7 @@ class Message:
                 assert part.text is not None
                 parts.append(part.text)
             else:
-                parts.append(IMAGE_MODEL_PLACEHOLDER)
+                parts.append(part.model_placeholder)
         return "\n".join(parts)
 
     def to_dict(self) -> dict[str, Any]:
@@ -220,6 +290,8 @@ class PreservedContextItem:
 SessionItem = Message | PreservedContextItem
 
 __all__ = [
+    "AUDIO_MODEL_PLACEHOLDER",
+    "BLOB_MODEL_PLACEHOLDER",
     "IMAGE_MODEL_PLACEHOLDER",
     "ContentPart",
     "ContentPartKind",

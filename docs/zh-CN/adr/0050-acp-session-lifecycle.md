@@ -7,8 +7,8 @@
 
 ## 背景
 
-Partial ACP 适配器已经能够创建、列出、加载、提示、取消和关闭 session，但客户端还不能
-删除持久历史、分叉独立对话，或在不回放可见历史的情况下恢复。新增操作必须保持客户端
+在本 ADR 接受时，partial ACP 适配器已经能够创建、列出、加载、提示、取消和关闭 session，但
+客户端还不能删除持久历史、分叉独立对话，或在不回放可见历史的情况下恢复。新增操作必须保持客户端
 可见 ACP ID 与内部 SQLite ID 分离，只作用于启动工作区，并继续对 provider、sandbox、
 权限、MCP 和后台任务所有权实行失败关闭。
 
@@ -45,5 +45,9 @@ router 没有注册稳定的 `session/delete` 方法。同一个 router 把 `ses
 - 分叉对话在创建时共享不可变前缀，但拥有独立 ID、event、alias、运行时资源和后续历史。
 - Delete 按协议意图属于破坏性操作；工作区过滤和稳定 not-found 错误避免其成为跨工作区
   元数据探针。
-- ACP 适配器仍是 partial：额外目录、非 stdio MCP 传输与能力、多媒体 prompt/历史、
-  客户端文件系统/终端方法、WebSocket 和扩展仍待完成。
+- ACP 适配器仍是 partial。后续有界切片已实现按 profile 控制的额外目录、Streamable HTTP 与
+  legacy SSE MCP 传输，以及有界的私有 resource/prompt/callback/refresh projection；也已实现
+  有界 prompt 多媒体输入、客户端文件系统/终端方法、WebSocket 传输和私有
+  artifact/subagent/lifecycle/compaction 扩展。二进制多媒体历史回放、ACP-transport MCP
+  server declaration、持久化 MCP 配置、交互式 client-terminal input/resize/PTY framing 以及
+  完整 conformance 仍在支持边界之外。

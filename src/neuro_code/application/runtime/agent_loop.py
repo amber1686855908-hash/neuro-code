@@ -65,6 +65,10 @@ from neuro_code.application.runtime.supervision import (
     ToolExecutionObservation,
 )
 from neuro_code.application.runtime.tool_pipeline import ToolExecutor
+from neuro_code.application.runtime.tool_scheduler import (
+    ToolBatchExecutionError,
+    ToolScheduler,
+)
 from neuro_code.application.sessions.lifecycle import (
     SessionLifecycleService,
     StartSessionRequest,
@@ -86,6 +90,7 @@ from neuro_code.domain.conversation.messages import (
     SyntheticReason,
     ToolCall,
 )
+from neuro_code.domain.conversation.request import ModelRequestSnapshot
 from neuro_code.domain.execution import (
     AgentExecutionOutcome,
     AgentExecutionStatus,
@@ -98,6 +103,8 @@ from neuro_code.domain.execution import (
     SupervisorDecisionKind,
     SupervisorReasonCode,
     TurnCancellationPolicy,
+    TurnInput,
+    TurnRecoveryAttempt,
     TurnSource,
 )
 from neuro_code.domain.plans import PlanStepStatus, SessionPlan
@@ -143,6 +150,14 @@ class AgentRunResult:
     steps: int
     plan: SessionPlan | None = None
     outcome: AgentExecutionOutcome | None = None
+    turn_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ScheduledToolOutcome:
+    observation: ToolExecutionObservation | None
+    messages: tuple[Message, ...] = ()
+    context_items: tuple[SessionItem, ...] = ()
 
 
 class AgentLoopRunner:
@@ -167,6 +182,7 @@ class AgentLoopRunner:
         "_system_prompt",
         "_tool_context",
         "_tool_executor",
+        "_tool_scheduler",
         "_tools",
     )
 
@@ -218,8 +234,13 @@ class AgentLoopRunner:
         self._finalizer_factory = finalizer_factory
         self._finalizer_max_attempts = finalizer_max_attempts
         self._tool_executor = tool_executor
+        self._tool_scheduler: ToolScheduler[_ScheduledToolOutcome] = ToolScheduler(tools)
         self._compaction_runtime_gate = compaction_runtime_gate
         self._provider_context_window = provider_context_window
+
+    @property
+    def provider_context_window(self) -> ProviderContextWindow | None:
+        return self._provider_context_window
 
     async def run(
         self,
@@ -234,10 +255,18 @@ class AgentLoopRunner:
         source_model: str | None = None,
         source_context_affinity: str | None = None,
         session_id: str | None = None,
+        turn_id: str | None = None,
+        ultracode_execution_id: str | None = None,
         cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
         turn_source: TurnSource = TurnSource.USER,
     ) -> AgentRunResult:
         prompt_parts = tuple(content_parts)
+        if ultracode_execution_id is not None and (
+            not isinstance(ultracode_execution_id, str)
+            or not ultracode_execution_id.strip()
+            or len(ultracode_execution_id.encode("utf-8")) > 128
+        ):
+            raise ValueError("ultracode execution id must be a bounded non-empty identifier")
         if not isinstance(turn_source, TurnSource):
             raise TypeError("turn_source must be a TurnSource")
         if turn_source is TurnSource.USER and not prompt.strip() and not prompt_parts:
@@ -303,6 +332,14 @@ class AgentLoopRunner:
         if plan_execution_requested and self._context_builder.plan is None:
             raise ConfigurationError("cannot execute a plan that has not been saved")
         session_task: SessionTask | None = None
+        if self._session_store is not None and session_id is not None:
+            open_attempts = await self._session_store.load_open_turn_attempts(session_id)
+            if open_attempts:
+                raise ConfigurationError(
+                    "session has an unresolved interrupted turn; explicitly abandon it "
+                    "before starting another turn"
+                )
+        queued_plan_task: SessionTask | None = None
         if plan_execution_requested:
             assert self._session_store is not None
             assert session_id is not None
@@ -314,26 +351,58 @@ class AgentLoopRunner:
                     datetime.now(UTC),
                     plan_snapshot=self._context_builder.plan,
                 )
-                await self._session_store.create_session_task(session_id, session_task)
             else:
-                queued_task = await SessionTaskQueryService(self._session_store).get_session_task(
-                    GetSessionTaskRequest(session_id, plan_execution_task_id)
-                )
-                if queued_task is None:
+                queued_plan_task = await SessionTaskQueryService(
+                    self._session_store
+                ).get_session_task(GetSessionTaskRequest(session_id, plan_execution_task_id))
+                if queued_plan_task is None:
                     raise ConfigurationError(f"unknown queued plan task: {plan_execution_task_id}")
-                if queued_task.kind is not SessionTaskKind.PLAN_EXECUTION:
+                if queued_plan_task.kind is not SessionTaskKind.PLAN_EXECUTION:
                     raise ConfigurationError("only plan execution tasks can be started")
-                if queued_task.status is not SessionTaskStatus.QUEUED:
+                if queued_plan_task.status is not SessionTaskStatus.QUEUED:
                     raise ConfigurationError(f"plan task {plan_execution_task_id} is not queued")
-                if queued_task.plan_snapshot != self._context_builder.plan:
+                if queued_plan_task.plan_snapshot != self._context_builder.plan:
                     raise ConfigurationError(
                         f"plan task {plan_execution_task_id} does not match the saved plan"
                     )
-                session_task = await self._session_store.start_session_task(
-                    session_id,
-                    plan_execution_task_id,
-                    datetime.now(UTC),
-                )
+
+        if self._session_store is not None and session_id is not None:
+            turn_id = turn_id or f"turn-{uuid.uuid4().hex}"
+            turn_input = TurnInput(
+                prompt,
+                prompt_parts,
+                turn_source,
+                plan_execution_requested,
+                session_task.task_id if session_task is not None else plan_execution_task_id,
+            )
+            attempt = TurnRecoveryAttempt.create(
+                turn_id=turn_id,
+                session_id=session_id,
+                input=turn_input,
+                task_id=(
+                    session_task.task_id
+                    if session_task is not None
+                    else queued_plan_task.task_id
+                    if queued_plan_task is not None
+                    else None
+                ),
+                accepted_at=datetime.now(UTC),
+            )
+            if plan_execution_requested:
+                if queued_plan_task is None:
+                    assert session_task is not None
+                    session_task = await self._session_store.start_plan_turn_attempt(
+                        attempt,
+                        task=session_task,
+                    )
+                else:
+                    session_task = await self._session_store.start_plan_turn_attempt(
+                        attempt,
+                        queued_task_id=queued_plan_task.task_id,
+                        started_at=datetime.now(UTC),
+                    )
+            else:
+                await self._session_store.start_turn_attempt(attempt)
 
         recorder = TurnEventRecorder(
             sink=sink,
@@ -348,9 +417,9 @@ class AgentLoopRunner:
             sequence=sequence,
             session_task=session_task,
             pristine_cancel_eligible=pristine_cancel_eligible,
+            turn_id=turn_id,
         )
         emit = recorder.emit
-        finish_session_task = recorder.finish_session_task
         record_turn_failure = recorder.record_turn_failure
         finalize_turn_completion = recorder.finalize_turn_completion
 
@@ -784,28 +853,35 @@ class AgentLoopRunner:
             if persist_turn_context:
                 context_items.append(final_message)
             await emit(AgentEventKind.TEXT_DELTA, {"text": finalization.response})
-            await finish_session_task(SessionTaskStatus.COMPLETED)
             result_items = (
                 persistent_context_items() if persist_turn_context else turn_context_prefix
             )
+            completion_data: dict[str, object] = {
+                "step": step,
+                "stop_reason": finalization.stop_reason,
+                "input_tokens": finalization.total_input_tokens,
+                "output_tokens": finalization.total_output_tokens,
+                "duration_seconds": monotonic() - turn_started_at,
+                "execution_status": outcome.status.value,
+                "execution_reason": outcome.reason_code.value
+                if outcome.reason_code is not None
+                else None,
+                "finalized": outcome.finalized,
+                "recoverable": outcome.recoverable,
+                "finalization_status": finalization.status.value,
+                "finalization_attempts": len(finalization.attempts),
+                "illegal_tool_calls": finalization.illegal_tool_calls,
+            }
+            if ultracode_execution_id is not None:
+                completion_data.update(
+                    {
+                        "ultracode_execution_id": ultracode_execution_id,
+                        "response": finalization.response,
+                    }
+                )
             await finalize_turn_completion(
                 outcome,
-                {
-                    "step": step,
-                    "stop_reason": finalization.stop_reason,
-                    "input_tokens": finalization.total_input_tokens,
-                    "output_tokens": finalization.total_output_tokens,
-                    "duration_seconds": monotonic() - turn_started_at,
-                    "execution_status": outcome.status.value,
-                    "execution_reason": outcome.reason_code.value
-                    if outcome.reason_code is not None
-                    else None,
-                    "finalized": outcome.finalized,
-                    "recoverable": outcome.recoverable,
-                    "finalization_status": finalization.status.value,
-                    "finalization_attempts": len(finalization.attempts),
-                    "illegal_tool_calls": finalization.illegal_tool_calls,
-                },
+                completion_data,
                 result_items,
             )
             return AgentRunResult(
@@ -817,6 +893,7 @@ class AgentLoopRunner:
                 step,
                 self._context_builder.plan,
                 outcome,
+                turn_id,
             )
 
         response_parts: list[str] = []
@@ -970,14 +1047,50 @@ class AgentLoopRunner:
                 if terminal_before_model is not None:
                     return await complete_finalized_turn(terminal_before_model, step=step - 1)
                 await emit_budget_usage()
+                tool_definitions = self._tools.definitions()
+                request_snapshot = ModelRequestSnapshot.build(
+                    context=context,
+                    tools=tool_definitions,
+                    provider=self._provider.provider_name,
+                    model=self._provider.model_name,
+                    context_affinity=getattr(self._provider, "context_affinity", None),
+                    step=step,
+                    reasoning_effort=context.reasoning_effort,
+                )
+                await emit(
+                    AgentEventKind.MODEL_REQUEST_SNAPSHOT,
+                    request_snapshot.to_event_data(),
+                )
+                await recorder.record_model_request_started(
+                    request_id=request_snapshot.request_id,
+                    step=step,
+                    provider=self._provider.provider_name,
+                    model=self._provider.model_name,
+                )
+
+                request_id = request_snapshot.request_id
+                current_step = step
+
+                async def record_output_started(
+                    output_kind: str,
+                    bound_request_id: str = request_id,
+                    bound_step: int = current_step,
+                ) -> None:
+                    await recorder.record_model_output_started(
+                        request_id=bound_request_id,
+                        step=bound_step,
+                        output_kind=output_kind,
+                    )
+
                 step_result = await ModelStepProcessor(session_store=self._session_store).consume(
-                    self._provider.stream(context, self._tools.definitions()),
+                    self._provider.stream(context, tool_definitions),
                     emit=emit,
                     step=step,
                     step_started_at=step_started_at,
                     session_id=session_id,
                     can_adopt_provider_origin=can_adopt_provider_origin,
                     on_imperfect=lambda: setattr(recorder, "pristine_cancel_eligible", False),
+                    on_output_started=record_output_started,
                 )
                 step_text = step_result.text
                 step_reasoning = step_result.reasoning
@@ -1086,10 +1199,23 @@ class AgentLoopRunner:
                     context_items.append(assistant_message)
 
                 if not tool_calls:
-                    await finish_session_task(SessionTaskStatus.COMPLETED)
                     result_items = (
                         persistent_context_items() if persist_turn_context else turn_context_prefix
                     )
+                    completion_data = {
+                        "step": step,
+                        "stop_reason": completion.stop_reason,
+                        "input_tokens": completion.input_tokens,
+                        "output_tokens": completion.output_tokens,
+                        "duration_seconds": monotonic() - turn_started_at,
+                    }
+                    if ultracode_execution_id is not None:
+                        completion_data.update(
+                            {
+                                "ultracode_execution_id": ultracode_execution_id,
+                                "response": "".join(response_parts),
+                            }
+                        )
                     await finalize_turn_completion(
                         AgentExecutionOutcome(
                             AgentExecutionStatus.COMPLETED,
@@ -1097,13 +1223,7 @@ class AgentLoopRunner:
                             finalized=False,
                             recoverable=False,
                         ),
-                        {
-                            "step": step,
-                            "stop_reason": completion.stop_reason,
-                            "input_tokens": completion.input_tokens,
-                            "output_tokens": completion.output_tokens,
-                            "duration_seconds": monotonic() - turn_started_at,
-                        },
+                        completion_data,
                         result_items,
                     )
                     return AgentRunResult(
@@ -1114,6 +1234,7 @@ class AgentLoopRunner:
                         tuple(events),
                         step,
                         self._context_builder.plan,
+                        turn_id=turn_id,
                     )
 
                 tool_batch = tuple(call.name for call in tool_calls)
@@ -1177,7 +1298,19 @@ class AgentLoopRunner:
                     )
                     update_runtime_supervision_guidance(after_tool_batch_decision)
                     continue
-                for index, call in enumerate(tool_calls):
+
+                async def execute_scheduled_tool(
+                    call: ToolCall,
+                    isolated: bool,
+                ) -> _ScheduledToolOutcome:
+                    # Parallel calls get private append-only projections.  The
+                    # executor still owns every permission, approval, sandbox,
+                    # redaction, and event boundary; only transcript merging
+                    # is deferred until model order is restored.
+                    base_message_count = len(messages)
+                    base_context_count = len(context_items)
+                    target_messages = list(messages) if isolated else messages
+                    target_context_items = list(context_items) if isolated else context_items
                     interaction_tool = isinstance(
                         self._tools.get(call.name), InteractionControlTool
                     )
@@ -1186,8 +1319,8 @@ class AgentLoopRunner:
                     try:
                         observation = await self._tool_executor.execute(
                             call,
-                            messages,
-                            context_items,
+                            target_messages,
+                            target_context_items,
                             emit,
                             session_id,
                             interrupted_observation_sink=record_interrupted_tool_outcome,
@@ -1197,33 +1330,63 @@ class AgentLoopRunner:
                                 is ExecutionControlMode.FINALIZE_TERMINAL
                                 else None
                             ),
+                            recovery_started_sink=(
+                                (
+                                    lambda tool_id, tool_name, side_effecting: (
+                                        recorder.record_tool_started(
+                                            tool_id=tool_id,
+                                            tool_name=tool_name,
+                                            side_effecting=side_effecting,
+                                        )
+                                    )
+                                )
+                                if self._session_store is not None
+                                and session_id is not None
+                                and turn_id is not None
+                                else None
+                            ),
                         )
-                        if observation is None:
-                            disable_supervision("tool_observation_unavailable")
-                        else:
-                            record_verification_evidence(observation)
-                            last_tool_decision = record_tool_outcome(observation)
-                            if (
-                                supervisor is not None
-                                and observation.progress_kind is not ProgressKind.NONE
-                            ):
-                                segment_progress_kinds.add(observation.progress_kind)
-                            pending_terminal_decision = select_terminal_decision(
-                                pending_terminal_decision,
-                                last_tool_decision,
-                            )
-                    except BaseException as error:
-                        await self._tool_executor.record_unstarted_tool_calls(
-                            tool_calls[index + 1 :],
-                            messages,
-                            context_items,
-                            emit,
-                            cancelled=isinstance(error, asyncio.CancelledError),
+                        return _ScheduledToolOutcome(
+                            observation,
+                            tuple(target_messages[base_message_count:]) if isolated else (),
+                            tuple(target_context_items[base_context_count:]) if isolated else (),
                         )
-                        raise
                     finally:
                         if interaction_tool and supervisor is not None:
                             supervisor.resume_wall_clock()
+
+                try:
+                    scheduled_observations = await self._tool_scheduler.run(
+                        tool_calls,
+                        execute_scheduled_tool,
+                    )
+                except ToolBatchExecutionError as batch_error:
+                    await self._tool_executor.record_unstarted_tool_calls(
+                        batch_error.not_started,
+                        messages,
+                        context_items,
+                        emit,
+                        cancelled=isinstance(batch_error.cause, asyncio.CancelledError),
+                    )
+                    raise batch_error.cause from batch_error
+                for scheduled in scheduled_observations:
+                    messages.extend(scheduled.messages)
+                    context_items.extend(scheduled.context_items)
+                    observation = scheduled.observation
+                    if observation is None:
+                        disable_supervision("tool_observation_unavailable")
+                    else:
+                        record_verification_evidence(observation)
+                        last_tool_decision = record_tool_outcome(observation)
+                        if (
+                            supervisor is not None
+                            and observation.progress_kind is not ProgressKind.NONE
+                        ):
+                            segment_progress_kinds.add(observation.progress_kind)
+                        pending_terminal_decision = select_terminal_decision(
+                            pending_terminal_decision,
+                            last_tool_decision,
+                        )
                 if pending_terminal_decision is not None:
                     return await complete_finalized_turn(pending_terminal_decision, step=step)
                 update_runtime_supervision_guidance(
@@ -1301,11 +1464,6 @@ class AgentLoopRunner:
                         SupervisorReasonCode.MODEL_STEP_LIMIT,
                     ),
                     step=self._max_steps,
-                )
-            if self._session_store is not None and session_id is not None:
-                await self._session_store.save_session_items(
-                    session_id,
-                    persistent_context_items() if persist_turn_context else turn_context_prefix,
                 )
             raise ProviderError(f"agent exceeded the maximum of {self._max_steps} model steps")
         except BaseException as error:

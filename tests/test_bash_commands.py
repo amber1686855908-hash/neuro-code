@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import unittest
 
-from neuro_code.domain.permissions.bash_commands import analyze_bash_command
+from neuro_code.domain.permissions.bash_commands import (
+    BashCommandFamily,
+    analyze_bash_command,
+    classify_bash_command_family,
+)
 
 
 class BashCommandAnalysisTests(unittest.TestCase):
@@ -100,6 +104,45 @@ class BashCommandAnalysisTests(unittest.TestCase):
         ):
             with self.subTest(command=command):
                 self.assertFalse(analyze_bash_command(command).complete)
+
+    def test_classifies_only_the_bounded_command_family_shapes(self) -> None:
+        cases = (
+            ("pytest -q tests", BashCommandFamily.TEST),
+            ("python -m pytest tests/unit", BashCommandFamily.TEST),
+            ("uv run pytest -q", BashCommandFamily.TEST),
+            ("uv run python -m pytest -q", BashCommandFamily.TEST),
+            ("ruff check src", BashCommandFamily.STATIC_CHECK),
+            ("uv run ruff format --check src", BashCommandFamily.STATIC_CHECK),
+            ("python -m mypy", BashCommandFamily.STATIC_CHECK),
+            ("git status --short", BashCommandFamily.GIT_READ),
+            ("git diff -- src/main.py", BashCommandFamily.GIT_READ),
+            ("git branch --show-current", BashCommandFamily.GIT_READ),
+        )
+        for command, family in cases:
+            with self.subTest(command=command):
+                self.assertEqual(classify_bash_command_family(command), family)
+
+    def test_command_family_classifier_rejects_composition_escape_and_high_risk_options(
+        self,
+    ) -> None:
+        commands = (
+            "pytest -q && echo done",
+            "timeout 30 pytest -q",
+            "FOO=value pytest -q",
+            "pytest --rootdir /tmp/outside",
+            "pytest --basetemp=../outside",
+            "ruff format src",
+            "ruff check --fix src",
+            "git push",
+            "git -C ../outside status",
+            "git diff --output=artifact.txt",
+            "git status > status.txt",
+            "python -c 'pytest'",
+            "uv run python -m pytest --rootdir=/tmp/outside",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertIsNone(classify_bash_command_family(command))
 
 
 if __name__ == "__main__":

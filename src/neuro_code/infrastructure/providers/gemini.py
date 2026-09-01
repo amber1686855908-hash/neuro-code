@@ -33,6 +33,10 @@ from neuro_code.domain.conversation.messages import (
     ToolCall,
 )
 from neuro_code.domain.tools import ToolDefinition
+from neuro_code.infrastructure.providers.failure_conformance import (
+    ProviderFailureProtocol,
+    classify_provider_failure,
+)
 from neuro_code.infrastructure.providers.image_references import (
     GEMINI_IMAGE_MEDIA_TYPES,
     GEMINI_MAX_INLINE_IMAGE_BYTES,
@@ -41,7 +45,7 @@ from neuro_code.infrastructure.providers.image_references import (
     is_gemini_file_uri,
     parse_image_reference,
 )
-from neuro_code.shared.errors import ProviderError
+from neuro_code.shared.errors import ProviderError, ProviderFailureKind, ProviderFailureOrigin
 
 
 class GeminiProvider:
@@ -143,6 +147,9 @@ class GeminiProvider:
                 assert part.text is not None
                 parts.append({"text": part.text})
                 continue
+            if part.kind is not ContentPartKind.IMAGE:
+                parts.append({"text": part.model_placeholder})
+                continue
             assert part.url is not None
             reference = parse_image_reference(
                 part.url,
@@ -202,7 +209,10 @@ class GeminiProvider:
                     cls._append_content(contents, "model", parts)
                 continue
             if not message.name:
-                raise ProviderError("Gemini tool results require a tool name")
+                raise ProviderError.classified(
+                    ProviderFailureKind.INVALID_REQUEST,
+                    "Gemini tool results require a tool name",
+                )
             function_response: dict[str, Any] = {
                 "name": message.name,
                 "response": cls._tool_response(content),
@@ -261,7 +271,7 @@ class GeminiProvider:
         try:
             import httpx
         except ImportError as error:
-            raise ProviderError(
+            raise ProviderError.local(
                 "httpx is required for live model requests; install the project"
             ) from error
 
@@ -283,8 +293,17 @@ class GeminiProvider:
             ):
                 if response.status_code >= 400:
                     detail = self._safe_detail((await response.aread()).decode("utf-8", "replace"))
-                    raise ProviderError(
-                        f"Gemini request failed with HTTP {response.status_code}: {detail}"
+                    raise ProviderError.from_http(
+                        response.status_code,
+                        detail,
+                        headers=response.headers,
+                        failure_kind=classify_provider_failure(
+                            ProviderFailureProtocol.GEMINI_GENERATE_CONTENT,
+                            detail,
+                        ),
+                        provider=self._provider_name,
+                        model=self._model,
+                        redaction_values=(self._api_key, *self._http_policy.redaction_values),
                     )
                 async for line in response.aiter_lines():
                     if not line.startswith("data:"):
@@ -295,12 +314,27 @@ class GeminiProvider:
                     try:
                         chunk = json.loads(payload)
                     except json.JSONDecodeError as error:
-                        raise ProviderError("Gemini returned malformed streaming JSON") from error
+                        raise ProviderError.protocol(
+                            "Gemini returned malformed streaming JSON",
+                            provider=self._provider_name,
+                            model=self._model,
+                        ) from error
                     if not isinstance(chunk, dict):
                         continue
                     if "error" in chunk:
                         detail = json.dumps(chunk["error"], ensure_ascii=False)
-                        raise ProviderError(f"Gemini stream error: {self._safe_detail(detail)}")
+                        raise ProviderError.classified(
+                            classify_provider_failure(
+                                ProviderFailureProtocol.GEMINI_GENERATE_CONTENT,
+                                json.dumps(chunk, ensure_ascii=False),
+                            )
+                            or ProviderFailureKind.UNKNOWN,
+                            f"Gemini stream error: {self._safe_detail(detail)}",
+                            provider=self._provider_name,
+                            model=self._model,
+                            origin=ProviderFailureOrigin.PROVIDER,
+                            redaction_values=(self._api_key, *self._http_policy.redaction_values),
+                        )
                     usage = chunk.get("usageMetadata")
                     if isinstance(usage, dict):
                         parsed_input_tokens = self._token_count(usage.get("promptTokenCount"))
@@ -325,8 +359,11 @@ class GeminiProvider:
                         if isinstance(feedback, dict) and isinstance(
                             feedback.get("blockReason"), str
                         ):
-                            raise ProviderError(
-                                f"Gemini blocked the prompt: {feedback['blockReason']}"
+                            raise ProviderError.classified(
+                                ProviderFailureKind.INVALID_REQUEST,
+                                f"Gemini blocked the prompt: {feedback['blockReason']}",
+                                provider=self._provider_name,
+                                model=self._model,
                             )
                         continue
                     candidate = candidates[0]
@@ -353,9 +390,9 @@ class GeminiProvider:
                         name = function_call.get("name")
                         arguments = function_call.get("args", {})
                         if not isinstance(name, str) or not name:
-                            raise ProviderError("Gemini emitted an incomplete tool call")
+                            raise ProviderError.protocol("Gemini emitted an incomplete tool call")
                         if not isinstance(arguments, dict):
-                            raise ProviderError(
+                            raise ProviderError.protocol(
                                 f"tool call {name!r} arguments must be a JSON object"
                             )
                         provider_call_id = function_call.get("id")
@@ -373,9 +410,12 @@ class GeminiProvider:
         except ProviderError:
             raise
         except Exception as error:
-            detail = self._safe_detail(str(error))
-            raise ProviderError(
-                f"Gemini stream failed: {type(error).__name__}: {detail}"
+            raise ProviderError.from_runtime(
+                error,
+                provider=self._provider_name,
+                model=self._model,
+                redaction_values=(self._api_key, *self._http_policy.redaction_values),
+                prefix="Gemini stream failed",
             ) from error
 
         usage = ModelUsage(

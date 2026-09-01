@@ -246,6 +246,27 @@ class BlockingProvider:
             yield ModelCompleted("stop")
 
 
+class CurrentTaskCancellingProvider:
+    provider_name = "cancelling"
+    model_name = "cancelling-model"
+    context_affinity = "profile-v1:cancelling"
+
+    async def stream(
+        self,
+        context: ModelContext,
+        tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
+    ) -> AsyncIterator[ModelEvent]:
+        del context, tools, tool_policy
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel()
+        await asyncio.Event().wait()
+        if False:
+            yield ModelCompleted("stop")
+
+
 class GateApprover:
     def __init__(self) -> None:
         self.requested = asyncio.Event()
@@ -1989,9 +2010,8 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             store = SqliteSessionStore(root / "sessions.db")
             await store.initialize()
-            provider = BlockingProvider()
             runtime = AgentRuntime(
-                provider=provider,
+                provider=CurrentTaskCancellingProvider(),
                 tools=ToolRegistry(),
                 workspace_change_observer=EmptyWorkspaceChangeObserver(),
                 permissions=PermissionManager(),
@@ -2000,28 +2020,24 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 plan=SessionPlan((PlanStep("Try the execution"),)),
             )
 
-            turn = asyncio.create_task(
-                runtime.run("Execute the approved plan", plan_execution_requested=True)
-            )
-            try:
-                await asyncio.wait_for(provider.started.wait(), timeout=5)
-                turn.cancel()
-                with self.assertRaises(asyncio.CancelledError):
-                    await turn
-            finally:
-                if not turn.done():
-                    turn.cancel()
-                    await asyncio.gather(turn, return_exceptions=True)
+            with self.assertRaises(asyncio.CancelledError):
+                await runtime.run("Execute the approved plan", plan_execution_requested=True)
 
             session_id = (await store.list_sessions())[0].id
             tasks = await store.list_session_tasks(session_id)
             self.assertEqual(len(tasks), 1)
+            self.assertIs(tasks[0].kind, SessionTaskKind.PLAN_EXECUTION)
             self.assertIs(tasks[0].status, SessionTaskStatus.CANCELLED)
             event_kinds = [event["kind"] for event in await store.load_events(session_id)]
+            self.assertIn(AgentEventKind.SESSION_TASK_STARTED.value, event_kinds)
+            self.assertIn(AgentEventKind.MODEL_REQUEST_STARTED.value, event_kinds)
+            self.assertIn(AgentEventKind.SESSION_TASK_CANCELLED.value, event_kinds)
             self.assertLess(
                 event_kinds.index(AgentEventKind.SESSION_TASK_CANCELLED.value),
                 event_kinds.index(AgentEventKind.TURN_FAILED.value),
             )
+            self.assertNotIn(AgentEventKind.TURN_COMPLETED.value, event_kinds)
+            self.assertIsNone(await store.load_execution_record(session_id))
 
     async def test_plan_execution_without_a_saved_plan_fails_before_creating_a_session(
         self,
@@ -3055,6 +3071,66 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("permission denied", denial[0].content)
             self.assertEqual(observer.capture_roots, [])
 
+    async def test_mixed_apply_patch_targets_are_denied_before_any_file_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            allowed = root / "allowed.py"
+            denied = root / "denied.py"
+            allowed.write_text("allowed = 1\n", encoding="utf-8")
+            denied.write_text("denied = 1\n", encoding="utf-8")
+            patch = """*** Begin Patch
+*** Update File: allowed.py
+@@
+-allowed = 1
++allowed = 2
+*** Update File: denied.py
+@@
+-denied = 1
++denied = 2
+*** End Patch"""
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(ToolCall("mixed", "apply_patch", {"patch": patch})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("The mixed patch was denied."), ModelCompleted("stop")),
+                )
+            )
+            observer = RecordingWorkspaceChangeObserver(
+                WorkspaceChangeReport(files=(), omitted_files=0, scan_limited=False)
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=default_tool_registry(),
+                workspace_change_observer=observer,
+                permissions=PermissionManager(
+                    mode=PermissionMode.DEFAULT,
+                    interactive=False,
+                    rules=(
+                        PermissionRule(
+                            PermissionEffect.ALLOW,
+                            "apply_patch",
+                            path_pattern="allowed.py",
+                            operation="update",
+                        ),
+                    ),
+                ),
+                tool_context=ToolContext(root),
+            )
+
+            result = await runtime.run("Update both files")
+
+            self.assertEqual(allowed.read_text(encoding="utf-8"), "allowed = 1\n")
+            self.assertEqual(denied.read_text(encoding="utf-8"), "denied = 1\n")
+            self.assertIn(AgentEventKind.TOOL_FAILED, [event.kind for event in result.events])
+            denial = [
+                message for message in provider.calls[1].messages if message.role is Role.TOOL
+            ]
+            self.assertEqual(len(denial), 1)
+            self.assertIn("outside explicit path allow rules", denial[0].content)
+            self.assertEqual(observer.capture_roots, [])
+
     async def test_interactive_approval_blocks_the_tool_until_user_allows(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3283,7 +3359,11 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
 
             turn = asyncio.create_task(runtime.run("Run both tools"))
-            await asyncio.wait_for(blocking.started.wait(), timeout=1)
+            # Persisted turn/tool write-ahead markers add a bounded SQLite
+            # boundary before the tool body. Keep this synchronization timeout
+            # independent of normal local scheduling variance across Python
+            # versions and hosted CI runners.
+            await asyncio.wait_for(blocking.started.wait(), timeout=5)
             turn.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await turn
@@ -3839,6 +3919,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     AgentEventKind.SESSION_STARTED,
                     AgentEventKind.USER_MESSAGE,
                     AgentEventKind.MODEL_STEP_STARTED,
+                    AgentEventKind.MODEL_REQUEST_SNAPSHOT,
                     AgentEventKind.MODEL_THINKING_COMPLETED,
                     AgentEventKind.TEXT_DELTA,
                     AgentEventKind.TURN_COMPLETED,

@@ -366,12 +366,12 @@ class ProfileConversationControllerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(selection.changed)
         self.assertIs(selection.requested, ReasoningEffort.ULTRACODE)
-        self.assertIs(selection.effective, ReasoningEffort.XHIGH)
-        self.assertFalse(selection.workflow_orchestration_active)
+        self.assertIs(selection.effective, ReasoningEffort.MAX)
+        self.assertTrue(selection.workflow_orchestration_active)
         self.assertIs(first.reasoning_effort, ReasoningEffort.ULTRACODE)
         self.assertIs(second.reasoning_effort, ReasoningEffort.ULTRACODE)
         self.assertIs(controller.reasoning_effort, ReasoningEffort.ULTRACODE)
-        self.assertIs(controller.effective_reasoning_effort, ReasoningEffort.XHIGH)
+        self.assertIs(controller.effective_reasoning_effort, ReasoningEffort.MAX)
 
     async def test_reasoning_effort_change_is_rejected_during_a_turn(self) -> None:
         runner = FixtureConversation(blocked=True)

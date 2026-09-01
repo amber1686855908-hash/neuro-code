@@ -41,5 +41,9 @@ POSIX 进程树或 Windows 原子 Job 保证。远程配置与 server 响应仍�
   环境代理。
 - 每个远程工具调用前都会获得用户权限决定；取消保持保守：后续调用会失败关闭，而不会
   复用状态不确定的连接。
-- MCP ACP 传输、resources、prompts、sampling、elicitation、动态 list-change 刷新、
-  配置持久化和多媒体/embedded 投影仍是独立的后续切片。
+- 在本 ADR 被接受时，ACP-transport MCP server、resources、prompts、sampling、elicitation
+  和动态 list-change 刷新仍是独立的后续切片。当前有界 ACP adapter 已通过私有 ACP
+  extension 提供 resource/resource-template 发现、resource 读取、prompt 发现/获取、
+  sampling/elicitation callback 和动态工具目录刷新。ACP-transport MCP server declaration、
+  配置持久化以及 MCP 多媒体/embedded 结果投影仍不支持。独立的 ACP server stdio/WebSocket
+  transport 由 ADR 0151 说明。

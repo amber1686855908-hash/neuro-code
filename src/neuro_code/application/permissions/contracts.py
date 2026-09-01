@@ -11,12 +11,17 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from neuro_code.application.permissions.scopes import (
+    PermissionScopeCandidate,
+    PermissionScopeContext,
+)
 from neuro_code.domain.permissions.bash_commands import analyze_bash_command
 
 
 class PermissionApprovalKind(StrEnum):
     ALLOW_ONCE = "allow_once"
     ALLOW_SESSION = "allow_session"
+    ALLOW_SCOPE = "allow_scope"
     DENY = "deny"
 
 
@@ -24,12 +29,28 @@ class PermissionApprovalKind(StrEnum):
 class PermissionApproval:
     kind: PermissionApprovalKind
     reason: str
+    scope_candidate: PermissionScopeCandidate | None = None
+    cache_hit: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, PermissionApprovalKind):
+            raise TypeError("permission approval kind must be a PermissionApprovalKind")
+        if not isinstance(self.reason, str) or not self.reason:
+            raise ValueError("permission approval reason must be non-empty")
+        if not isinstance(self.cache_hit, bool):
+            raise TypeError("permission approval cache_hit must be a bool")
+        if self.kind is PermissionApprovalKind.ALLOW_SCOPE:
+            if not isinstance(self.scope_candidate, PermissionScopeCandidate):
+                raise ValueError("scoped approval requires a scope candidate")
+        elif self.scope_candidate is not None:
+            raise ValueError("only scoped approval may contain a scope candidate")
 
     @property
     def allowed(self) -> bool:
         return self.kind in {
             PermissionApprovalKind.ALLOW_ONCE,
             PermissionApprovalKind.ALLOW_SESSION,
+            PermissionApprovalKind.ALLOW_SCOPE,
         }
 
     @classmethod
@@ -44,6 +65,16 @@ class PermissionApproval:
         return cls(PermissionApprovalKind.ALLOW_SESSION, reason)
 
     @classmethod
+    def allow_scope(
+        cls,
+        scope_candidate: PermissionScopeCandidate,
+        reason: str = "approved for this scope by user",
+        *,
+        cache_hit: bool = False,
+    ) -> PermissionApproval:
+        return cls(PermissionApprovalKind.ALLOW_SCOPE, reason, scope_candidate, cache_hit)
+
+    @classmethod
     def deny(cls, reason: str = "denied by user") -> PermissionApproval:
         return cls(PermissionApprovalKind.DENY, reason)
 
@@ -55,6 +86,40 @@ class PermissionRequest:
     summary: str
     reason: str
     scope_key: str | None
+    scope_candidates: tuple[PermissionScopeCandidate, ...] = ()
+    scope_context: PermissionScopeContext | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.call_id, str) or not self.call_id or "\x00" in self.call_id:
+            raise ValueError("permission request call_id must be non-empty")
+        if not isinstance(self.tool_name, str) or not self.tool_name or "\x00" in self.tool_name:
+            raise ValueError("permission request tool_name must be non-empty")
+        for name in ("summary", "reason"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"permission request {name} must be non-empty")
+        if self.scope_key is not None and (
+            not isinstance(self.scope_key, str) or not self.scope_key or "\x00" in self.scope_key
+        ):
+            raise ValueError("permission request scope_key must be non-empty when present")
+        candidates = tuple(self.scope_candidates)
+        if not all(isinstance(candidate, PermissionScopeCandidate) for candidate in candidates):
+            raise TypeError("permission request scope candidates must be canonical")
+        if len(set(candidates)) != len(candidates):
+            raise ValueError("permission request scope candidates must be unique")
+        if self.scope_context is not None and not isinstance(
+            self.scope_context, PermissionScopeContext
+        ):
+            raise TypeError("permission request scope context must be canonical")
+        if any(candidate.is_broad for candidate in candidates) and self.scope_context is None:
+            raise ValueError("broad permission scopes require a scope context")
+        if self.scope_context is not None and any(
+            candidate.workspace_root != self.scope_context.workspace_root
+            for candidate in candidates
+            if candidate.is_broad
+        ):
+            raise ValueError("permission scope candidates must use the request workspace root")
+        object.__setattr__(self, "scope_candidates", candidates)
 
 
 def _bounded_text(value: object, *, limit: int) -> str:
@@ -77,6 +142,9 @@ def build_permission_request(
     tool_name: str,
     arguments: Mapping[str, Any],
     reason: str,
+    *,
+    scope_candidates: tuple[PermissionScopeCandidate, ...] = (),
+    scope_context: PermissionScopeContext | None = None,
 ) -> PermissionRequest:
     """Build a bounded UI description and opaque exact-action session scope.
 
@@ -125,7 +193,15 @@ def build_permission_request(
         scope_key = None
     else:
         scope_key = hashlib.sha256(scope_payload.encode("utf-8")).hexdigest() if cacheable else None
-    return PermissionRequest(call_id, tool_name, summary, reason, scope_key)
+    return PermissionRequest(
+        call_id,
+        tool_name,
+        summary,
+        reason,
+        scope_key,
+        tuple(scope_candidates),
+        scope_context,
+    )
 
 
 __all__ = [

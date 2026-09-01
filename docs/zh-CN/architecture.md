@@ -59,6 +59,16 @@ scripts 和 `python -m neuro_code` 都直接使用它。它只在相应命令实
 解析、分发、渲染和退出码处理；其注入式 `run` 函数由 canonical bootstrap entrypoint 调用。导入
 CLI 不会加载 bootstrap、adapters 或 providers，也不会创建资源。
 
+已解析的 `sessions` command execution boundary 现在由
+`neuro_code.interfaces.cli.sessions` 作为 canonical owner。其
+`run_sessions_command` entrypoint 只依赖窄的 `SessionCliServices` contract，取得配置、会话
+存储、有界 tool-output artifact service 和已打开的 application。它拥有既有的 list、search、rename、
+compact、artifacts 与 recovery operation，以及这些 operation 的 validation、output、bounds 和
+cleanup behavior。Parser grammar 与顶层 dispatch 仍保留在 `neuro_code.cli`；其 private
+`_sessions_command` name 是指向 canonical entrypoint 的 identity-preserving alias。Canonical command
+复用 `neuro_code.interfaces.cli.serialization`。这只是 execution-boundary extraction：
+`neuro_code.cli` 还不是完整的 compatibility facade，其余 command 仍保留原位置。
+
 阶段 2C 保持 `neuro_code.acp` 原位置，作为 ACP/JSON-RPC 入站适配器，但只向它提供
 `application.acp` 契约和 ACP 专用应用服务。该服务暴露绑定创建和安全恢复准备、会话别名与列表、
 工作区校验、协议元数据以及按会话惰性创建的 MCP 工具上下文。`bootstrap.entrypoints` 将
@@ -66,6 +76,34 @@ CLI 不会加载 bootstrap、adapters 或 providers，也不会创建资源。
 随后启动 server。`serve_acp` 只接受所得的 `AcpApplicationService`，不再适配
 `ApplicationComposition` 调用方。ACP 不再导入 MCP 或工作区实现，也不再直接读取组合根配置或存储；导入 ACP 不会
 加载 bootstrap、MCP adapter、SQLite 存储或 providers。
+
+ACP prompt/content 校验与转换由 `neuro_code.interfaces.acp.content` 作为 canonical owner，持久
+history 和实时 event projection 则由 `neuro_code.interfaces.acp.updates` 作为 canonical owner；
+`neuro_code.interfaces.acp.client_io` 现在作为 capability-gated client filesystem 与 terminal
+adapter 的 canonical owner，同时拥有 adapter-local bounds 和 terminal task lifecycle state。
+`neuro_code.acp` 以 private compatibility alias 导入相同的 symbol。
+`neuro_code.interfaces.acp.transport` 现在作为 ACP SDK connection adapter、stdio framing、
+WebSocket newline-JSON bridge、transport-local bounds 以及外层 transport close/shutdown lifecycle
+的 canonical owner。Transport 接收已经构造好的 Agent 或 Agent factory；它不构造 session，也不执行
+capability negotiation。`neuro_code.acp` 保留 service-to-Agent public wrapper，并以 private
+compatibility alias 导入 transport symbol。
+`neuro_code.interfaces.acp.session.AcpSessionRuntime` 现在作为 per-session 可变 interface state、
+resource reference、runtime lock、prompt/cancel/approval presentation state、identity transition 和
+aggregate cleanup 的 canonical owner。`NeuroCodeAcpAgent` 继续拥有 protocol connection attachment、
+capability、registry、
+publication、外层 lifecycle routing、extension dispatch、live MCP orchestration 和 protocol-agent
+semantics；
+`SessionTurnService`/`ConversationRunner` 继续拥有实际 turn 与 recovery authority。
+`neuro_code.interfaces.acp.mcp_config` 现在作为从 ACP MCP declaration 到 application MCP
+configuration contract 的无状态有界转换 canonical owner。`neuro_code.acp` 提供 protected-environment
+集合并保留 caller、capability negotiation、session registry、publication 与外层 lifecycle routing、
+permission request coordination、live MCP 以及 service-to-Agent compatibility wrapper。因此
+`neuro_code.acp` 仍是混合适配器，而不是 facade。详见 [ADR 0145](adr/0145-acp-prompt-content-boundary.md)、
+[ADR 0146](adr/0146-acp-update-and-event-projection-boundary.md)、
+[ADR 0147](adr/0147-acp-client-io-adapter-boundary.md)、
+[ADR 0148](adr/0148-acp-mcp-configuration-boundary.md) 以及
+[ADR 0150](adr/0150-acp-session-runtime-ownership-boundary.md) 和
+[ADR 0151](adr/0151-acp-transport-boundary.md)。
 
 Agent harness 行为现阶段位于 `neuro_code.application.runtime` 的明确 canonical 子模块：
 `background_task_reminders`、`agent`、`conversation` 以及循环、上下文、工具和终结模块。
@@ -387,19 +425,56 @@ USER 候选。按名称先见为准的去重确保 LOCAL 技能遮蔽同名 REPO
 `SkillTool` 始终针对同一稳定边界解析。详见
 [ADR 0044](adr/0044-repository-level-skill-discovery.md)。
 
+## 规范的结构化文件系统目标
+
+结构化本地文件系统工具对每次调用使用一个不可变的
+`FilesystemAccessPlan`。工具适配器先从经过校验的工具语法中提取全部目标，随后
+`resolve_filesystem_access_targets()` 在权限评估前一次性规范化每个本地路径。每个目标
+记录规范路径、所属主工作区或附加工作区根、策略路径、操作、存在状态和链接样组件证明；
+主工作区使用工作区相对的 POSIX 风格策略路径；附加工作区使用遵循平台大小写规则并
+统一使用正斜杠的绝对规范策略路径。原始写法只用于诊断。
+
+权限链严格按以下顺序执行：
+
+1. 一次解析全部目标，包括 `apply_patch` 的所有源路径和目标路径。对缺失的创建叶子会证明
+   已存在的父级/祖先，并拒绝符号链接、junction、Windows reparse traversal、父级逃逸以及
+   含义不明确的 Windows device/extended/ADS 命名空间。
+   普通 drive-absolute 和 UNC 写法只有在其规范目标位于已配置工作区根内时才可用；
+   drive-relative 路径会在文件系统解析前被拒绝。
+2. `PermissionManager.decide_targets()` 对每个规范目标独立评估。显式 deny 优先；无头模式中
+   未解决的 ask 会拒绝；路径范围 allow 是 allowlist。只有所有目标都获授权时，结构化调用才会通过。
+3. 工具执行接收同一个不可变计划，并按提取索引消费规范目标，不会再次解析原始路径。因此混合
+   允许/拒绝目标的 `apply_patch` 会在 journal 或任何写入前停止。
+
+审批层只有在该计划成功后才可以派生 `WORKSPACE_EDITS` 候选。该候选只覆盖主规范根中普通的
+`search_replace` 与 `apply_patch` create/update 目标，要求没有 link-like component，且目标
+不是 Neuro metadata、checkpoint/internal state 或明显的 credential/key。删除、移动、additional
+root、受保护目标以及失败或有歧义的计划都不能成为宽范围编辑 grant。
+
+该契约覆盖本地结构化工具：`read_file`、`read_files`、目录列举、glob/search、
+`search_replace` 和 `apply_patch`。工作区身份、permission、sandbox 和 execution 仍是分离
+决策；该计划不会把任意 Bash 路径解释、MCP 调用、ACP 委托执行或不透明 artifact 句柄变成
+结构化文件系统目标。ACP 客户端路径属于独立的 client authority：Neuro Code 只做 session 根
+的词法校验，不会对远程路径调用宿主 `Path.resolve()`、存在性或链接检查。该契约收口的是
+本地结构化工具边界上的 raw-path authority gap，不声称为所有进程或 Provider capability 提供
+无竞态的 TOCTOU 保护。
+
 ## Partial ACP v1 适配器
 
 `neuro-code acp` 是位于 `ApplicationComposition` 与官方
-`agent-client-protocol` Python SDK 之上的协议适配器。生产 framing、JSON-RPC
-路由、换行分隔 stdio、`session/update` notification 和
-`session/request_permission` request 均继续由 SDK 持有。适配器声明
+`agent-client-protocol` Python SDK 之上的协议适配器。canonical 的
+`neuro_code.interfaces.acp.transport` 负责组装 SDK connection、官方 stdio stream、换行分隔的
+WebSocket bridge 以及外层 connection/Agent shutdown lifecycle；SDK 继续拥有生产环境的 JSON-RPC
+framing、dispatch、Schema 与 normalization。适配器声明
 `loadSession: true` 与 list/delete/fork/resume/close session capability，实现
 `initialize`、`session/new`、`session/list`、`session/load`、`session/delete`、
 `session/fork`、`session/resume`、`session/prompt`、`session/cancel` notification
 和 `session/close`。SDK 0.11 把 fork、resume 和 close 置于
 `use_unstable_protocol` 门后；其生成 Schema 已包含稳定 delete 模型，但 Agent router
-漏掉了该路由，因此 Neuro Code 只把生成的 delete request 加到官方 `MessageRouter`，
-SDK stream、`Connection`、dispatcher、Schema、framing 与错误规范化保持不变。
+漏掉了该路由，因此 canonical transport 只把生成的 delete request 加到官方 `MessageRouter`；
+SDK stream、`Connection`、dispatcher、Schema、framing 与错误规范化保持不变。旧的
+`neuro_code.acp` server function 继续作为 service-to-Agent 的薄 wrapper，并保留既有 private
+transport alias 供兼容调用方使用。
 
 每条 ACP 连接固定绑定到规范化后的启动工作区。每个成功 session 拥有稳定随机 ACP ID、
 一个 `AgentConversation`、一个后台任务 scope、一个活动 prompt 槽位，以及独立审批/
@@ -426,8 +501,8 @@ scope，释放运行时绑定，同时保留持久历史与 alias。EOF 或连�
 
 当 ACP 客户端明确声明 `fs.readTextFile` 时，session 会获得一个绑定到该 ACP session 的窄
 `ClientFileSystem` 应用端口。既有 `read_file` 和 `read_files` 工具仍会先通过选定的主工作区或
-额外工作区根解析每个路径，再将每个绝对路径及有界行范围委托给 `fs/read_text_file`；它们绝不会
-回退调用未声明的客户端操作。ACP 文件系统能力不提供目录遍历或搜索操作，因此 `list_tree` 和
+额外工作区根做词法 session 根校验，再将客户端拥有的路径及有界行范围委托给
+`fs/read_text_file`；宿主机不会解析或检查该路径，也绝不会回退调用本地操作。ACP 文件系统能力不提供目录遍历或搜索操作，因此 `list_tree` 和
 `grep_many` 与 `list_dir`、`grep` 一样继续使用本地工作区语义。当客户端同时声明文本读写能力时，
 `search_replace` 会使用同一端口读取、保留现有
 精确匹配/歧义检查和指令预检规则，再通过 `fs/write_text_file` 写回结果。只读客户端不会暴露该
@@ -443,6 +518,9 @@ scope，释放运行时绑定，同时保留持久历史与 alias。EOF 或连�
 并会在超时或 session 清理时 kill/release 工作。普通有副作用权限仍会门禁启动和终止操作。所有启用的
 sandbox 都不会暴露这些工具，直接调用也会失败关闭，因此客户端终端不能弱化显式本地沙箱。交互式
 输入/resize、游标流式读取和 PTY framing/背压仍未支持。
+适配器实现及其 foreground/background lifecycle state 由
+`neuro_code.interfaces.acp.client_io` 作为 canonical owner；capability negotiation 与 session ownership
+仍保留在顶层 ACP adapter。详见 [ADR 0147](adr/0147-acp-client-io-adapter-boundary.md)。
 
 非空 `mcpServers` 接受 ACP stdio、Streamable HTTP（`http`）和 legacy SSE（`sse`）
 结构；ACP 传输 server 会被确定性拒绝。每个 server 都必须在 session 发布前完成初始化，
@@ -451,6 +529,15 @@ sandbox 都不会暴露这些工具，直接调用也会失败关闭，因此客
 失败。远程 URL 必须是绝对 HTTP/HTTPS endpoint，不能包含内嵌凭据或 fragment。header
 名称、数量、值与总字节均有上限，且不能覆盖 framing 或 routing header。加载持久 ACP
 session 时可以重新提供相同的临时 MCP 配置，但它不会作为历史或授权被持久化。
+
+无状态的 MCP configuration conversion 由 `neuro_code.interfaces.acp.mcp_config` 作为 canonical owner。
+它接受现有的 stdio、Streamable HTTP 和 legacy SSE declaration，返回既有的
+`AcpMcpServerConfig` contract，并保留全部有界校验与 `RequestError.invalid_params` reason。它从 ACP
+service 接收 protected-environment 集合；不会扫描环境状态，也不会从 bootstrap、infrastructure、
+providers 或 stores 获取 authority。配置转换不执行任何 I/O。`MAX_MCP_SERVERS` 因 MCP runtime adapter
+也消费该共享 server-count bound，仍由 application contract 拥有；URL 与 serialized-configuration
+bound 可以被 live ACP projection 复用，但 live callback 或 MCP lifecycle code 不迁移。详见
+[ADR 0148](adr/0148-acp-mcp-configuration-boundary.md)。
 
 官方 `mcp>=1.28.1,<2` SDK 持有 MCP Schema、`ClientSession`、版本协商、JSON-RPC 调度
 和工具结果类型。stdio 使用项目自有的换行分隔 `ProcessTree` 桥接：官方 SDK 在 Windows
@@ -468,8 +555,13 @@ in-progress 并调用 server；拒绝审批绝不会执行。stdio prompt 取消
 `cancelled` prompt 响应完成前终止整个受控 server 进程树。远程 server 的取消会关闭 SDK
 连接并让其无法再被调用；项目不声称持有远程进程，因此不会把终态不确定的远程副作用表示成
 已成功取消。close、load 失败、创建失败、EOF 与断连都幂等关闭同一 session-owned
-collection。MCP resources、prompts、sampling、elicitation、动态工具目录刷新与 ACP
-传输仍未支持。
+collection。session-scoped 私有 ACP MCP extension 提供有界的 resource 与
+resource-template 发现、resource 读取、prompt 发现与获取；在客户端支持时转发
+sampling 与 elicitation callback，并支持有界动态工具目录刷新。这些是遵守既有
+脱敏、权限和生命周期规则的有界投影，不等于通用 MCP feature parity。ACP server
+提供官方 SDK stdio 传输和有界 WebSocket newline-JSON bridge；ACP-transport MCP
+server declaration 仍不支持。持久化 MCP 配置以及 MCP 结果中的多媒体/embedded
+body 仍不支持。
 
 list 只用于发现；即使省略 `cwd`，也始终限制在连接工作区。它只返回持久 ACP ID、记录的
 绝对 cwd、有界标题和 ISO 更新时间。尚无 alias 的 session 通过 schema v5 原子
@@ -478,16 +570,20 @@ get-or-create 获得一个。SQLite keyset page 经过文件系统身份工作�
 位置，最多 256 个，不暴露内部 ID。list 不会打开 conversation/background scope，也不
 返回内容、provider 元数据、`_meta` 或额外目录。
 
-提示转换按照输入顺序接受 ACP 基线 Text、内嵌 Image、ResourceLink 与内嵌
-`TextResourceContents`。Text/resource 数量、单字段大小、annotations 序列化、ResourceLink
+提示转换现在由 `neuro_code.interfaces.acp.content` 作为 canonical owner，按照输入顺序接受
+ACP 基线 Text、内嵌 Image、内嵌 Audio、ResourceLink 与内嵌 `TextResourceContents` 或
+`BlobResourceContents`。Text/resource 数量、单字段大小、annotations 序列化、ResourceLink
 汇总字节和文本总字节都有上限。Image 只接受固定光栅 MIME 白名单中通过校验的 base64：最多
-八张、解码后单张 5 MiB、总计 10 MiB。其可选 URI、本地文件与远程链接绝不会被读取、下载或
-解引用。内嵌文本资源只接受已提供的文本：最多八个、单个 64 KiB、合计 128 KiB。它会成为带
-有界 URI 和可选 MIME 类型来源标签的文本 `ContentPart`；URI 绝不会被解析，block、resource
-及 annotation 的 `_meta` 都会被省略。规范的有序 `ContentPart` 会随用户消息持久化，因此
-供应商适配器可以在当前轮和恢复会话中应用自己的角色、MIME 和请求大小校验。只有 `uri`、
-`name`、`title`、`description`、`mimeType`、`size` 和标准 annotations 字段会进入模型可见的
-ResourceLink 描述；`_meta` 会被忽略。音频和内嵌 `BlobResourceContents` 提示块仍会被拒绝。
+八张、解码后单张 5 MiB、总计 10 MiB。Audio 接受通过校验的 base64 与 `audio/*` MIME type，
+最多八个、单个解码后 5 MiB、总计 10 MiB。内嵌文本或二进制 resource 只接受已提供的值：每种
+最多八个，文本单个 64 KiB 或二进制单个 5 MiB，分别合计 128 KiB 或 10 MiB。Resource 与
+embedded-resource URI、可选本地文件和远程链接绝不会被读取、下载或解引用。内嵌文本会成为
+带有界 URI 与可选 MIME 类型来源标签的文本 `ContentPart`，内嵌二进制数据则保持为 typed blob
+`ContentPart`；block、resource 及 annotation 的 `_meta` 都会被省略。规范的有序 `ContentPart`
+会随用户消息持久化，因此供应商适配器可以在当前轮和恢复会话中应用自己的角色、MIME 和请求
+大小校验。只有 `uri`、`name`、`title`、`description`、`mimeType`、`size` 和标准 annotations
+字段会进入模型可见的 ResourceLink 描述；`_meta` 会被忽略。详见
+[ADR 0145](adr/0145-acp-prompt-content-boundary.md)。
 
 load 历史使用另一组显式投影。可见用户与助手文本使用新的 UUID message ID 映射为标准
 message chunk。有序图片 part 会变成现有的安全图片占位符，绝不会变成 raw data URI、图片
@@ -496,6 +592,11 @@ message chunk。有序图片 part 会变成现有的安全图片占位符，绝�
 reasoning、供应商保留上下文、任意参数、
 `_meta` 和 raw input/output 全部省略。发送第一条 update 前先校验完整回放，并限制持久项数、
 update 数、单字段和序列化总字节。
+
+历史投影与实时 `AgentEvent` allowlist 现在由 `neuro_code.interfaces.acp.updates` 实现。顶层
+ACP adapter 仍保留调用这些 projection 所需的 session-bound wiring、lifecycle、client capability
+和 MCP 职责；canonical transport 拥有 SDK connection 与 wire framing。本次提取是结构性变更，
+保留既有 ACP wire behavior；不增加 event kind，也不移动权限 authority。
 
 事件投影采用显式白名单：
 
@@ -738,15 +839,17 @@ profile 时，组合根创建不恢复任何会话的新供应商/运行时/会�
 上下文。详见 [ADR 0017](adr/0017-safe-interactive-profile-selection.md)。
 
 该控制器还持有一项进程内 `ReasoningEffort` 选择，并让强度切换与轮次串行。profile 或
-会话切换安装新对话绑定时，会把请求等级重新应用到新绑定。`low`、`medium`、`high` 与
-`xhigh` 对应应用层审查指引；在工作流编排实现前，`ultracode` 的明确实际值是 `xhigh`。
-TUI 通过 `Ctrl+E`、`/effort` 和 `/reasoning` 暴露选择，CLI 则使用 `--effort`。选择不会
-改写供应商配置，也不成为会话身份。
+会话切换安装新对话绑定时，会把请求等级重新应用到新绑定。`low`、`medium`、`high`、
+`xhigh` 与 `max` 对应应用层审查指引；`max` 仍然是普通单智能体的最深策略。显式选择
+`ultracode` 会进入应用层有界委派服务，由它持久化地准确选择 `MAIN_MAX` 或
+`BOUNDED_SWARM` 中的一条路径。普通主路径继续使用兼容供应商的 `max` 投影；不会向任何
+供应商发送编造的原生 `ultracode` 值。TUI 通过 `Ctrl+E`、`/effort` 和 `/reasoning` 暴露选择，
+CLI 则使用 `--effort`。选择不会改写供应商配置，也不成为会话身份。
 
 每次模型步骤开始时，`AgentRuntime` 会把所选指引加入仅用于本次请求的系统消息，并将
 有类型的请求值写入 `ModelContext`；该指引不会加入规范 `SessionItem` 历史。供应商
-适配器可以读取这个类型值，但当前适配器不会把它翻译成供应商私有推理参数。未来若增加
-原生映射，必须显式声明能力并提供相应测试。详见
+适配器可以读取这个类型值。显式的 Kimi K3 与 GLM 5.3/5.2 dialect 会为 `max` 发送配置的
+原生 `max` 字段；其他 dialect 会省略原生强度字段，但仍保留应用层指引。详见
 [ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md)。
 
 同一控制器还暴露限定工作区的 `SessionOption` 目录，并让会话选择与轮次串行。组合根
@@ -777,10 +880,14 @@ TUI 通过 `Ctrl+E`、`/effort` 和 `/reasoning` 暴露选择，CLI 则使用 `-
 
 权限策略与用户交互是两个独立边界。`PermissionManager` 先返回确定性判定；`ask` 随后
 可以进入可选的异步 `PermissionApprover` 端口。运行时产生请求/结果审计事件，并且在
-收到允许结果之前不能产生 `tool_started`。TUI 会话代理只在内存中记住“精确工具/参数
-组合”的哈希；后续每次调用仍重新经过策略判定，从而保持 deny 优先级。无头组合不提供
-审批器并继续失败关闭。详见
-[ADR 0015](adr/0015-async-interactive-tool-approval.md)。
+收到允许结果之前不能产生 `tool_started`。TUI 会话代理在内存中保存精确操作 hash，以及由
+运行时生成的有类型 `WORKSPACE_EDITS` 与保守 `COMMAND_FAMILY` grant。每个 grant 都绑定可信
+session identity 与工作区主规范根，后续每次调用仍重新经过策略判定。只有普通 interactive
+默认 `ASK` 可以生成宽范围候选；显式 deny/ask、mode 决定、headless 请求、高风险操作以及
+model/provider/planner/worker 输入都不能创建宽范围候选。等价排队请求会在首个决定后重新检查
+grant；仅允许一次、拒绝和取消不会替等待者授权。无头组合不提供审批器并继续失败关闭。详见
+[ADR 0015](adr/0015-async-interactive-tool-approval.md) 与
+[ADR 0142](adr/0142-scoped-session-permission-grants.md)。
 
 ## 稳定端口
 
@@ -879,6 +986,30 @@ CC Switch 是可选配置源和 HTTP 网关，不是应用依赖。其导出的�
 直连端点还是经过 CC Switch 网关，规则都相同。详见
 [ADR 0011](adr/0011-safe-pre-output-provider-failover.md)。
 
+Provider 传输和协议失败在进入 resilience 之前会经过类型化边界。
+`shared.errors` 中的 `ProviderFailure` 是不可变、有界且已脱敏的事实对象，包含 kind、
+安全 detail、可选状态码/`Retry-After`、Provider/模型身份、生命周期 phase 和证据来源
+（`provider`、`transport`、`local` 或 `unknown`），但不包含 retry、circuit 或 failover
+决策。五个模型 HTTP 适配器先使用保守的通用 HTTP fallback，再分类本协议拥有的精确
+结构化字段；通用 404 不断言为模型不存在，没有明确 rate code 的通用 429 不可重试，
+通用 413 归为 invalid request。timeout/network 是 transport 事实，损坏的 Provider 流是
+protocol 事实，非传输的意外 runtime 是 local 事实。`ConfigurationError` 保持独立，
+取消原样传播。
+
+`ProviderFailurePolicy` 独立拥有 retry、circuit 和 failover 决策。server、timeout 和
+network 是瞬态熔断输入；明确的限流可以重试或隔离候选项，但不标记 Provider 不健康；
+永久的请求、认证、授权、模型和上下文失败不会污染瞬态熔断。Provider/transport unknown
+不重试、不计入熔断，但可以在输出前故障转移；local unknown 停在当前候选项。invalid
+request 不故障转移，protocol 使用明确的保守策略。第一个模型事件之后同时禁止 retry 和
+failover。`consecutive_failures` 表示自上次成功或不计入熔断的失败后，连续的、输出前且
+有资格计入熔断的失败数。`ProviderHealth.last_failure_kind` 以及失败事件可选的
+`failure_kind`/`status_code` 字段提供稳定且有界的事实，同时保留兼容性的
+`last_error_type` 和原有事件字段。协议专属的 Anthropic `rate_limit_error` 和 Gemini
+Generate Content `RESOURCE_EXHAUSTED` envelope 是明确的 rate-limit 事实；Anthropic
+`billing_error` 仍是 authorization，未结构化或未来的通用 429 仍是 unknown。离线
+fixtures 只覆盖列出的官方 envelope，不宣称完整 Provider 兼容或 live 验证。详见
+[ADR 0126](adr/0126-provider-typed-failure-taxonomy.md)。
+
 每个 profile 还会在构造适配器时解析一个 `HttpClientPolicy`。环境模式把标准代理/证书
 环境变量交给 HTTPX；直连模式关闭 HTTPX 环境信任；显式模式从指定环境变量读取一个
 代理 URL。解析后的策略为所有供应商适配器提供相同的客户端选项和错误脱敏。代理 URL
@@ -925,7 +1056,9 @@ Runtime 与协议行为仍由 service 及其端口/适配器负责。
 - deny 规则优先于 allow 规则和绕过模式。
 - 无头执行把未解决的 `ask` 转换为拒绝。
 - 具有副作用的工具在等待审批、被拒绝或审批等待取消后都不能启动。会话批准只覆盖
-  完全相同的工具/参数摘要，仅保留在内存中，并从属于新的策略判定。
+  完全相同的工具/参数摘要；宽范围批准只覆盖同一 session、同一规范工作区中的可信有类型
+  候选。所有批准仅保留在内存中，并从属于新的策略判定；显式 deny 和显式 ask 永远不能被
+  绕过。
 - 助手消息中持久化的每个本地工具调用，在上下文再次使用之前必须恰好具有一个工具结果。
   取消会给当前调用以及同一模型批次中的所有剩余调用记录错误结果。
 - 写入前必须解析并校验目标；工作区工具不能通过 `..` 或符号链接逃逸。
@@ -1015,6 +1148,46 @@ Provider/窗口元数据、源条目计数、半开候选范围、不透明源�
 ID、工作区、模型和时间戳；ID 已存在时不做任何修改并返回失败。源会话文件永远不会
 以写入模式打开。恢复授权按文件系统身份比较已记录工作区与请求工作区，并以规范化路径
 作为回退，因此可以接受平台路径别名，同时仍拒绝不同工作区。
+
+## 持久化回合崩溃恢复
+
+每个持久化的 `AgentRuntime.run()` 都会分配唯一的不透明 `turn_id`，并在 Provider 请求或
+工具 body 可能开始前，先在 `session_turn_attempts` 写入小型记录。该行是规范恢复索引；
+有序 `events` 表继续作为追加式审计证据。恢复事实与对应事件一起写入，因此重启分类依赖
+sticky facts，而不是事件缺失。
+对计划执行而言，接受与任务归属属于同一个 SQLite 事务。新建的 `RUNNING` 计划任务与精确
+的 `attempt.task_id` 一起插入，或校验精确的 `QUEUED` 任务并使用相同身份转为 `RUNNING`。
+恢复投影不会从最新任务、输入指纹或事件推断归属；事务失败时，attempt 和任务激活都不会
+对外可见。
+
+write-ahead 边界是明确的：进入 Provider stream 前提交 `MODEL_REQUEST_STARTED`；第一个
+可观察的文本、推理、后端工具、工具调用或完成事件处理前提交 `MODEL_OUTPUT_STARTED`；
+工具 body 执行前提交 `TOOL_STARTED`，并记录工具是否可能产生副作用。Provider 请求体、
+请求头、凭据、完整上下文、工具参数和无界输出不会复制到该恢复索引。
+
+现有 `SessionStore.finalize_turn()` 和 `finalize_turn_with_compaction()` 事务是唯一的
+`COMMITTED` 点：完成事件、最终会话项、标题/搜索投影、可选 execution record、任务终态和
+attempt resolution 共享同一个 SQLite 事务。失败和取消使用对应的原子终态路径。普通的
+`FAILED` 或 `CANCELLED` attempt 属于执行历史，不是孤立的崩溃回合，因此不会进入恢复 UI。
+默认恢复 inspect 只展示未决/开放 attempt；已提交和明确放弃的历史通过独立的审计视图获取。
+
+派生状态为 `COMMITTED`、`SAFELY_RETRYABLE`、`INDETERMINATE` 和 `ABANDONED`。只有输入可重建
+且不超过 256 KiB 时才保存精确的用户归属输入；后台唤醒输入刻意不可重建。没有可观察输出、
+没有工具开始、有精确输入且没有事实冲突的非计划用户 attempt 可以被明确 retry。可观察输出、
+任意工具开始、可能的副作用、输入缺失、后台唤醒或矛盾事实都会得到 `INDETERMINATE`，且永不
+自动 replay。若没有观察到输出或工具副作用，计划 attempt 可以保持 `SAFELY_RETRYABLE`，但
+由于计划执行 retry 尚未支持，其 `retry_available` 为 false，只能明确 abandon。只有明确恢复
+操作可以写入 `ABANDONED`。重试会放弃旧 attempt 并创建新的回合身份，不会继续旧 attempt。
+
+CLI 和 TUI 暴露有界恢复元数据及明确的 `inspect`、`retry`、`abandon` 操作。对已关联的
+`RUNNING` 计划任务，abandon 会原子地将任务转为 `CANCELLED`，并先写入 `SESSION_TASK_CANCELLED`
+再写入 `TURN_ABANDONED`；没有任务的普通用户 attempt 保持原有路径。ACP 通过私有
+`neuro-code/session/recovery` 扩展复用同一个应用服务，并返回机器可读的有界投影。存在未决
+attempt 时，resume 会阻止新回合。本层不实现回合中途续接、工具补偿、后台子进程协调、计划
+执行重试或工作区回滚。尤其是 `EXECUTION_SEGMENT_CHECKPOINTED` 仍是进度/审计标记：崩溃
+恢复不是工作区回滚点。
+
+详见 [ADR 0127](adr/0127-durable-turn-crash-recovery.md)。
 
 规范序列由普通 `Message` 和不透明但经过校验的 `PreservedContextItem` 联合组成。
 消息内容项保留文本/图片顺序及图片 URL；推理和后端工具载荷保留供应商 JSON 与相对
@@ -1111,7 +1284,7 @@ network `STRONG` provider contract。W1/W2 foundation actual-capability constant
 isolation 而失败关闭。Gate 1–5 执行 7 个 native acceptance test 且 0 skip，证明
 final-child identity、文件系统/网络 enforcement、binary/protocol transport、normal wait、
 显式 termination、controller-loss cleanup 与 runner kill-on-close ownership。PTY/ConPTY 留给
-W4，现有 `off` 路径保持不变；已接受的 W5 workload matrix（run `32194952573`）已通过
+W4，现有 `off` 路径保持不变；已接受的 W5 workload matrix（run `32374860136`）已通过
 W3 与 W4 验证 Python/child Python、PowerShell、Git、Node/npm、curl、NUL 读写模式和动态
 BCrypt 启动；未来 developer tool 仍需各自的有界证据行。
 
@@ -1153,6 +1326,23 @@ ACP 命名空间再次解析每个已分配的 alias。不可用、无法解析�
 `resume` 请求和 ACP 客户端重连后继续使用同一个 alias。该切片不改变生命周期所有权、
 子代理执行、schema、ACP 标准 capability 或明确的单子会话只读边界。详见
 [ADR 0083](adr/0083-acp-subagent-alias-reconnect-compatibility.md)。
+
+## 子代理 capability 闭包
+
+所有生产 child-runtime 构造路径的 canonical parent authority 都是实际
+`ConversationBinding.capabilities` manifest。无头 CLI 会在启动显式 child 前打开 parent binding；TUI
+读取活动 binding；私有 ACP child 扩展要求活动 parent binding。缺少 metadata 时失败关闭。Scheduler 和
+显式服务共用由 composition 拥有的 global policy。
+
+显式只读工作流把 `READ_ONLY_SUBAGENT_TOOL_NAMES` 只当作 requested capability。它会在创建 child task 或
+binding 前通过 `SubagentCapabilitySet.resolve_child()` 解析
+`parent ∩ requested ∩ global_policy`，把同一个 manifest 传给 factory 和
+`ApplicationComposition.create_binding(capabilities=...)`，并校验 runtime fingerprint。这阻止受限 child
+恢复 root 工作区、工具、沙箱强度、MCP、terminal 或 network authority。旧版任意
+`SubagentExecutor` binding 只作为明确标记的测试/内部兼容接缝保留，普通 composition 边界会拒绝它。子代理
+关系的 `resume`、`fork` 和 `delete` 不会重新构造 Runtime；普通 ACP fork 是独立的 session binding。本闭包
+只证明 `child capability <= actual parent capability`，不等于完整证明 Permission、Workspace、Sandbox、MCP、
+Provider transport 或整个 Agent security system。详见 [ADR 0125](adr/0125-subagent-capability-closure.md)。
 
 ## Stage5DD 确定性上下文压缩评估
 
@@ -1415,3 +1605,534 @@ Runtime 门控现在会在允许的显式压缩操作外层真正执行有限的
 prompt-cache 字段，OpenAI Responses 保留 cached-input 详情，Anthropic 使用原生顶层 automatic ephemeral cache
 control，使缓存断点可随着仅追加的 Agent 会话前移，并保留 cache creation/read 用量，Gemini 保留其实际返回的
 implicit cached-content 用量。未上报字段保持 `None`；Runtime 不从总输入 token 推断缓存拆分，也不会声称命中了缓存。
+
+## 只读 Language Server Protocol 边界
+
+LSP 纵向切片是由 application 拥有的语义只读路径。稳定的 `lsp` tool 由
+`ToolRegistry` 注册，并通过普通 `ToolExecutor` 执行，因此输入路径使用与其他结构化只读工具相同的
+canonical `FilesystemAccessPlan` 和 permission decision。该 tool 不会被记入 mutation journal，
+跨文件结果投影也不会弹出 approval。
+
+`ApplicationComposition` 为每个 binding 创建一个 `LanguageServerManager`。Binding-owned
+resource scope 会立即关闭短生命周期 worker manager；application shutdown 关闭仍然存活的 manager。
+manager 按 canonical workspace root 加显式
+`LanguageServerProfile` 路由，不是 TUI singleton，也不拥有第二套 configuration system。profile command
+只能是 argv，并通过 `LocalProcessSandbox`、`LocalProcessPurpose.LSP_SERVER`、只读 workspace root、
+显式 environment 和有界 process lifecycle 启动。
+
+MCP stdio adapter 仍由 MCP 自己拥有并使用 newline framing。LSP 使用独立的 Content-Length JSON-RPC
+framer，以及自己的 request correlation、cancellation、server-request 安全回复、diagnostics cache、
+有界 stderr 与 close handshake。LSP 输出是不可信内容：只有位于 canonical workspace roots 内且安全的
+local file URI 才会投影；permission DENY/ASK，以及 invalid、workspace 外或 link-like 的 location 都会省略。
+
+当前实现的 operation 是 definition、references、hover、document symbols、workspace symbols、diagnostics、
+status 与有界 restart。Rename、format、code actions、`workspace/applyEdit` 和任意 server edit 仍不属于
+LSP slice。Worktree 与 checkpoint capability 是下面定义的 application-owned seam；LSP manager
+不会修改它们，ADR 0132 把只读 manager 组合进显式 managed-worktree worker binding。
+
+## 由应用拥有的受管 Git Worktree
+
+首个 worktree 能力是显式 application service，而不是面向模型的任意 Git tool。
+`ApplicationComposition` 可以构造一个由 `GitWorktreePort` 和独立、版本化
+`worktrees.db` ownership store 支持的 `WorktreeApplicationService`。该服务只在 workspace
+binding 阶段复用现有 canonical filesystem resolver；Git repository identity 是独立领域值，
+基于规范 common Git directory、source worktree、Git directory 和观察到的 HEAD。
+
+managed path 位于 state directory 下的 `worktrees/<repository-id>/<worktree-id>`，并且在 source
+checkout 之外。create request 必须明确 base revision，先解析为精确 commit，并预检适用的
+external checkout filter，再创建 detached 或 `neuro/worktree/<id>` branch worktree。源 checkout
+的 dirty 变更始终只留在源 checkout 中。
+worktree binding 不继承 additional workspace roots。
+
+本地 Git adapter 通过规范的 local process sandbox 端口提交 argv-safe request，并设置有界输出、
+超时和取消清理；它不直接创建子进程。每次调用都将 `core.hooksPath` 覆盖为 Neuro Code 拥有
+的空目录，并设置 `core.fsmonitor=false`。它还会针对精确目标 commit 让 Git 检查是否存在
+适用且配置了 `smudge` 或 `process` driver 的 checkout filter；存在时在 checkout 前拒绝。
+已有的 `ProcessTreeLocalProcessSandbox` 配合 `SandboxProfile.OFF` 只是 lifecycle bridge，
+不是 OS 强制的文件系统或网络隔离，因此该 capability 不会宣称这项保证。显式 remote operation
+仍不存在：不执行 fetch/pull/push/clone 或全仓库 prune。移除要求 durable managed ownership
+以及匹配的 repository/path/HEAD/branch identity，并使用不带 `--force` 的 `git worktree remove`；
+dirty 和 locked worktree 拒绝移除，managed branch 则保留。
+受管 worktree capability 要求 Git 2.40.0 或更高版本，因为 fail-closed filter preflight
+依赖 `git check-attr --source=<tree-ish>`；更低版本会在初始化时被拒绝。
+
+SQLite intent 与 Git metadata 不被当作一个事务。worktree schema 使用 insert-only ownership
+claim 和持久化 generation CAS：`WorktreeId` conflict 不能覆盖已有 row，canonical path 仍保持
+unique，后续每次 mutation 都要求 expected generation/state 并增加 generation。stale writer
+返回 `CONCURRENT_MODIFICATION`；reconciliation 会重新读取赢家而不覆盖它。进程退出后，durable
+`CREATING`/`REMOVING` 记录会与实际 Git record reconciliation。精确匹配可以变为 `READY`，remove
+intent 后实际记录缺失可以变为 `REMOVED`；path reuse、仓库缺失和 identity mismatch 会变为
+`ORPHANED`，且不执行文件系统删除。详见 [ADR 0129](adr/0129-managed-git-worktree-capability.md)。
+
+## 受管 Workspace Checkpoint 与 Rollback
+
+Workspace checkpoint 是独立的显式内部 capability，不复用 execution segment checkpoint 或
+`session_turn_attempts`。分段 event 是进展/审计标记；turn recovery 是 request/output/tool 耐久性；
+workspace checkpoint 是某个 READY managed worktree 拥有的 source projection。
+`WorkspaceCheckpointApplicationService` 只由 `ApplicationComposition.create_workspace_checkpoint_service()`
+构造，不是面向模型的 tool，也没有自动 policy。
+
+Capture 接收 `WorktreeHandle`，先证明 durable managed-worktree record，然后在独立的 `checkpoints.db`
+和 state-owned content-addressed artifact 中保存 exact per-worktree Git index，以及 tracked 与 non-ignored
+untracked regular file/symlink。它包含 staged/unstaged content、tracked deletion、binary bytes、mode 和
+安全的 symlink target；ignored file 不在范围内。Unmerged stage、intent-to-add、sparse/split index、
+submodule、nested repository、special file 和不安全 link-like parent 都失败关闭。确定性 SHA-256
+fingerprint 覆盖 identity、HEAD、index、mode、path 与范围内 content。
+
+Rollback 只作用于同一个 owned managed worktree 与 exact checkpoint HEAD。它在 mutation 前持久化独立的
+`RollbackAttempt`，获取唯一 Neuro Code Git worktree lock，通过 workspace adapter 枚举 exact
+checkpoint-after path，恢复 file 与 index，并验证最终 fingerprint。它不使用宽泛 `git clean`、stash、
+reset、checkout、branch-ref rewrite、history rewind 或任意 recursive deletion；ignored file 保持不变。
+Partial 或不确定 operation 持久化为 `INDETERMINATE`，可在进程退出后 reconciliation；READY checkpoint
+target 不可变并受 CAS 保护。详见 [ADR 0130](adr/0130-managed-workspace-checkpoint-rollback.md)。
+
+## 显式串行 Writable Subagent 工作区
+
+现有 `/subagent` capability 以及 CLI/TUI/ACP 的显式子代理入口仍然只读。Standalone
+writable-subagent service 是由 `ApplicationComposition.create_writable_subagent_service()`
+构造的独立内部纵向切片；它本身不是 public subagent surface，也不启动
+checkpoint/rollback orchestration。Standalone service 仍然串行运行；有界 Task DAG
+通过 typed factory 创建独立 worker，后续有界 `Ultracode -> Bounded Swarm` 组合也只通过既有
+Swarm、Leader 和 Task DAG factory 到达这些 worker。
+
+`WritableSubagentApplicationService` 一次只串行运行一个 child。它先记录 `ALLOCATING` lease，
+读取 parent 的 exact committed HEAD，在 parent workspace roots 之外创建 Neuro Code 拥有的 managed
+branch worktree，并捕获 `READY` baseline checkpoint。之后才派生 typed
+`ManagedChildWorkspaceGrant`；其 fingerprint 绑定 parent capability、repository identity、
+exact base SHA、不可变 `WorktreeHandle`、managed worktree ID/path、创建时间和 baseline checkpoint。
+Child 使用全新的 session 与 binding，cwd 和唯一 root 都恰好是该 worktree。
+
+Derived child 只有有界 read set（`read_file`、`read_files`、`list_dir`、`list_tree`、`glob`、
+`grep`、`grep_many`、`skill` 与可选只读 `lsp`）以及 `search_replace`、`apply_patch`。`lsp`
+只有位于真实 parent/global/worker policy 交集时才会出现。Child 没有 Bash、terminal、
+background、MCP、network、Git/worktree/checkpoint/rollback 或 subagent authority。Parent 和
+global policy 都必须证明 write tool、write authority 与 writable sandbox。通用
+`SubagentCapabilitySet.is_subset_of()` 保持不变；typed grant 是把 child 绑定到新 managed
+workspace 的窄边界。每一次 child write 仍执行正常的 Permission、canonical filesystem target、
+execution 与 sandbox pipeline。
+
+Durable lease 使用 `ALLOCATING`、`WORKTREE_READY`、`BASELINE_READY`、`ACTIVE`、`PRESERVED`、
+`ORPHANED`、`FAILED`，并具备不可变 identity、insert-only ownership 和 generation CAS。成功、
+Provider failure、取消或 final inspection 不确定时都会保留 worktree 与 baseline；没有自动移除、
+rollback、merge、commit、copy-back 或 cleanup。Crash 后的 reconciliation 验证 worktree 与 checkpoint
+证据，不删除不确定数据。Bounded result projection 只暴露生命周期/工作区 identity、脱敏 response、
+有界 outcome 与 fingerprint，不暴露 diff、transcript、raw arguments 或 file contents。组合根从真实
+活动的 `ConversationBinding` 捕获 parent authority，包括 runner session ID 与 capability fingerprint；
+不信任调用方报告的 parent manifest，request parent ID 与 binding 不一致时在分配前拒绝。Session
+store schema 16 会重建并保留 schema 15 lease row，两个 lease session foreign key 都使用
+`RESTRICT`；只要递归 session deletion closure 中任一 session 被 writable lease 引用，session
+删除就会拒绝。共享 owner liveness 在 POSIX 使用真实 probe，在 Windows 使用 process-handle wait，
+未能证明的 access/API failure 保守地视为 alive。完整契约见
+[ADR 0131](adr/0131-managed-writable-subagent-workspace.md)。
+
+### Worker-scoped 只读 LSP runtime
+
+Managed grant 从不可变 handle 派生 `WorktreeWorkspaceBinding`。除非 binding cwd、effective
+capability cwd、workspace-binding primary root、LSP manager root 与 canonical managed child
+root 全部相等且 additional root 为空，否则 Writable runtime composition 会拒绝。现有 per-binding
+instruction 与 skill tracker 因此也只从 managed child root 发现内容。
+
+每个 worker 继续使用现有 per-binding `LanguageServerManager`；manager、client、route、
+document/diagnostics cache、version 与 restart counter 不与 parent 或另一 worker 共享。Manager
+会在语义请求前重新读取 canonical child document，因此显式 `search_replace`/`apply_patch`
+写入之后，会用新的 child bytes 发送 `didOpen` 或带版本的 `didChange`。输入路径与 server 返回
+URI 仍通过 LSP canonical target 与 visibility boundary。
+
+`ConversationBindingResourceScope` 为 binding 提供一个幂等且 cancellation-safe 的异步 close
+task。Worker 成功、Provider 失败、取消或超时都会关闭 LSP client/process 并释放 cache；
+application shutdown 仍是未关闭 binding 的兜底。Worktree、checkpoint、lease 与 session evidence
+保持持久并保留；LSP process/cache state 是临时状态，不写入 SQLite，由未来 binding 重新构造。
+详见 [ADR 0132](adr/0132-worker-scoped-lsp-runtime-integration.md)。
+
+### 有界 Parent Context Relay
+
+Writable workflow 现在只从实际 parent `ConversationBinding` 所绑定 session 的 durable item
+派生一个 `ParentContextRelay`。它以确定性方式选择最近的真实纯文本 USER/ASSISTANT 内容，
+应用 composition-owned 的既有配置脱敏，并执行 10 项、每项 4 KiB、投影合计 24 KiB、
+完整渲染 32 KiB 的 UTF-8 边界。SYSTEM、TOOL role、synthetic、含 tool call、含 media、
+保留 reasoning 与保留 backend-call 的结构都会排除；assistant 可见正文可与
+`reasoning_content` 明确分离，后者绝不进入 Relay。
+
+Session schema 29 保留 schema 17 的每个 writable lease 一条一对一、insert-only READY Relay，
+以及下述持久化 Task DAG 表、schema 20 的 predecessor-result Relay 表和 schema 21 的 Task DAG
+recovery-claim fence；schema 22 增加有界 DAG capacity 与 scoped Writable lease policy，schema 23
+增加逐节点 execution-owner identity，schema 24 增加 parallel-aware Leader decision projection，
+schema 25 增加下文的 bounded model-planning attempt/proposal projection，schema 26 增加 bounded
+DAG replan attempt/proposal projection，schema 27 增加下文描述的 bounded Agent Swarm run projection，schema 28 增加下文描述的
+durable Ultracode delegation projection，schema 29 增加下文描述的 durable Result Adoption projection，
+并保留后文的持久化 Leader attempt/decision 投影。
+其 identity
+绑定 parent/task/child、lease、worktree、baseline checkpoint、base commit、
+capability/grant fingerprint 与 child-task digest。加载时校验 source、content 和完整记录
+fingerprint，不一致时 fail closed。投影和 durable 复验发生在 `SubagentLink` 之后、child
+runtime 创建之前，因此 Relay 发布前不会发生 child model request。发布失败会保留既有
+durable worker identity，而不是删除或 rollback。
+
+`ContextBuilder` 在每次模型请求中，于 project instructions/skills 之后、真实 child history
+之前精确注入一条不可变 `SyntheticReason.PARENT_RELAY` USER 消息。它不写入 child
+conversation history，并在模型、tool 与 LSP 多步骤间保持字节稳定。Relay 字符串只作为证据，
+不会被解析为 tool、root、sandbox、network、LSP、worktree 或 checkpoint 权限。既有 capability
+求交与 child-root instruction/skill discovery 仍是唯一权限 owner。Durable compaction summary
+复用、实时 context sharing 和无界并行 worker 仍未实现；bounded Swarm 与 Ultracode 入口编排
+在下文定义。
+有界 Task DAG、Leader 与 model-planning 切片由独立的 [ADR 0134](adr/0134-durable-serialized-task-dag.md)、
+[ADR 0135](adr/0135-bounded-serialized-leader-controller.md) 与 [ADR 0137]
+(adr/0137-parallel-aware-leader-bounded-wave-scheduling.md) 规定，model-generated planning
+详见 [ADR 0138](adr/0138-bounded-model-generated-dag-planning.md)，bounded DAG revision/replan
+详见 [ADR 0139](adr/0139-bounded-dag-revision-replan.md)；Relay 边界详见
+[ADR 0133](adr/0133-bounded-parent-context-relay.md)。
+
+### 有界持久化 Task DAG
+
+ADR 0134 增加了一个显式的内部编排边界：一个有界 DAG 的节点定义必须由调用方以 typed value
+提供。第一切片最多允许 8 个节点、16 条依赖边、每个节点最多 4 个依赖，并且只允许
+`WRITABLE_SUBAGENT` 节点。发布前会拒绝未知引用、重复边、自依赖和环。拓扑顺序与 ready 节点
+选择按声明 ordinal 和 node ID 确定；依赖边只控制执行，不会转发前置节点的 prompt、transcript、
+tool output 或 workspace 数据。
+
+DAG service 只从真实的 `ConversationBinding` 推导 parent session。每个节点复用既有
+`SessionTask` owner 和既有 `WritableSubagentApplicationService`。`max_parallel` 是不可变字段，
+默认 1，并受共享 application 上限 4 约束。worker 启动前，节点持久化生成的精确 parent task ID
+和 execution owner PID/token；单个 `BEGIN IMMEDIATE` 事务统计 durable `RUNNING` node rows、
+校验 capacity，并通过精确 generation CAS 将 `READY` 改为 `RUNNING`。ready slice 按 ordinal/node ID
+确定，使用结构化 `TaskGroup`，不会使用 `SubagentScheduler.run_many()` 或无界 gather。
+
+canonical active execution model 是 `state=RUNNING` 的 node rows 集合。旧的
+`task_dags.active_node_id` 只作为兼容 projection：只有恰好一个节点运行时才写入，不参与调度或
+capacity。逐节点 owner PID 存活时，reconciliation 会观察短暂的 evidence 分配窗口；只有 owner
+死亡后才进入逐节点 crash 分类。
+
+Parallel node 通过 typed `TaskDagWritableWorkerFactory` 获得全新的 Writable application service。
+这样既保留冻结的每 worker `asyncio.Lock`，也使每个节点拥有独立的 binding、lease、worktree、
+checkpoint、child session、Parent Relay 和 worker-scoped LSP state。
+
+当前 Session schema 29 在 `task_dags` 与 `task_dag_nodes` 中保存不可变 DAG 定义和有界节点运行投影，
+并在 `task_dag_dependency_relays` 中保存 insert-only 的 predecessor-result Relay，同时在独立的
+`task_dag_recovery_claims` 中保存跨进程 ownership fence。定义和 Relay 发布都是 insert-only；graph
+与 node 生命周期更新使用 generation CAS。成功节点记录精确的 worker task、child session、writable lease、
+worktree、baseline checkpoint、Parent Relay 和有界结果投影。缺失或不一致的成功关联不会被当作成功。
+
+三条编排 context channel 保持分离。Parent Context Relay 把有界 parent-session snapshot 带入一个
+child；DAG predecessor-result Relay 只把已完成的直接前置节点 projection 带入 dependent worker；
+Leader evidence envelope 把有界 DAG state 带入 zero-tool Leader。root node 不接收 predecessor
+Relay；dependent node 的 Relay 按其直接 edge 的声明顺序排列，在该 node 精确的 `RUNNING` generation
+claim 之后、child runtime 或 provider 执行之前发布。每个 entry 都绑定精确 predecessor generation、
+parent task、child session、保留中的 writable lease、worktree、baseline checkpoint 和 Parent Relay。
+Relay 限制为每个 predecessor 4 KiB UTF-8 result、合计 16 KiB source content、渲染消息 24 KiB。
+它只包含脱敏 result text 和 opaque fingerprint，不跨 edge 传递 transcript、reasoning、tool call、
+workspace bytes、capability grant、path 或 authority instruction。缺失、过期、被篡改、非 completed
+或 identity 不匹配的 evidence 会在 worker request 前失败关闭；相同 target generation 的精确重复
+发布是幂等的，不同发布会被拒绝。
+
+生命周期为 `PENDING -> READY -> RUNNING -> COMPLETED/FAILED/CANCELLED/INDETERMINATE`；因依赖被
+阻塞的后代进入 `SKIPPED`。失败或取消的依赖只阻塞其后代，独立分支继续执行。重启 reconciliation
+按精确 parent task 与 lease 查询：worker 已完成/失败/取消时映射为 DAG 相同的终态；证据缺失、
+orphan 或不确定时映射为 `INDETERMINATE`。Restart reconciliation 不启动 worker，并把 active node
+分类为 `ACTIVE_WORKER`、`SAFE_NOT_STARTED`、`RECOVERY_OWNED` 或 `INDETERMINATE`。`SAFE_NOT_STARTED` 要求精确 active
+`RUNNING` node 与 `parent_task_id`、按 DAG/target/generation 读取的同一 READY Relay、精确的
+definition/direct dependency/fingerprint，以及对应 `SessionTask`、writable lease 与 subagent link
+均不存在且没有 live recovery owner。后续 DAG step 先取得精确 durable claim，只有 winner 可以调用 Writable。
+`RECOVERY_OWNED` 是 live 或未被证明死亡的 claim owner 的只读分类，也覆盖 lease 已存在但 `SessionTask` 尚未
+出现的 partial window。Loser 不进行 provider/resource allocation，也不写 `FAILED` 或 `INDETERMINATE`。
+Writable 第一个 durable side-effecting allocation 是插入 lease；此前的 repository identity 检查是只读的。
+若 owner 在第一次 lease insert 前被证明死亡，可用 version CAS 在同一 generation、parent task 与 Relay identity
+上 takeover；lease ownership 开始后，既有 Writable reconciliation 保持 fail-closed，永不自动 rerun worker。
+Relay 缺失、identity 过期或其他不确定状态仍为 `INDETERMINATE`，永不自动 rerun。worker 已
+完成/失败/取消时映射为 DAG 相同的终态。不增加自动 retry、崩溃重跑、merge、copy-back、rollback、cleanup、
+dynamic 或无界 dataflow execution、UI、Swarm 或 Ultracode 行为；有界独立节点执行已实现，上文所述有界直接 predecessor-result
+Relay 是本切片唯一的 dataflow 行为，不传递 authority 或 workspace state；有界 Leader controller 由 ADR
+0135 单独规定。
+既有 Worktree、Checkpoint、Parent Relay 和 worker-scoped 只读 LSP 合约继续作为 authority owner。详见
+[ADR 0134](adr/0134-durable-serialized-task-dag.md)。
+
+### 有界串行 Leader controller（历史 compatibility path）
+
+ADR 0135 在一个已经发布的 Task DAG 之上增加一个显式 Leader controller。Leader 只拥有 decision
+authority：它 reconciliation 当前 DAG，构造有界、脱敏、确定性的 evidence envelope，让专用
+zero-tool model 生成一个 typed decision，然后调用既有 Task-DAG one-step seam。它不会直接创建或
+修改 graph definition、dependency、prompt、capability、root、worker、Worktree、Checkpoint、
+Relay、LSP process 或 child session。
+
+串行 compatibility path 接受 `SELECT_NODE`，其 node ID 必须属于当前精确 READY set；以及仅在 DAG
+terminal 时允许的 `FINALIZE`。model response 必须是 strict JSON；普通 prose、unknown action、额外
+字段、blocked/stale node ID 和 node text 中的指令都只是数据或失败关闭。evidence 只包含有界的
+node definition 与 durable outcome metadata，并对 preview 脱敏、带 fingerprint；不包含 raw
+transcript/reasoning/tool argument/output、Relay payload、workspace bytes、checkpoint bytes、Git
+diff、secret 或 arbitrary path。
+
+当前 Session Store schema 29 保留 schema 19 新增的 `leader_attempts` 与 `leader_decisions` 投影。Attempt 绑定精确 DAG
+generation、definition/evidence/objective fingerprint、Leader session、controller owner、turn
+identity 与 durable lifecycle。SQLite write transaction 和 CAS-like state transition 保证同一精确
+snapshot 只有一个 controller 拥有 model request。Controller 必须在 provider call 紧邻之前，使用
+精确 owner/session/turn 将 `CLAIMED` durable fence 为 `PROVIDER_FENCED`，且该 session 必须等于实际
+model binding 的 session。只有没有 output、decision 和旧 session 匹配 turn evidence 时，过期 claim
+才会 rebased 到新的 session/turn；lease 到期本身不证明进程死亡。因此存活的 stale controller 会
+在 fence 处失败，fence 之后的 restart 则失败关闭，不猜测 provider 是否已经执行。已提交的 model
+response 可在重启后解析复用；历史 session/turn provenance 保留，observable turn 后不自动 replay
+provider。存在未解决的 session turn 时保守转为 `INDETERMINATE`，需要显式 recovery。decision 已发布
+后，即使 controller 在 DAG claim 前崩溃，另一个 controller 也可以通过 DAG CAS 复用 decision，不会
+产生第二次 model request 或 worker allocation。
+
+历史 Leader loop 有界且串行：选择一个 ready node，等待既有 Writable Subagent/DAG 结果，然后构造下一份
+snapshot；one-step seam 内不会自动执行第二个 node。只有 DAG terminal 后才请求 final synthesis，且
+结果保留在专用 Leader session，不写入 parent transcript。model 生成 DAG 由下方独立 planning
+切片处理；本历史 Leader 切片不执行 planning。bounded failed-DAG revision/replan 由下方独立
+切片处理；retry、recursive replan、dynamic/无界 dataflow、merge、
+rollback、UI/ACP 暴露、Swarm、Ultracode 与自动委派仍不属于本切片。
+有界 parallel-aware Leader wave 由下方 [ADR 0137]
+(adr/0137-parallel-aware-leader-bounded-wave-scheduling.md) 实现。
+
+### Parallel-aware Leader / 有界 wave scheduling
+
+ADR 0137 在不改变 authority ownership 的前提下扩展 zero-tool Leader。Leader 可以为串行
+compatibility path 发布 typed `SELECT_NODE`，也可以为一个有界 wave 发布 typed `SELECT_NODES`；
+只有 terminal DAG 才能接收 `FINALIZE`。`SELECT_NODES` 必须非空、无重复、不超过不可变
+`max_parallel`，并按 canonical `(ordinal, node_id)` 顺序排列。Non-canonical、unknown、
+stale-generation、overflow 以及 running-node finalization decision 都 fail closed；model output
+不会被静默重排或 replay。
+
+Evidence envelope 包含 parent session、graph/definition identity、generation、不可变
+`max_parallel`、durable running ID、available capacity、canonical READY ID、node generation/
+dependency，以及确定性的 completed/failed/cancelled/skipped/indeterminate state bucket。它仍然
+有界、脱敏且只是 evidence。`RunTaskDagWaveRequest` 将 exact graph 与 selected node generation
+交给 Task DAG authority。SQLite 统计 durable RUNNING row，并执行 capacity check 与 graph/node
+CAS；wave seam 只 claim selected ID，创建独立 Writable service，并使用结构化 `TaskGroup`，不会
+填充未选择的 node。`max_parallel=1` 继续兼容 one-node path。
+
+Session schema 24 增加了 parent-session、selected-node 和 selected-generation decision projection，
+并迁移已填充的 schema-23 row；当前 schema 29 保留这些 projection。Crash 后只有每个 selected node 仍在记录的 READY generation，或
+已经 durable advanced 到 RUNNING/terminal 时，durable wave decision 才能复用；不会推断 provider
+replay 安全。Partial claim、controller race、failure、cancellation、skipped descendant 和
+indeterminate branch 保留既有 Task DAG recovery semantics。Leader 仍不拥有 Writable、Worktree、
+Checkpoint、Relay、LSP、capability 或 graph mutation authority。详见 [ADR 0137]
+(adr/0137-parallel-aware-leader-bounded-wave-scheduling.md)。
+
+### 有界 model-generated DAG planning
+
+ADR 0138 增加一个显式的内部 planning boundary：来自真实 parent `ConversationBinding` 的一个
+objective，经专用 zero-tool、由 Provider 驱动的 Planner 转换为一个不可变且有界的 Task DAG proposal。
+Planner 只拥有 proposal data，不能创建或 claim node，不能调用 Writable worker、创建 Worktree 或
+Checkpoint、运行 LSP/Bash、修改文件，也不能修改 capability、root、sandbox policy、provider、retry、
+merge 或 publication 后的 graph。TaskDagApplicationService 继续拥有 node、edge、dependency、acyclic、
+parallelism 和 immutable graph 的规范 validation/publication；已有 parallel-aware Leader 继续拥有
+READY wave 选择，Writable 继续拥有 worker authority。
+
+Planner binding 是专用的持久化 one-step session，没有 local 或 provider-hosted tool、filesystem、Bash、
+terminal、network、MCP、LSP、Worktree、Checkpoint、worker 或 background capability。输入由显式 objective
+和独立的 `PlanningContextEnvelope` 组成，后者只从真实 parent runner session 派生。只有有界、脱敏的真实
+USER 与可见 ASSISTANT 纯文本可以被选入；SYSTEM/TOOL message、synthetic item、reasoning、tool call/result、
+media、任意 workspace bytes 及其他带 authority 的结构都会排除。Envelope 保持 source order，具备 byte
+bound、确定性渲染与 fingerprint；它只是 evidence，不是 Parent Context Relay，因为此时还不存在 worker
+lease、Worktree、Checkpoint 或 child identity。
+
+Provider response 必须是严格 JSON，只允许 `nodes`、`max_parallel` 和有界 `reason`；每个 node 必须严格包含
+`id`、`prompt`、`depends_on`。Node declaration order 是 canonical，dependency ID 必须按同一 declaration
+order 排列，proposal fingerprint 来自 canonical sorted-key JSON，不会通过排序抹掉 graph 的语义差异。
+Parser 保留冻结的 Task DAG limits：最多 8 个 node、16 条 edge、每 node 4 个 dependency、8 KiB prompt，
+以及 1 到 4 的 `max_parallel`。unknown dependency、self-dependency、cycle、duplicate ID、edge overflow
+和其他 graph 规则仍由规范 Task DAG service 拒绝。Model text 只是 data，不包含 authority field。
+
+Schema 25 新增 insert-only 的 `orchestration_planning_attempts` 与 `orchestration_plan_proposals`；当前
+schema 29 保留这些 projection。
+Planning attempt 绑定调用方精确 planning ID、真实 parent session、objective/context fingerprint、专用
+planner session/turn、预分配 intended DAG ID、provider lifecycle、proposal fingerprint 和已发布 DAG identity。
+生命周期为 `CLAIMED -> PROVIDER_FENCED -> MODEL_COMMITTED -> PROPOSAL_PUBLISHED -> DAG_PUBLISHED ->
+COMPLETED`，并有 typed stale/indeterminate terminal classification。精确 owner/CAS 检查 fence 并发
+controller；live 或未证明死亡的 owner 不会被抢占。Proposal record 不可变，精确重复可幂等；冲突记录或
+被篡改的 canonical JSON fail closed。
+
+每次 fresh `ApplicationComposition.create_model_planning_service()` 都会新建并持久化 Planner session。
+Service 的 `planning_session_id` 标识当前 recovery controller，而 attempt 上的历史 Planner session/turn
+保持为不可变 provenance；因此在 L2 下 recovery 不会改写原 controller 记录的 L1/T1 identity。
+
+Provider replay 规则沿用既有 durable turn contract：一旦 Provider turn 可观察，就绝不自动 replay。新进程
+复用已提交的 model output，再复用精确 proposal 和预分配 DAG identity；不会改变 node、prompt、dependency
+或 `max_parallel`，insert-only Task DAG publication 也不会生成第二个 graph。Fresh composition crash
+acceptance 使用 spawned process，覆盖 output committed、proposal published、DAG inserted 和
+provider-turn-evidence boundary，并在 L2 recovery 下保留 L1/T1 provenance。独立 controller race 还验证
+losing process 不会改写 winner 的 provenance。可观察到的 invalid JSON 会记录为 stale，不会再次发送给 Provider。
+Bounded failed-DAG revision/replan 由下方独立的 [ADR 0139](adr/0139-bounded-dag-revision-replan.md) 实现。
+Retry、node resurrection、recursive planning、自动委派、dynamic/无界 dataflow、merge/copy-back、
+rollback、cleanup、public CLI/TUI/ACP orchestration、Swarm、Ultracode 和 distributed scheduling
+仍不属于本切片。详见 [ADR 0138](adr/0138-bounded-model-generated-dag-planning.md)。
+
+### 有界 DAG revision / replan
+
+ADR 0139 在已发布 Task DAG 到达 quiescent `FAILED` state 后增加一个显式 revision boundary。
+Request 指定一个 source DAG 与一个 revision identity。Source 必须没有 `RUNNING` 或未解决的
+`INDETERMINATE` node，且所有 node 都是 terminal。Successful、cancelled、active、foreign-parent、
+missing 或 tampered source 会被拒绝。Source definition 与 runtime projection 保持不可变；replan
+通过既有 `TaskDagApplicationService` 创建一个 distinct successor DAG。
+
+Replan depth 由 `MAX_DAG_REPLAN_DEPTH=1` 限制，因此本切片只支持一个显式 successor。它不是
+automatic retry、recursive planning、node resurrection 或 publication-time mutation。已完成的 source
+work 只作为 evidence；successor 拥有新的 pending/ready node definition，不复用 source lease、session、
+worktree、checkpoint、relay 或 worker runtime identity。
+
+Replan model 接收确定性、脱敏、不可变的 evidence envelope，只包含 source identity、canonical node
+state/dependency projection、有界 completed-result projection、typed failure summary 与安全的有界
+metadata。它排除 transcript、tool argument/result、log、environment、secret、workspace bytes、checkpoint、
+diff、arbitrary path 与 authority instruction。UTF-8 边界为每个 completed result 4 KiB、completed-result
+evidence 合计 16 KiB、failure/state evidence 8 KiB、rendered 32 KiB；fingerprint 之前先脱敏。
+
+`ApplicationComposition.create_task_dag_replan_service()` 创建一个 fresh、持久化、one-step zero-tool
+binding。它没有 local/provider-hosted tool、filesystem、Bash、terminal、network、MCP、LSP、Worktree、
+Checkpoint、worker 或 background authority。Model 只返回既有 typed `ModelDagProposal`；revision、source、
+successor、depth 与 authority field 由 application 拥有。Schema 26 以 insert-only 方式保存
+`orchestration_dag_replan_attempts` 与 `orchestration_dag_replan_proposals`，并保留精确
+source/evidence/proposal/successor identity 及 `FOREIGN KEY ... ON DELETE RESTRICT`。
+
+Lifecycle 为 `CLAIMED -> PROVIDER_FENCED -> MODEL_COMMITTED -> PROPOSAL_PUBLISHED ->
+SUCCESSOR_DAG_PUBLISHED -> COMPLETED`，并有 typed `STALE` 与 `INDETERMINATE` terminal classification。
+在 provider invocation 前和 successor publication 前都会重复进行 source snapshot fence。一个 canonical
+source/revision identity 至多有一次 provider call、一个 proposal 和一个 successor；重复 recovery 幂等，
+不同 evidence 或 publication 被拒绝，不使用 blind upsert。
+
+Fresh composition recovery 复用 committed output、durable proposal 与已经插入的 exact successor，不 replay
+Provider。Generic provider-turn evidence 在 model commit 前可观察时，转为 explicit recovery-required
+`INDETERMINATE`，系统不会伪造 successor。独立 spawned controller 通过 durable owner/CAS 只有一个 winner，
+loser 不调用 Provider，也不修改 provenance。本切片由 fixture-provider focused tests、真实
+`ApplicationComposition` process-death tests、two-process race，以及进入既有 parallel-aware Leader 和
+Writable authority 的端到端测试覆盖；不提供 public CLI/TUI/ACP orchestration API。
+
+### 有界 Agent Swarm / 持久化编排运行
+
+ADR 0140 在既有 Planner、parallel-aware Leader、Task DAG、Writable Subagent、Parent Context Relay、
+predecessor-result Relay、Worktree、Checkpoint、worker-scoped LSP 和 bounded Replan service 之上增加一个
+内部的有界组合层。Swarm 只拥有一个绑定 parent 的 orchestration identity、durable lifecycle 与精确 DAG
+lineage。`ApplicationComposition` 通过既有 factory 创建下层 service；Swarm 不直接创建 tool、session、
+worker、worktree、checkpoint、LSP manager 或 relay record。
+
+Durable lifecycle 为 `CLAIMED -> PLANNING -> PLANNED -> EXECUTING`，符合条件的 failed source DAG 进入
+`REPLANNING`，随后可进入 `FINALIZING`，终态为 `COMPLETED`、`FAILED` 或 `INDETERMINATE`。正常路径使用一次
+model-generated A/B,C/D DAG、真实 bounded Leader wave 让 B/C 重叠、拥有独立 managed resource 的 Writable
+worker、durable predecessor-result fan-in、B/C 完成后执行 D，以及 Leader finalization。原始 graph definition
+和每个 successor identity 都保持不可变。
+
+只有当 source DAG 为 `FAILED`、quiescent、所有 node terminal 且没有 `INDETERMINATE` node 时才允许 Replan。
+既有 Replan service 在 `MAX_DAG_REPLAN_DEPTH=1` 下创建一个精确的 immutable successor；Swarm 在恢复执行前验证
+source、evidence、proposal、revision、parent 与 successor lineage。它不会重试 worker 或 Provider、复活 source
+node、对 uncertain/cancelled DAG 重规划，也不会创建第二个 successor。
+
+Schema 27 增加 insert-once、受 foreign key 保护的 `orchestration_swarm_runs` projection。`BEGIN IMMEDIATE`、
+process-liveness ownership、generation CAS 与不可变 identity field 保证一个 controller 获得所有权。Loser 或
+仍存活的 stale controller 不执行 Provider call、DAG publication、worker allocation 或 result mutation。
+可观察的 provider-turn uncertainty 与 cancellation fail closed 为 `INDETERMINATE`；fresh controller 只复用
+durable terminal result 或下层既有 recovery contract，不推断 replay 安全。Swarm projection 和所有 Relay 都保持
+有界且脱敏：raw transcript、hidden reasoning、Provider request、tool argument、environment、credential、
+checkpoint blob 和 workspace content 不会跨越此边界。
+
+代表性的 `multiprocessing`-spawn recovery matrix 证明四个明确的 process boundary：Swarm 进入 `PLANNED` 前
+Planner state 已完成、`FINALIZING` 前 lower Leader/DAG result 已终态、Swarm 切换 current DAG 前 Replan successor
+已持久化且 failed source 保持不可变，以及 `COMPLETED` 前 `FINALIZING` result 已持久化。每个 L1 process 都通过
+`os._exit` 退出；fresh composition L2 校验精确 durable identity、Provider/resource count 与 no replay。该 matrix
+是有意保持代表性的证明，不声称覆盖任意 kill timing 或 live-provider。组合层 lower-layer `INDETERMINATE` result
+会成为终态，且不会进入 Replan。
+
+这是一个仅内部的 vertical slice，不增加 recursive Swarm、无界 agent 或 queue、generic retry、automatic
+Ultracode delegation、共享 writable worktree、merge/copy-back/cherry-pick/patch adoption、public CLI/TUI/ACP
+orchestration、remote execution、marketplace integration，也不重新实现 Checkpoint/Rollback。详见 [ADR
+0140](adr/0140-bounded-agent-swarm-durable-orchestration-run.md)。
+
+### Automatic Ultracode delegation / durable branch entry
+
+ADR 0141 增加第一版由应用拥有的 Ultracode 入口。`max` 仍然是普通单智能体最深的
+reasoning/review 策略；只有显式的 `ReasoningEffort.ULTRACODE` 用户回合会进入该服务，
+`low`、`medium`、`high`、`xhigh` 与 `max` 继续使用普通 ConversationRunner 路径。
+
+该入口使用有界、确定性的本地策略，不增加第二次 model classifier 调用。本切片中的策略是针对
+并行/拆分、跨文件和研究措辞的固定 marker heuristic；它不是语义任务分类，也不具备 model-level
+routing intelligence。它只做一个 typed 选择：`MAIN_MAX` 或 `BOUNDED_SWARM`。它不能选择 tool、
+worker 数量、DAG definition、sandbox、workspace root、network、MCP、retry、merge 或 provider
+credential。`MAIN_MAX` 调用现有 parent `ConversationRunner` 并保留普通单智能体的 `max` 语义；
+`BOUNDED_SWARM` 通过 `ApplicationComposition.create_agent_swarm_service()` 调用既有 Swarm，并使用
+一个由 durable identity 推导的 `swarm_run_id`，不会增加第二个 Planner、Leader、DAG、Writable
+worker 或 Swarm。
+
+交互式 TUI 组合只在启动时把这个 application entry 绑定为 dormant delegate。`SessionTurnService`
+在每个用户回合读取 controller 当前 effort，因此同一个长生命周期 service 可以在
+`max` → `ultracode` → `max` → `ultracode` 之间切换而无需重建；普通 effort 永远不会调用 delegate。
+
+Session schema 28 增加 insert-once 的 `orchestration_ultracode_executions` projection；当前 schema 29 保留该 projection。不可变
+identity 绑定实际 parent session、精确 parent turn、input/context fingerprint、provider/model/context
+provenance、一个 decision 与一个下游 identity。`BEGIN IMMEDIATE`、process-liveness ownership
+和 generation CAS 保护 `DECIDED -> MAIN_MAX_RUNNING` 或 `DECIDED -> BOUNDED_SWARM_RUNNING`
+选择；随后只允许 `FINALIZING`、`COMPLETED` 或 `INDETERMINATE`。失败、取消、fence 丢失或
+可观察但不确定的 branch 永远不会切换到另一条 branch。
+
+两个 branch 都通过既有 conversation finalization contract 发布一个 parent 可见的 assistant
+result。只用精确的 `(session_id, turn_id, ultracode_execution_id)` evidence 匹配已提交 output。
+原始 A–E matrix 直接测试 durable lifecycle seam，本身不等同于完整 composition proof。另有两个
+`multiprocessing`-spawn acceptance 使用全新的 `ApplicationComposition`：MAIN_MAX 在精确 parent
+`TURN_COMPLETED` result 已持久化但 Ultracode 终态 transition 前退出；BOUNDED_SWARM 在既有 Swarm
+已经 `COMPLETED` 但 parent external-turn commit 前退出。恢复复用精确 durable result 与 identity，
+不会再次调用 Provider、Planner、Leader、Worker 或执行第二个 Swarm，resource count 也保持不变。
+parent attempt 仍开放时，只有同一个精确 `swarm_run_id` 已经存在且可以由既有 Swarm 恢复，才允许
+继续；否则 fail closed。不存在 latest-row lookup、timestamp correlation、text matching、silent
+fallback 或重复 assistant append。
+
+Parent `ConversationBinding` 继续是 capability ceiling。入口不增加 filesystem、Bash、LSP、MCP、
+network、Worktree、Checkpoint 或 Writable authority；provider adapter 也永远不会收到编造的
+原生 `ultracode` 值。CLI 与 TUI 可以进入这个内部服务，第一切片只显示有界 orchestration
+progress 和最终回答，不增加 ACP effort surface。Recursive Ultracode、普通 effort 的自动 Swarm、
+generic retry、merge/copy-back、checkpoint rollback、remote/cloud execution 和 public Swarm
+dashboard 仍不在 Ultracode slice 范围内。Bounded Result Adoption core 在下文单独规定，只有
+[ADR 0144](adr/0144-automatic-ultracode-result-adoption-integration.md) 定义的 stacked integration
+会把它接入 Ultracode。详见 [ADR 0141](adr/0141-automatic-ultracode-delegation.md)。
+
+### Bounded durable result adoption core
+
+ADR 0143 增加一个显式的内部 application service，把 preserved writable worker result 的有界集合采纳到实际 parent
+checkout。Worker result 只是关于自身 managed Worktree 的证据，不是修改 parent 的权限。Service 只接收 adoption
+identity 与 completed Swarm identity，然后从实际活动 parent `ConversationBinding`、completed Task DAG、preserved
+Writable lease、managed READY Worktree、READY baseline Checkpoint 与 live worker projection 生成由 application
+拥有的不可变 `ResultAdoptionPlan`。Response text、Leader 或 Relay text、`git diff`、model 提供的 path 与调用方报告的
+parent manifest 永远不是 authority source。
+
+每个 eligible source 都绑定精确 parent session/task、child session、lease、Worktree、baseline Checkpoint、base
+commit、final workspace fingerprint、capability fingerprint、grant fingerprint 与 repository identity。生成 Plan 前，
+canonical live preserved-worker fingerprint 必须同时等于 completed DAG node 与 preserved lease；parent binding 的实际
+repository 与当前 committed HEAD 必须匹配每个 source base commit，parent 无关 dirty path 保持在 target set 之外。
+
+Plan 使用保守的 three-way classification：baseline 不存在且 desired 存在为 `CREATE`；baseline 与 desired 都存在且
+不同为 `UPDATE`；baseline 存在且 desired 不存在为 `DELETE`。Parent 必须按规则不存在或精确等于 baseline。同路径 parent
+变化会在 `APPLYING` 前持久化为 `CONFLICT`；eligible worker 之间的 path overlap 会在 Plan 发布前拒绝。Symlink、
+link-like traversal、special file、仅 mode 变化、Neuro 受保护状态、credential/key path、checkpoint/worktree storage
+与 root 外 target 都 fail closed。第一版上限为 8 个 source worker、64 个 target file、target image 总计 32 MiB、
+单个 file image 8 MiB 与 relative path 4 KiB。
+
+Session schema 29 增加 insert-only 的 `result_adoptions` 与逐 target 的 `result_adoption_targets` projection。Durable
+lifecycle 为 `CLAIMED -> VERIFIED -> APPLYING -> VERIFYING -> COMPLETED`，终态包括 `CONFLICT`、`FAILED` 与
+`INDETERMINATE`。每个 target 记录 `NOT_STARTED`、`APPLYING`、`RETRYABLE`、`APPLIED`、`CONFLICT`、`FAILED` 或
+`INDETERMINATE`。在任何可观察 target mutation 前，expected pre-image、desired image、operation、path 与 fingerprint
+已经 durable。恢复只有在实际 image 仍为 expected 时才 retry；desired 已存在时只标记 `APPLIED` 而不重写；第三种 image
+绝不覆盖。多文件 filesystem mutation 不是 atomic operation；partial application forward recovery，尝试产生 effect
+后遇到外部修改则成为 `INDETERMINATE`，不 rollback。
+
+Parent write 使用活动 binding 捕获的 mutation port，并保留 canonical filesystem target、Permission/scoped approval、
+workspace/instruction、sandbox/profile 与 exact regular-file execution 层。`CREATE` 与 `UPDATE` 只有在 ordinary canonical
+rules 生成候选时才可使用既有 `WORKSPACE_EDITS` candidate；`DELETE` 绝不继承这个 broad candidate。Explicit deny、foreign
+session/root、model 或 worker text 与 memory-only grant 都不能授权 adoption。Completed adoption 在 fresh invocation 中幂等且
+零写入。Worker Worktree、lease、READY Checkpoint、DAG row 与 Swarm resource 保持 preserved。本核心不增加 model
+merge/conflict resolution、cleanup、rollback、commit/push、remote execution、TUI/ACP entrypoint 或通用 merge/copy-back
+engine。Automatic Ultracode wiring 只由独立的 [ADR 0144](adr/0144-automatic-ultracode-result-adoption-integration.md)
+composition slice 提供。详见 [ADR 0143](adr/0143-bounded-durable-result-adoption.md)。
+
+Production-shaped acceptance 覆盖真实临时 Git 的 A/B/C/D process boundary：durable Plan 在 controller death 后保留且不重复写入；尝试写入后
+死亡时从 desired image 确认 `APPLIED`；durable `APPLYING` 后出现第三方 image 时变为 `INDETERMINATE`，保留原 bytes 且零 retry write；已完成的
+adoption 由 fresh composition 重入时返回相同 durable result，且不产生新的 filesystem、Plan、target、worker、Worktree、Checkpoint 或 approval
+副作用。Schema 28→29 migration 与重复 schema-29 initialization 会保留旧 rows 与 adoption projection。
+
+### Automatic Ultracode 结果采纳集成
+
+[ADR 0144](adr/0144-automatic-ultracode-result-adoption-integration.md) 增加显式 `ULTRACODE` entry 与内部 Result Adoption
+core 之间唯一的有界 composition seam。`MAIN_MAX` 保持普通单智能体语义，并执行零次 adoption activity。`BOUNDED_SWARM`
+必须先产生精确的 canonical terminal `AgentSwarmResult`，再把这个 typed result 与实际 parent `ConversationBinding` 传给
+Result Adoption。只有 adoption 达到 `COMPLETED` 后才提交 parent external turn；只有 parent commit 成功后 Ultracode 才达到
+`COMPLETED`。
+
+Adoption identity 从精确的 Ultracode execution 与 Swarm run identity 确定性推导。`CONFLICT`、`FAILED` 与
+`INDETERMINATE` 保持为 parent 可见的有界结果；不存在 `MAIN_MAX` fallback、provider/Swarm replay、model merge、overwrite
+或静默 success。Fresh-process A/B/C/D recovery 复用精确 durable identity，保留 worker resource，并避免重放已完成的 lower
+work。集成复用既有 permission、workspace、sandbox 与 `ULTRACODE_DELEGATION_PROGRESS` contract，不暴露 raw patch、
+workspace bytes、secret，也不增加新的 model tool。

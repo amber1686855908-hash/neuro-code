@@ -67,6 +67,13 @@ the official Python SDK's newline-delimited stdio transport:
 uv run neuro-code acp --cwd /absolute/workspace
 ```
 
+The same ACP router can be served over a bounded WebSocket newline-JSON
+bridge:
+
+```bash
+uv run neuro-code acp --transport websocket --host 127.0.0.1 --port 8765 --cwd /absolute/workspace
+```
+
 The slice implements `initialize`, `session/new`, `session/list`,
 `session/load`, `session/delete`, `session/fork`, `session/resume`,
 `session/prompt`, `session/cancel` (notification), and `session/close`, sends
@@ -76,11 +83,16 @@ list/delete/fork/resume/close session capabilities. Text, inline Image,
 ResourceLink, and embedded text-resource prompt blocks preserve their order
 and are bounded. An Image block accepts raw base64 only for a small raster MIME
 allowlist, with at most eight 5 MiB images and 10 MiB in total; its associated
-URI is never read or dereferenced. An embedded `TextResourceContents` block
-accepts only client-provided text, at most eight 64 KiB resources and 128 KiB
-in aggregate; its URI is an origin label and is never resolved. ResourceLink
-metadata is allowlisted, `_meta` is not sent to the model, and links are never
-downloaded or dereferenced during prompt conversion.
+URI is never read or dereferenced. Audio blocks accept validated `audio/*` MIME
+types and bounded base64, and embedded `BlobResourceContents` accepts validated
+base64 with a bounded decoded size. Text, audio, and binary content remain
+ordered in the durable model context; non-image media is projected to a safe
+placeholder for providers that do not natively support it. An embedded
+`TextResourceContents` block accepts only client-provided text, at most eight
+64 KiB resources and 128 KiB in aggregate; its URI is an origin label and is
+never resolved. ResourceLink metadata is allowlisted, `_meta` is not sent to
+the model, and links are never downloaded or dereferenced during prompt
+conversion.
 
 Each connection remains bound to its launch workspace. `session/new` rejects a
 different or relative `cwd`; an `off`-profile binding may additionally declare
@@ -108,7 +120,11 @@ official MCP Python SDK owns schemas, `ClientSession`, negotiation, and
 JSON-RPC dispatch. Stdio uses Neuro Code's bounded `ProcessTree` bridge, while
 remote transports use the SDK's Streamable HTTP or legacy SSE clients with
 HTTPS/HTTP URL and header validation, no environment proxy inheritance, no
-redirect following, and bounded response bodies. Only MCP tools are projected.
+redirect following, and bounded response bodies. Tools, resource metadata,
+resource templates, and prompts are projected through a bounded private MCP
+session extension; that extension also supports refresh and bounded resource/
+prompt reads. MCP sampling and elicitation callbacks are forwarded to the ACP
+client through bounded private callback methods when the client supports them.
 Every invocation is treated as side-effecting and requires ACP client approval
 even under local bypass mode; explicit local deny still wins. `_meta` is
 ignored and configured environment/header values are redacted. Cancelling a
@@ -127,10 +143,11 @@ not receive configured Neuro Code environment values. It also exposes the bounde
 background lifecycle (`terminal_start`, `terminal_output`, `terminal_wait`, and `terminal_kill`)
 with opaque task IDs; terminal input, resize, and PTY framing remain unavailable. This is still
 explicitly not complete ACP v1
-support: ACP MCP transport, MCP resources/prompts/sampling/elicitation, audio
-prompt content, embedded binary-resource prompt content, binary multimedia
-history replay, client interactive terminal input/resize/PTY methods, WebSocket
-transport, and custom extensions remain unsupported and are not advertised. See the
+support: ACP-transport MCP server declarations, binary multimedia history replay, client
+interactive terminal input/resize/PTY methods, and arbitrary custom
+extensions remain unsupported. The bounded private artifact, subagent,
+lifecycle, MCP, and compaction extensions are intentionally outside the
+standard ACP capability advertisement. See the
 [compatibility matrix](compatibility-matrix.md) and
 [ADR 0035](adr/0035-partial-acp-v1-stdio.md) plus
 [ADR 0036](adr/0036-durable-acp-session-load.md) and
@@ -237,10 +254,10 @@ configured, the bar shows the known token use without inventing a percentage.
 Managed provider details expose this local capability field so every configured
 model can supply its own real denominator. When a requested effort has a different
 implemented policy, the status projection shows both values, for example
-`ultracode → xhigh`. Its text updates with the selected UI language.
+`ultracode → max`. Its text updates with the selected UI language.
 
 Typing `/` shows command syntax and parameter hints. The suggestions include
-the five effort values, four modes, and currently selectable provider profile names; free
+the six effort values, four modes, and currently selectable provider profile names; free
 text commands display placeholders such as `SESSION_ID`, `QUERY`, and `TITLE`.
 `Tab` applies the first valid completion while ordinary prompt text and modal
 focus traversal retain their normal behavior.
@@ -280,7 +297,7 @@ redirect its stored key to another endpoint. The storage port is replaceable
 by a future OS-keychain adapter; the current credential file is not encrypted
 at rest.
 
-Use `Ctrl+E`, bare `/effort`, or bare `/reasoning` to open the five-level effort
+Use `Ctrl+E`, bare `/effort`, or bare `/reasoning` to open the six-level effort
 picker. `/effort LEVEL` and `/reasoning LEVEL` select directly, and `--effort
 LEVEL` selects a level for an interactive launch or headless run. A TUI change
 is saved as a user preference and is reapplied after a later launch, profile
@@ -295,16 +312,25 @@ turn is active and applies from the next model step.
 | `medium` | ◐ | Routine inspection, self-review, and focused verification |
 | `high` | ● | Deeper investigation and proactive regression checks; the default |
 | `xhigh` | ⬤ | Difficult edge cases, challenged assumptions, and multiple validation passes |
-| `ultracode` | ⚡ | Currently uses the `xhigh` policy; workflow orchestration is not implemented |
+| `max` | ◆ | Maximum ordinary single-agent depth with broad but bounded verification |
+| `ultracode` | ⚡ | Application-owned bounded delegation to exactly one `MAIN_MAX` or `BOUNDED_SWARM` path |
 
-These levels are currently Neuro Code review policies, not claims about a
-provider's private reasoning controls. For every model request, the runtime
-adds non-persistent policy guidance and carries the typed requested value in
-`ModelContext`. Provider adapters do not blindly translate it into proprietary
-API parameters; any future native mapping must be explicit and
-capability-gated. Selecting `ultracode` does not start sub-agents and explicitly
-reports its `xhigh` fallback. See
-[ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md).
+These levels are Neuro Code application policies, not claims about a
+provider's private reasoning controls. `max` remains the deepest ordinary
+single-agent policy. An explicit `ultracode` turn enters the application-owned
+bounded delegation service, whose current decision policy is a fixed marker
+heuristic for parallel/decomposition, cross-file, and research wording—not a
+semantic or model classifier—and durably chooses exactly one `MAIN_MAX` or
+`BOUNDED_SWARM` branch. `MAIN_MAX` uses the existing normal Agent runtime and
+`BOUNDED_SWARM` uses the existing bounded Swarm composition. The interactive
+TUI binds this entry once as a dormant delegate and checks the current effort
+on every user turn, so `max` ↔ `ultracode` can switch without recreating the
+turn service; ordinary efforts never delegate. Provider adapters never receive
+an invented native `ultracode` value: the ordinary main branch uses the
+existing provider-compatible `max` projection or omission. The delegation
+decision, downstream identity, and parent-visible result are recovery-safe
+and are not automatically switched or replayed. See [ADR 0027](adr/0027-semantic-tui-and-application-reasoning-effort.md)
+and [ADR 0141](adr/0141-automatic-ultracode-delegation.md).
 
 Ordinary Agent execution uses the `normal` budget profile by default (48 model
 calls, 48 tool rounds, and 192 tool calls). `--execution-profile deep` selects
@@ -841,6 +867,32 @@ policy, substitutions, redirections, multiline scripts, and other constructs
 that cannot yet be decomposed safely are denied in headless mode. Commands run
 with null stdin, bounded output, disabled pagers/prompts, and process-tree
 cleanup on timeout or cancellation.
+
+## Read-only LSP semantic navigation
+
+Neuro Code exposes a stable `lsp` read-only tool for definition, references,
+hover, document symbols, workspace symbols, diagnostics, server status, and a
+bounded explicit restart. Configure a server explicitly in the existing user
+or project TOML file:
+
+```toml
+[lsp.servers.python]
+language = "python"
+command = ["pyright-langserver", "--stdio"]
+extensions = [".py"]
+root_markers = ["pyproject.toml"]
+```
+
+The command is argv-only. Neuro Code does not download or install a language
+server, and an unavailable executable fails closed at execution time. The
+server runs through the canonical local-process boundary, receives a read-only
+workspace, and cannot apply workspace edits. LSP locations are filtered to
+safe local workspace files and existing permission rules; unsafe or unresolved
+cross-file results are omitted. Use `grep` for text search. Rename, formatting,
+code actions, and workspace edits remain unsupported. The explicit internal
+writable-worker runtime may compose this same read-only LSP service into its
+managed child worktree; it does not turn worktree or checkpoint lifecycle into
+LSP tools. See [ADR 0132](adr/0132-worker-scoped-lsp-runtime-integration.md).
 
 ## Project status
 

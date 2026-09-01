@@ -9,8 +9,9 @@ import sys
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
+from neuro_code.application.checkpoints import WorkspaceCheckpointApplicationService
 from neuro_code.application.execution_policy import ExecutionBudgetPolicy
 from neuro_code.application.memory.compaction import ProviderContextWindow
 from neuro_code.application.memory.compaction_runtime import ContextCompactionRuntimeGate
@@ -22,8 +23,10 @@ from neuro_code.application.permissions.policy import (
     PermissionEffect,
     PermissionManager,
     PermissionRule,
+    PermissionRuleStore,
 )
 from neuro_code.application.permissions.service import ToolApprovalService
+from neuro_code.application.ports.agent_swarm import AgentSwarmStore
 from neuro_code.application.ports.approval import PermissionApprover
 from neuro_code.application.ports.background_tasks import (
     BackgroundTaskManager,
@@ -32,16 +35,31 @@ from neuro_code.application.ports.background_tasks import (
 from neuro_code.application.ports.client_filesystem import ClientFileSystem
 from neuro_code.application.ports.client_terminal import ClientTerminal
 from neuro_code.application.ports.instructions import InstructionDiscovery
+from neuro_code.application.ports.leader import LeaderStore
 from neuro_code.application.ports.model import (
     CapabilityStatus,
     ModelCapability,
     ModelCapabilitySet,
     ModelProvider,
 )
+from neuro_code.application.ports.model_planning import ModelPlanningStore
+from neuro_code.application.ports.parent_context_relay import (
+    ParentContextRelayError,
+    ParentContextRelayStore,
+)
+from neuro_code.application.ports.result_adoption import ResultAdoptionStore
 from neuro_code.application.ports.sandbox import LocalProcessSandbox
 from neuro_code.application.ports.skills import SkillDiscovery
 from neuro_code.application.ports.storage import SessionStore
+from neuro_code.application.ports.task_dag import TaskDagError, TaskDagStore
+from neuro_code.application.ports.task_dag_recovery import TaskDagRecoveryClaimStore
+from neuro_code.application.ports.task_dag_replan import TaskDagReplanStore
+from neuro_code.application.ports.task_dag_result_relay import (
+    TaskDagDependencyResultRelayError,
+    TaskDagDependencyResultRelayStore,
+)
 from neuro_code.application.ports.tools import Tool, ToolContext
+from neuro_code.application.ports.ultracode import UltracodeResultAdoption, UltracodeStore
 from neuro_code.application.ports.user_interaction import UserInteractionPort
 from neuro_code.application.ports.web_fetch import (
     WebFetchExecutionPath,
@@ -54,6 +72,7 @@ from neuro_code.application.ports.web_search import (
     resolve_web_search_path,
 )
 from neuro_code.application.ports.workspace_changes import WorkspaceChangeObserver
+from neuro_code.application.ports.writable_subagent import WritableSubagentLeaseStore
 from neuro_code.application.providers.service import (
     ProviderChangeService,
     ProviderProfileController,
@@ -62,7 +81,10 @@ from neuro_code.application.runtime.agent import AgentRuntime
 from neuro_code.application.sessions import (
     SessionApplicationService,
 )
-from neuro_code.application.sessions.binding import ConversationBinding
+from neuro_code.application.sessions.binding import (
+    ConversationBinding,
+    ConversationBindingResourceScope,
+)
 from neuro_code.application.sessions.conversation import AgentConversation
 from neuro_code.application.sessions.selection import (
     SessionSelectionController,
@@ -82,6 +104,16 @@ from neuro_code.application.settings import ApplicationSettings
 from neuro_code.application.tools.service import SessionToolOutputArtifactApplicationService
 from neuro_code.application.web_fetch.service import WebFetchService
 from neuro_code.application.web_search.service import WebSearchService
+from neuro_code.application.workflows.agent_swarm import (
+    AgentSwarmApplicationService,
+    AgentSwarmLeader,
+    AgentSwarmPlanner,
+    AgentSwarmReplanner,
+)
+from neuro_code.application.workflows.leader import LeaderApplicationService
+from neuro_code.application.workflows.model_planning import (
+    ModelDagPlanningApplicationService,
+)
 from neuro_code.application.workflows.plan_execution import (
     PlanExecutionController,
     PlanExecutionService,
@@ -90,6 +122,7 @@ from neuro_code.application.workflows.plan_scheduling import (
     PlanSchedulingController,
     PlanSchedulingService,
 )
+from neuro_code.application.workflows.result_adoption import ResultAdoptionApplicationService
 from neuro_code.application.workflows.session_task_execution import (
     QueuedPlanExecutionController,
     QueuedPlanExecutionService,
@@ -101,13 +134,54 @@ from neuro_code.application.workflows.subagent import (
     SubagentExecutionService,
     SubagentExecutorFactory,
 )
+from neuro_code.application.workflows.subagent_capabilities import (
+    MAX_SUBAGENT_CAPABILITY_STEPS,
+    SubagentCapabilitySet,
+)
+from neuro_code.application.workflows.subagent_scheduler import (
+    MAX_SUBAGENT_PARALLELISM,
+    ScopedSubagentRuntimeFactory,
+    SubagentScheduler,
+)
+from neuro_code.application.workflows.task_dag import (
+    TaskDagApplicationService,
+    TaskDagWritableService,
+    TaskDagWritableWorkerFactory,
+)
+from neuro_code.application.workflows.task_dag_replan import (
+    TaskDagReplanApplicationService,
+)
+from neuro_code.application.workflows.ultracode import (
+    UltracodeDelegationApplicationService,
+)
+from neuro_code.application.workflows.writable_subagent import (
+    WritableSubagentApplicationService,
+)
+from neuro_code.application.worktrees import WorktreeApplicationService
+from neuro_code.domain.conversation.messages import Message, Role, SyntheticReason
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
+from neuro_code.domain.parent_context_relay import (
+    ParentContextRelay,
+    render_parent_context_relay,
+)
 from neuro_code.domain.sandbox.models import SandboxProfile
+from neuro_code.domain.task_dag import TaskDagNodeState
+from neuro_code.domain.task_dag_result_relay import (
+    TaskDagDependencyResultRelay,
+    render_task_dag_dependency_relay,
+)
 from neuro_code.domain.workspace.instructions import InstructionDiscoveryResult
 from neuro_code.domain.workspace.skills import SkillDiscoveryResult
 from neuro_code.infrastructure.background_tasks import LocalBackgroundTaskManager
+from neuro_code.infrastructure.git.worktree import LocalGitWorktreeAdapter
+from neuro_code.infrastructure.lsp.manager import LanguageServerManager
+from neuro_code.infrastructure.persistence.checkpoint_artifacts import LocalCheckpointArtifactStore
+from neuro_code.infrastructure.persistence.managed_worktrees import SqliteManagedWorktreeStore
 from neuro_code.infrastructure.persistence.output_artifacts import FileToolOutputArtifactStore
 from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
+from neuro_code.infrastructure.persistence.workspace_checkpoints import (
+    SqliteWorkspaceCheckpointStore,
+)
 from neuro_code.infrastructure.providers import create_routed_provider
 from neuro_code.infrastructure.providers.hosted_web_search import (
     RoutedWebSearchBackendResolver,
@@ -117,6 +191,7 @@ from neuro_code.infrastructure.sandbox.local_process import ProcessTreeLocalProc
 from neuro_code.infrastructure.sandbox.windows_native_local_process import (
     WindowsNativeLocalProcessSandbox,
 )
+from neuro_code.infrastructure.tools.filesystem import ExactWorkspaceMutationTool
 from neuro_code.infrastructure.tools.registry import ToolRegistry, default_tool_registry
 from neuro_code.infrastructure.tools.web_fetch import WebFetchTool
 from neuro_code.infrastructure.tools.web_search import WebSearchTool
@@ -126,8 +201,10 @@ from neuro_code.infrastructure.workspace.changes import (
     FilesystemWorkspaceChangeObserver,
     MultiRootWorkspaceChangeObserver,
 )
+from neuro_code.infrastructure.workspace.checkpoints import LocalWorkspaceStateAdapter
 from neuro_code.infrastructure.workspace.instructions import FilesystemInstructionDiscovery
 from neuro_code.infrastructure.workspace.paths import FilesystemWorkspaceIdentity, workspaces_match
+from neuro_code.infrastructure.workspace.projection import LocalParentWorkspaceProjectionReader
 from neuro_code.infrastructure.workspace.skills import FilesystemSkillDiscovery
 from neuro_code.shared.errors import ConfigurationError, SandboxError
 
@@ -249,6 +326,28 @@ def _default_workspace_change_observer_factory() -> WorkspaceChangeObserver:
     return FilesystemWorkspaceChangeObserver()
 
 
+class CompositionTaskDagWritableWorkerFactory(TaskDagWritableWorkerFactory):
+    """Create one fresh Writable application owner per parallel DAG node."""
+
+    __slots__ = ("_composition", "_parent_binding", "_timeout_seconds")
+
+    def __init__(
+        self,
+        composition: ApplicationComposition,
+        parent_binding: ConversationBinding,
+        timeout_seconds: float,
+    ) -> None:
+        self._composition = composition
+        self._parent_binding = parent_binding
+        self._timeout_seconds = timeout_seconds
+
+    def create(self) -> TaskDagWritableService:
+        return self._composition.create_writable_subagent_service(
+            parent_binding=self._parent_binding,
+            timeout_seconds=self._timeout_seconds,
+        )
+
+
 class ApplicationComposition:
     """Own shared configuration, persistence, and conversation resources.
 
@@ -291,6 +390,7 @@ class ApplicationComposition:
             skill_discovery if skill_discovery is not None else _default_skill_discovery_factory()
         )
         self._workspace_change_observer_factory = workspace_change_observer_factory
+        self._lsp_services: set[LanguageServerManager] = set()
         self._closed = False
 
     def create_local_process_sandbox(
@@ -317,6 +417,89 @@ class ApplicationComposition:
             selected_config.sandbox_profile,
             selected_config.cwd,
             selected_config.state_dir,
+        )
+
+    def create_worktree_service(self) -> WorktreeApplicationService:
+        """Create the application-owned local Git worktree capability.
+
+        The service is explicit and not automatically exposed to ordinary
+        model-facing tools.  Its database and managed root are both owned by
+        the configured state directory; callers must await ``initialize``
+        before using lifecycle operations.
+
+        创建应用拥有的本地 Git worktree 能力.该服务是显式的,不会自动暴露给普通模型工具.
+        database 和 managed root 都属于配置的 state directory;调用方必须先 await
+        ``initialize`` 再使用生命周期操作.
+        """
+
+        return WorktreeApplicationService(
+            git=LocalGitWorktreeAdapter(hooks_directory=self.config.state_dir / "git-hooks"),
+            store=SqliteManagedWorktreeStore(self.config.state_dir / "worktrees.db"),
+            managed_root=self.config.state_dir / "worktrees",
+        )
+
+    def create_workspace_checkpoint_service(self) -> WorkspaceCheckpointApplicationService:
+        """Create the internal managed-workspace checkpoint capability.
+
+        The capability is intentionally explicit and is not registered as a
+        model-facing tool.  Callers must await ``initialize`` before use.
+        """
+
+        git = LocalGitWorktreeAdapter(hooks_directory=self.config.state_dir / "git-hooks")
+        return WorkspaceCheckpointApplicationService(
+            git=git,
+            workspace_git=git,
+            worktrees=SqliteManagedWorktreeStore(self.config.state_dir / "worktrees.db"),
+            state=LocalWorkspaceStateAdapter(git=git, workspace_git=git),
+            checkpoints=SqliteWorkspaceCheckpointStore(self.config.state_dir / "checkpoints.db"),
+            artifacts=LocalCheckpointArtifactStore(self.config.state_dir),
+        )
+
+    def create_result_adoption_service(
+        self,
+        *,
+        parent_binding: ConversationBinding,
+    ) -> ResultAdoptionApplicationService:
+        """Create the explicit durable parent-result adoption capability.
+
+        The service is an internal application capability. All source
+        evidence, worktree/checkpoint services, and the parent mutation port
+        are bound here from the active composition and conversation binding;
+        it is not a model-facing tool or a second provider path.
+        """
+
+        if not isinstance(parent_binding, ConversationBinding):
+            raise ConfigurationError("result adoption parent binding is required")
+        if parent_binding.workspace_mutation is None:
+            raise ConfigurationError("result adoption parent mutation authority is missing")
+        git = LocalGitWorktreeAdapter(hooks_directory=self.config.state_dir / "git-hooks")
+        managed_worktrees = SqliteManagedWorktreeStore(self.config.state_dir / "worktrees.db")
+        checkpoint_store = SqliteWorkspaceCheckpointStore(self.config.state_dir / "checkpoints.db")
+        state = LocalWorkspaceStateAdapter(git=git, workspace_git=git)
+        worktrees = WorktreeApplicationService(
+            git=git,
+            store=managed_worktrees,
+            managed_root=self.config.state_dir / "worktrees",
+        )
+        checkpoints = WorkspaceCheckpointApplicationService(
+            git=git,
+            workspace_git=git,
+            worktrees=managed_worktrees,
+            state=state,
+            checkpoints=checkpoint_store,
+            artifacts=LocalCheckpointArtifactStore(self.config.state_dir),
+        )
+        parent_reader = LocalParentWorkspaceProjectionReader(git=git, state=state)
+        return ResultAdoptionApplicationService(
+            store=cast(ResultAdoptionStore, self.store),
+            swarms=cast(AgentSwarmStore, self.store),
+            dags=cast(TaskDagStore, self.store),
+            leases=cast(WritableSubagentLeaseStore, self.store),
+            worktrees=worktrees,
+            checkpoints=checkpoints,
+            parent_reader=parent_reader,
+            mutation=parent_binding.workspace_mutation,
+            parent_binding=parent_binding,
         )
 
     @classmethod
@@ -386,12 +569,105 @@ class ApplicationComposition:
         client_terminal: ClientTerminal | None = None,
         max_steps: int | None = None,
         allowed_tool_names: Collection[str] | None = None,
-        enable_background_tasks: bool = True,
+        enable_background_tasks: bool | None = None,
+        capabilities: SubagentCapabilitySet | None = None,
         user_interaction: UserInteractionPort | None = None,
+        parent_context_relay: ParentContextRelay | None = None,
+        dag_result_relay: TaskDagDependencyResultRelay | None = None,
     ) -> ConversationBinding:
         if self._closed:
             raise RuntimeError("application composition is closed")
         selected_config = config or self.config
+        if parent_context_relay is not None:
+            if not isinstance(parent_context_relay, ParentContextRelay):
+                raise ConfigurationError("parent context relay must be canonical")
+            if capabilities is None or resume_id != parent_context_relay.child_session_id:
+                raise ConfigurationError("parent context relay child binding is inconsistent")
+            if capabilities.fingerprint != parent_context_relay.capability_fingerprint:
+                raise ConfigurationError("parent context relay capability binding is inconsistent")
+            try:
+                durable_relay = await cast(
+                    ParentContextRelayStore,
+                    self.store,
+                ).get_parent_context_relay(parent_context_relay.relay_id)
+            except ParentContextRelayError as error:
+                raise ConfigurationError(
+                    f"parent context relay integrity verification failed: {error}"
+                ) from error
+            if durable_relay != parent_context_relay:
+                raise ConfigurationError("parent context relay is not the published durable record")
+        if dag_result_relay is not None:
+            if not isinstance(dag_result_relay, TaskDagDependencyResultRelay):
+                raise ConfigurationError("DAG result relay must be canonical")
+            try:
+                durable_dag_relay = await cast(
+                    TaskDagDependencyResultRelayStore,
+                    self.store,
+                ).get_task_dag_dependency_relay(dag_result_relay.relay_id)
+            except TaskDagDependencyResultRelayError as error:
+                raise ConfigurationError(
+                    f"DAG result relay integrity verification failed: {error}"
+                ) from error
+            if durable_dag_relay != dag_result_relay:
+                raise ConfigurationError("DAG result relay is not the published durable record")
+            try:
+                durable_dag = await cast(TaskDagStore, self.store).get_task_dag(
+                    dag_result_relay.dag_id
+                )
+            except TaskDagError as error:
+                raise ConfigurationError(
+                    f"DAG result relay target verification failed: {error}"
+                ) from error
+            if durable_dag is None:
+                raise ConfigurationError("DAG result relay target DAG is missing")
+            try:
+                durable_target = durable_dag.node(dag_result_relay.target_node_id)
+            except KeyError as error:
+                raise ConfigurationError("DAG result relay target node is missing") from error
+            if (
+                durable_dag.definition_fingerprint != dag_result_relay.dag_definition_fingerprint
+                or durable_target.state is not TaskDagNodeState.RUNNING
+                or durable_target.generation != dag_result_relay.target_node_generation
+                or durable_target.definition_fingerprint
+                != dag_result_relay.target_node_definition_fingerprint
+                or durable_target.dependencies != dag_result_relay.direct_dependency_ids
+            ):
+                raise ConfigurationError(
+                    "DAG result relay target is not the active exact execution"
+                )
+        if capabilities is not None:
+            if not isinstance(capabilities, SubagentCapabilitySet):
+                raise ConfigurationError("child capabilities must be canonical")
+            if selected_config.cwd != capabilities.cwd:
+                raise ConfigurationError("child capability cwd does not match child config")
+            if selected_config.sandbox_profile is not capabilities.sandbox_profile:
+                raise ConfigurationError("child capability sandbox does not match child config")
+            if max_steps is not None and max_steps != capabilities.max_steps:
+                raise ConfigurationError("child max_steps conflicts with capability budget")
+            if allowed_tool_names is not None and frozenset(allowed_tool_names) != (
+                capabilities.allowed_tool_names
+            ):
+                raise ConfigurationError("raw tool allowlist conflicts with child capability")
+            if enable_background_tasks is not None and (
+                enable_background_tasks is not capabilities.background_tasks
+            ):
+                raise ConfigurationError("raw background-task flag conflicts with child capability")
+            expected_additional_roots = capabilities.workspace_roots[1:]
+            if (
+                additional_workspace_roots
+                and tuple(
+                    path.expanduser().resolve(strict=False) for path in additional_workspace_roots
+                )
+                != expected_additional_roots
+            ):
+                raise ConfigurationError("raw workspace roots conflict with child capability")
+            max_steps = capabilities.max_steps
+            allowed_tool_names = capabilities.allowed_tool_names
+            additional_workspace_roots = expected_additional_roots
+            enable_background_tasks = capabilities.background_tasks
+        elif enable_background_tasks is None:
+            enable_background_tasks = True
+        assert enable_background_tasks is not None
         selected_execution_budget = (
             self.settings.execution_budget
             if max_steps is None
@@ -414,7 +690,7 @@ class ApplicationComposition:
                 raise ConfigurationError(
                     f"tool {tool.definition.name!r} is outside the selected capability set"
                 )
-            preview_tools.register(tool)
+            preview_tools.register_external(tool)
         if selected_config.web_fetch_mode is not WebFetchMode.DISABLED and any(
             tool.definition.name == "web_fetch" for tool in additional_tools
         ):
@@ -429,11 +705,19 @@ class ApplicationComposition:
             ModelProvider,
             ToolRegistry,
             LocalProcessSandbox,
+            LanguageServerManager,
         ]:
             local_process_sandbox = self._local_process_sandbox_factory(
                 selected_config.sandbox_profile,
                 selected_config.cwd,
                 selected_config.state_dir,
+            )
+            lsp_service = LanguageServerManager(
+                config=selected_config,
+                local_process_sandbox=local_process_sandbox,
+                workspace_root=selected_config.cwd,
+                additional_workspace_roots=tuple(additional_workspace_roots),
+                redaction_values=selected_config.redaction_values(),
             )
             task_scope = self.background_tasks.open_scope(
                 local_process_sandbox=local_process_sandbox,
@@ -552,6 +836,7 @@ class ApplicationComposition:
                     client_file_system=client_file_system,
                     client_terminal=client_terminal,
                     user_interaction=user_interaction,
+                    lsp_service=lsp_service,
                 )
                 if fetch_path is WebFetchExecutionPath.LOCAL and (
                     allowed_tool_names is None or "web_fetch" in allowed_tool_names
@@ -586,13 +871,21 @@ class ApplicationComposition:
                         raise ConfigurationError(
                             f"tool {tool.definition.name!r} is outside the selected capability set"
                         )
-                    tools.register(tool)
-                return task_scope, provider, tools, local_process_sandbox
+                    tools.register_external(tool)
+                return task_scope, provider, tools, local_process_sandbox, lsp_service
             except BaseException:
+                await asyncio.shield(lsp_service.close())
                 await asyncio.shield(task_scope.shutdown())
                 raise
 
-        task_scope, provider, tools, local_process_sandbox = await prepare_provider_and_tools()
+        (
+            task_scope,
+            provider,
+            tools,
+            local_process_sandbox,
+            lsp_service,
+        ) = await prepare_provider_and_tools()
+        self._lsp_services.add(lsp_service)
         try:
             compaction_persistence = ContextCompactionApplicationService(
                 self.store,
@@ -637,9 +930,18 @@ class ApplicationComposition:
             def skill_provider() -> SkillDiscoveryResult | None:
                 return skill_tracker.current_result()
 
+            persisted_rules: tuple[PermissionRule, ...] = ()
+            if self.settings.permission_rules_path is not None:
+                try:
+                    persisted_rules = PermissionRuleStore(
+                        self.settings.permission_rules_path
+                    ).load()
+                except ValueError as error:
+                    raise ConfigurationError(str(error)) from error
             permissions = PermissionManager(
                 mode=self.settings.permission_mode,
                 rules=(
+                    *persisted_rules,
                     *self.settings.permission_rules,
                     *(
                         PermissionRule(PermissionEffect.ASK, tool.definition.name)
@@ -648,6 +950,7 @@ class ApplicationComposition:
                 ),
                 interactive=approval_service is not None,
             )
+            lsp_service.set_visibility_policy(permissions)
             workspace_change_observer = self._workspace_change_observer_factory()
             if additional_workspace_roots:
                 workspace_change_observer = MultiRootWorkspaceChangeObserver(
@@ -685,6 +988,7 @@ class ApplicationComposition:
                 ),
                 approver=approval_service,
                 session_store=self.store,
+                workspace_mutation_tool=ExactWorkspaceMutationTool(),
                 execution_budget=selected_execution_budget,
                 reasoning_effort=reasoning_effort or self.settings.reasoning_effort,
                 execution_control_mode=self.settings.execution_control_mode,
@@ -701,6 +1005,24 @@ class ApplicationComposition:
                 ),
                 instruction_provider=instruction_provider,
                 skill_provider=skill_provider,
+                parent_relay_message=(
+                    Message(
+                        Role.USER,
+                        render_parent_context_relay(parent_context_relay.items),
+                        synthetic_reason=SyntheticReason.PARENT_RELAY,
+                    )
+                    if parent_context_relay is not None
+                    else None
+                ),
+                dag_result_relay_message=(
+                    Message(
+                        Role.USER,
+                        render_task_dag_dependency_relay(dag_result_relay.entries),
+                        synthetic_reason=SyntheticReason.DAG_PREDECESSOR_RESULTS,
+                    )
+                    if dag_result_relay is not None
+                    else None
+                ),
             )
             conversation = await AgentConversation.open(
                 runtime=runtime,
@@ -709,8 +1031,38 @@ class ApplicationComposition:
                 workspace_identity=FilesystemWorkspaceIdentity(),
                 resume_id=resume_id,
             )
-            return ConversationBinding(conversation, provider, task_scope)
+            binding_capabilities = SubagentCapabilitySet.from_runtime(
+                tool_names=tools.names(),
+                provider_tool_names=selected_config.provider.builtin_tools,
+                mcp_tool_names=tuple(tool.definition.name for tool in additional_tools),
+                cwd=selected_config.cwd,
+                additional_workspace_roots=additional_workspace_roots,
+                sandbox_profile=selected_config.sandbox_profile,
+                enable_background_tasks=enable_background_tasks,
+                max_steps=selected_execution_budget.max_model_calls,
+            )
+            if capabilities is not None and binding_capabilities != capabilities:
+                raise ConfigurationError(
+                    "child binding capability metadata does not match its construction"
+                )
+
+            async def close_binding_resources() -> None:
+                self._lsp_services.discard(lsp_service)
+                await lsp_service.close()
+                await task_scope.shutdown()
+
+            return ConversationBinding(
+                runner=conversation,
+                provider=provider,
+                background_tasks=task_scope,
+                capabilities=binding_capabilities,
+                resource_scope=ConversationBindingResourceScope(close_binding_resources),
+                workspace_root=selected_config.cwd,
+                workspace_mutation=runtime.workspace_mutation,
+            )
         except BaseException:
+            self._lsp_services.discard(lsp_service)
+            await asyncio.shield(lsp_service.close())
             if task_scope is not None:
                 await asyncio.shield(task_scope.shutdown())
             raise
@@ -867,19 +1219,46 @@ class ApplicationComposition:
     def bind_subagent_executor(
         self,
         executor_factory: SubagentExecutorFactory,
+        *,
+        _test_only: bool = False,
     ) -> SubagentExecutionService:
-        """Bind an explicit subagent executor to the durable task lifecycle.
+        """Bind the legacy executor seam for tests/internal compatibility only.
 
-        The executor remains responsible for creating an isolated runtime and
-        selecting its capabilities.  Composition only supplies the shared
-        session store; it does not enable automatic scheduling.
+        This seam accepts an arbitrary executor and therefore is not a
+        capability boundary.  Normal production entrypoints must use the
+        capability-aware read-only service or scheduler.  The explicit flag
+        keeps the compatibility API available without presenting it as a
+        production security guarantee.
 
-        将明确的子代理执行器绑定到持久任务生命周期.
-        执行器仍负责创建隔离运行时并选择能力,组合根只提供共享会话存储,
-        不会启用自动调度.
+        仅为测试/内部兼容绑定旧版执行器接缝. 该接缝接受任意执行器,因此不是 capability
+        边界.正常生产入口必须使用 capability-aware 只读服务或 scheduler.
         """
 
+        if _test_only is not True:
+            raise ConfigurationError("legacy subagent executor binding is test-only")
         return SubagentExecutionService(self.store, executor_factory)
+
+    def subagent_global_policy(self) -> SubagentCapabilitySet:
+        """Return the one composition-owned child capability ceiling.
+
+        The parent binding remains the primary authority.  This manifest is
+        only the process-wide ceiling used by both the canonical scheduler and
+        the explicit read-only workflow.
+        """
+
+        config = self.config
+        tools = default_tool_registry(
+            config.sandbox_profile,
+            enable_background_tasks=True,
+        )
+        return SubagentCapabilitySet.from_runtime(
+            tool_names=tools.names(),
+            provider_tool_names=config.provider.builtin_tools,
+            cwd=config.cwd,
+            sandbox_profile=config.sandbox_profile,
+            enable_background_tasks=True,
+            max_steps=MAX_SUBAGENT_CAPABILITY_STEPS,
+        )
 
     def create_read_only_subagent_service(
         self,
@@ -899,9 +1278,390 @@ class ApplicationComposition:
 
         from neuro_code.bootstrap.subagent import CompositionReadOnlySubagentRuntimeFactory
 
+        factory = CompositionReadOnlySubagentRuntimeFactory(self)
         return IsolatedSubagentExecutionService(
             self.store,
-            CompositionReadOnlySubagentRuntimeFactory(self),
+            factory,
+            global_policy=self.subagent_global_policy(),
+            requested_capability_factory=factory.requested_capabilities,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def create_writable_subagent_service(
+        self,
+        *,
+        parent_binding: ConversationBinding,
+        timeout_seconds: float = 120.0,
+    ) -> WritableSubagentApplicationService:
+        """Create the explicit internal serialized writable-subagent slice.
+
+        The returned service is not connected to CLI, TUI, ACP, or the normal
+        ``/subagent`` command.  Its parent authority is captured from the
+        actual active ``ConversationBinding`` at this composition boundary.
+        """
+
+        from neuro_code.bootstrap.subagent import CompositionWritableSubagentRuntimeFactory
+
+        if not isinstance(parent_binding, ConversationBinding):
+            raise ConfigurationError("writable subagent parent binding is required")
+        if not isinstance(parent_binding.capabilities, SubagentCapabilitySet):
+            raise ConfigurationError(
+                "writable subagent parent binding capability metadata is missing"
+            )
+        parent_session_id = parent_binding.runner.session_id
+        if not isinstance(parent_session_id, str) or not parent_session_id.strip():
+            raise ConfigurationError("writable subagent parent binding session identity is missing")
+
+        worktrees = self.create_worktree_service()
+        checkpoints = self.create_workspace_checkpoint_service()
+        factory = CompositionWritableSubagentRuntimeFactory(self)
+        return WritableSubagentApplicationService(
+            self.store,
+            cast(WritableSubagentLeaseStore, self.store),
+            worktrees,
+            checkpoints,
+            factory,
+            parent_binding=parent_binding,
+            global_policy=self.subagent_global_policy(),
+            relay_store=cast(ParentContextRelayStore, self.store),
+            redaction_values=self.config.redaction_values(),
+            timeout_seconds=timeout_seconds,
+        )
+
+    def create_task_dag_service(
+        self,
+        *,
+        parent_binding: ConversationBinding,
+        timeout_seconds: float = 120.0,
+    ) -> TaskDagApplicationService:
+        """Create the explicit bounded Task DAG application slice."""
+
+        if not isinstance(parent_binding, ConversationBinding):
+            raise ConfigurationError("task DAG parent binding is required")
+        writable = self.create_writable_subagent_service(
+            parent_binding=parent_binding,
+            timeout_seconds=timeout_seconds,
+        )
+        writable_worker_factory = CompositionTaskDagWritableWorkerFactory(
+            self,
+            parent_binding,
+            timeout_seconds,
+        )
+        return TaskDagApplicationService(
+            self.store,
+            cast(TaskDagStore, self.store),
+            writable,
+            cast(WritableSubagentLeaseStore, self.store),
+            cast(ParentContextRelayStore, self.store),
+            parent_binding=parent_binding,
+            dependency_relay_store=cast(TaskDagDependencyResultRelayStore, self.store),
+            recovery_claim_store=cast(TaskDagRecoveryClaimStore, self.store),
+            writable_worker_factory=writable_worker_factory,
+            redaction_values=self.config.redaction_values(),
+        )
+
+    async def create_leader_service(
+        self,
+        *,
+        parent_binding: ConversationBinding,
+        timeout_seconds: float = 120.0,
+    ) -> LeaderApplicationService:
+        """Create the bounded zero-tool Leader over one existing Task DAG.
+
+        The Leader gets its own persisted session and provider route, but all
+        provider-hosted tools, local tools, background wakes, and child
+        capabilities are removed at this composition boundary.  The returned
+        service owns the dedicated binding and should be closed by its caller.
+        """
+
+        if not isinstance(parent_binding, ConversationBinding):
+            raise ConfigurationError("Leader parent binding is required")
+        leader_config = replace(
+            self.config,
+            providers={
+                name: replace(profile, builtin_tools=())
+                for name, profile in self.config.providers.items()
+            },
+        )
+        provider_profile = leader_config.provider
+        leader_session_id = await self.store.create_session(
+            str(leader_config.cwd),
+            provider_profile.name,
+            provider_profile.model,
+            provider_profile.context_affinity,
+            leader_config.sandbox_profile,
+        )
+        try:
+            leader_binding = await self.create_binding(
+                config=leader_config,
+                resume_id=leader_session_id,
+                max_steps=1,
+                allowed_tool_names=(),
+                enable_background_tasks=False,
+            )
+        except BaseException:
+            await asyncio.shield(self.store.delete_session(leader_session_id))
+            raise
+        try:
+            dag_service = self.create_task_dag_service(
+                parent_binding=parent_binding,
+                timeout_seconds=timeout_seconds,
+            )
+            return LeaderApplicationService(
+                cast(LeaderStore, self.store),
+                dag_service,
+                parent_binding=parent_binding,
+                leader_binding=leader_binding,
+                session_store=self.store,
+                redaction_values=leader_config.redaction_values(),
+            )
+        except BaseException:
+            await asyncio.shield(leader_binding.close())
+            await asyncio.shield(self.store.delete_session(leader_session_id))
+            raise
+
+    async def create_model_planning_service(
+        self,
+        *,
+        parent_binding: ConversationBinding,
+        timeout_seconds: float = 120.0,
+    ) -> ModelDagPlanningApplicationService:
+        """Create the bounded zero-tool model-generated DAG planner.
+
+        The planner owns only a typed proposal.  It receives a dedicated
+        persisted one-step binding; Task DAG creation and all later execution
+        remain behind their existing application owners.
+        """
+
+        if not isinstance(parent_binding, ConversationBinding):
+            raise ConfigurationError("model planning parent binding is required")
+        planner_config = replace(
+            self.config,
+            providers={
+                name: replace(profile, builtin_tools=())
+                for name, profile in self.config.providers.items()
+            },
+        )
+        provider_profile = planner_config.provider
+        planner_session_id = await self.store.create_session(
+            str(planner_config.cwd),
+            provider_profile.name,
+            provider_profile.model,
+            provider_profile.context_affinity,
+            planner_config.sandbox_profile,
+        )
+        try:
+            planner_binding = await self.create_binding(
+                config=planner_config,
+                resume_id=planner_session_id,
+                max_steps=1,
+                allowed_tool_names=(),
+                enable_background_tasks=False,
+            )
+        except BaseException:
+            await asyncio.shield(self.store.delete_session(planner_session_id))
+            raise
+        try:
+            dag_service = self.create_task_dag_service(
+                parent_binding=parent_binding,
+                timeout_seconds=timeout_seconds,
+            )
+            return ModelDagPlanningApplicationService(
+                cast(ModelPlanningStore, self.store),
+                dag_service,
+                parent_binding=parent_binding,
+                planner_binding=planner_binding,
+                session_store=self.store,
+                redaction_values=planner_config.redaction_values(),
+            )
+        except BaseException:
+            await asyncio.shield(planner_binding.close())
+            await asyncio.shield(self.store.delete_session(planner_session_id))
+            raise
+
+    create_planner_service = create_model_planning_service
+
+    async def create_task_dag_replan_service(
+        self,
+        *,
+        parent_binding: ConversationBinding,
+        timeout_seconds: float = 120.0,
+    ) -> TaskDagReplanApplicationService:
+        """Create the explicit zero-tool bounded failed-DAG replan service."""
+
+        if not isinstance(parent_binding, ConversationBinding):
+            raise ConfigurationError("DAG replan parent binding is required")
+        planner_config = replace(
+            self.config,
+            providers={
+                name: replace(profile, builtin_tools=())
+                for name, profile in self.config.providers.items()
+            },
+        )
+        provider_profile = planner_config.provider
+        planner_session_id = await self.store.create_session(
+            str(planner_config.cwd),
+            provider_profile.name,
+            provider_profile.model,
+            provider_profile.context_affinity,
+            planner_config.sandbox_profile,
+        )
+        try:
+            planner_binding = await self.create_binding(
+                config=planner_config,
+                resume_id=planner_session_id,
+                max_steps=1,
+                allowed_tool_names=(),
+                enable_background_tasks=False,
+            )
+        except BaseException:
+            await asyncio.shield(self.store.delete_session(planner_session_id))
+            raise
+        try:
+            dag_service = self.create_task_dag_service(
+                parent_binding=parent_binding,
+                timeout_seconds=timeout_seconds,
+            )
+            return TaskDagReplanApplicationService(
+                cast(TaskDagReplanStore, self.store),
+                cast(TaskDagStore, self.store),
+                dag_service,
+                parent_binding=parent_binding,
+                planner_binding=planner_binding,
+                session_store=self.store,
+                redaction_values=planner_config.redaction_values(),
+            )
+        except BaseException:
+            await asyncio.shield(planner_binding.close())
+            await asyncio.shield(self.store.delete_session(planner_session_id))
+            raise
+
+    create_dag_replan_service = create_task_dag_replan_service
+
+    async def create_agent_swarm_service(
+        self,
+        *,
+        parent_binding: ConversationBinding,
+        timeout_seconds: float = 120.0,
+    ) -> AgentSwarmApplicationService:
+        """Create the internal bounded Planner-to-Replan Swarm workflow.
+
+        Lower-layer services are created lazily per phase so the Swarm owns
+        only orchestration identity/lifecycle while the composition root
+        continues to own provider, workspace, capability, and LSP wiring.
+        This service has no direct public CLI, TUI, or ACP surface.  The
+        application-level Ultracode entry may invoke it as its one bounded
+        delegation branch.
+        """
+
+        if not isinstance(parent_binding, ConversationBinding):
+            raise ConfigurationError("Swarm parent binding is required")
+
+        async def planner_factory() -> AgentSwarmPlanner:
+            return await self.create_model_planning_service(
+                parent_binding=parent_binding,
+                timeout_seconds=timeout_seconds,
+            )
+
+        async def leader_factory() -> AgentSwarmLeader:
+            return await self.create_leader_service(
+                parent_binding=parent_binding,
+                timeout_seconds=timeout_seconds,
+            )
+
+        async def replanner_factory() -> AgentSwarmReplanner:
+            return await self.create_task_dag_replan_service(
+                parent_binding=parent_binding,
+                timeout_seconds=timeout_seconds,
+            )
+
+        from neuro_code.application.ports.agent_swarm import AgentSwarmStore
+
+        return AgentSwarmApplicationService(
+            cast(AgentSwarmStore, self.store),
+            cast(TaskDagStore, self.store),
+            parent_binding=parent_binding,
+            planner_factory=planner_factory,
+            leader_factory=leader_factory,
+            replanner_factory=replanner_factory,
+            redaction_values=self.config.redaction_values(),
+        )
+
+    async def create_ultracode_delegation_service(
+        self,
+        *,
+        parent_binding: ConversationBinding,
+        timeout_seconds: float = 120.0,
+    ) -> UltracodeDelegationApplicationService:
+        """Create the application-owned Ultracode branch router.
+
+        The router receives the composition's existing parent binding and can
+        create only the already-frozen bounded Swarm plus the internal Result
+        Adoption capability for its one typed branch. It does not create
+        tools, workers, worktrees, or provider clients.
+        """
+
+        if not isinstance(parent_binding, ConversationBinding):
+            raise ConfigurationError("Ultracode parent binding is required")
+        if parent_binding.capabilities is None:
+            raise ConfigurationError("Ultracode parent capability metadata is missing")
+
+        async def swarm_factory() -> AgentSwarmApplicationService:
+            return await self.create_agent_swarm_service(
+                parent_binding=parent_binding,
+                timeout_seconds=timeout_seconds,
+            )
+
+        async def result_adoption_factory() -> UltracodeResultAdoption:
+            return cast(
+                UltracodeResultAdoption,
+                self.create_result_adoption_service(parent_binding=parent_binding),
+            )
+
+        return UltracodeDelegationApplicationService(
+            cast(UltracodeStore, self.store),
+            session_store=self.store,
+            parent_binding=parent_binding,
+            swarm_factory=swarm_factory,
+            result_adoption_factory=result_adoption_factory,
+        )
+
+    create_swarm_service = create_agent_swarm_service
+
+    def create_subagent_scheduler(
+        self,
+        factory: ScopedSubagentRuntimeFactory,
+        *,
+        parent_capabilities: SubagentCapabilitySet | None = None,
+        parent_binding: ConversationBinding | None = None,
+        global_policy: SubagentCapabilitySet | None = None,
+        max_parallel: int = MAX_SUBAGENT_PARALLELISM,
+        max_retries: int = 0,
+        timeout_seconds: float | None = None,
+    ) -> SubagentScheduler:
+        """Create an opt-in scheduler with explicit capability authorities."""
+
+        if parent_binding is not None:
+            if parent_binding.capabilities is None:
+                raise ConfigurationError("parent binding capability metadata is missing")
+            if (
+                parent_capabilities is not None
+                and parent_capabilities != parent_binding.capabilities
+            ):
+                raise ConfigurationError("parent capability metadata conflicts with binding")
+            parent_capabilities = parent_binding.capabilities
+        if parent_capabilities is None:
+            raise ConfigurationError("parent subagent capability metadata is required")
+        owned_global_policy = self.subagent_global_policy()
+        if global_policy is not None and global_policy != owned_global_policy:
+            raise ConfigurationError("global subagent capability policy is not composition-owned")
+
+        return SubagentScheduler(
+            factory,
+            parent_capabilities=parent_capabilities,
+            global_policy=owned_global_policy,
+            max_parallel=max_parallel,
+            max_retries=max_retries,
             timeout_seconds=timeout_seconds,
         )
 
@@ -1024,6 +1784,12 @@ class ApplicationComposition:
         if self._closed:
             return
         self._closed = True
+        lsp_services = tuple(self._lsp_services)
+        self._lsp_services.clear()
+        await asyncio.gather(
+            *(service.close() for service in lsp_services),
+            return_exceptions=True,
+        )
         await self.background_tasks.shutdown()
 
 

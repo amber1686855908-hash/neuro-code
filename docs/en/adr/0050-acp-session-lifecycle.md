@@ -7,9 +7,10 @@
 
 ## Context
 
-The partial ACP adapter can create, list, load, prompt, cancel, and close
-sessions, but a client cannot yet delete durable history, fork an independent
-conversation, or resume without replaying visible history. These operations
+At this ADR's acceptance, the partial ACP adapter could create, list, load,
+prompt, cancel, and close sessions, but a client could not yet delete durable
+history, fork an independent conversation, or resume without replaying visible
+history. These operations
 must preserve the existing separation between client-visible ACP IDs and
 internal SQLite IDs, remain scoped to the launch workspace, and keep provider,
 sandbox, permission, MCP, and background-task ownership fail-closed.
@@ -60,6 +61,12 @@ The same router registers `session/fork`, `session/resume`, and
   independent IDs, events, aliases, runtime resources, and future history.
 - Delete is destructive by protocol intent. Workspace filtering and stable
   not-found errors prevent it from becoming a cross-workspace metadata oracle.
-- The ACP adapter remains partial: additional directories, non-stdio MCP
-  transports and features, multimedia prompt/history content, client
-  filesystem/terminal methods, WebSocket, and extensions remain open.
+- The ACP adapter remains partial. Later bounded slices implement
+  profile-gated additional directories, Streamable HTTP and legacy SSE MCP
+  transports plus private bounded resource/prompt/callback/refresh projections,
+  bounded prompt multimedia input, client filesystem/terminal methods,
+  WebSocket transport, and private artifact/subagent/lifecycle/compaction
+  extensions. Binary multimedia history replay, ACP-transport MCP server
+  declarations, persistent MCP configuration, interactive client-terminal
+  input/resize/PTY framing, and complete conformance remain outside the
+  supported boundary.

@@ -85,8 +85,10 @@ JSON session exports move to schema version 4 and include the optional title.
   indexed.
 - CLI search spans the selected state database. Interactive search additionally
   enforces the active workspace identity and the existing safe-resume checks.
-- Model-generated titles, a live debounced picker search field, stemming beyond
-  the bounded prefix rules, and ACP exposure remain future slices.
+- Model-generated titles, a live debounced picker search field, and stemming
+  beyond the bounded prefix rules remain future slices. Workspace-scoped ACP
+  session listing is implemented by ADR 0037; full-text search remains exposed
+  through the CLI and TUI rather than ACP.
 
 ## Rejected alternatives
 

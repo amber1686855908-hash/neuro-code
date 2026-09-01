@@ -28,8 +28,13 @@ from textual.widget import Widget
 from textual.widgets import Button, Input, Label, Static, TextArea
 from textual.worker import Worker
 
+from neuro_code.application.memory.compaction_runtime import ContextCompactionCommandResult
 from neuro_code.application.permissions.broker import ApprovalHandler
 from neuro_code.application.permissions.contracts import PermissionApproval, PermissionRequest
+from neuro_code.application.permissions.scopes import (
+    PermissionScopeCandidate,
+    PermissionScopeKind,
+)
 from neuro_code.application.ports.http import HttpClientPolicy
 from neuro_code.application.ports.model import ModelCapabilitySet
 from neuro_code.application.ports.provider_catalog import (
@@ -104,6 +109,7 @@ from neuro_code.application.workflows.subagent import (
     ReadOnlySubagentApplicationService,
     RunSubagentRequest,
 )
+from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
 from neuro_code.configuration.app import resolve_http_client_policy
 from neuro_code.domain.background_tasks.models import (
     BackgroundTaskSnapshot,
@@ -122,6 +128,7 @@ from neuro_code.domain.execution import (
     AgentExecutionStatus,
     SessionExecutionRecord,
     TurnCancellationPolicy,
+    TurnRecoveryStatus,
 )
 from neuro_code.domain.plans import PlanComment, PlanStepStatus, SessionPlan
 from neuro_code.domain.sandbox.models import SandboxProfile
@@ -147,7 +154,7 @@ from neuro_code.interfaces.tui.tool_activity.renderers import (
     bounded_inline,
     safe_tool_text,
 )
-from neuro_code.shared.errors import ProviderError
+from neuro_code.shared.errors import ConfigurationError, ProviderError
 from neuro_code.shared.redaction import redact_sensitive_text
 from neuro_code.shared.ui_language import UiLanguage
 from neuro_code.tui_commands import SlashCompletion, slash_completions
@@ -375,6 +382,9 @@ class ConversationRunner(Protocol):
     @property
     def session_id(self) -> str | None: ...
 
+    @property
+    def items(self) -> tuple[SessionItem, ...]: ...
+
     async def run(
         self,
         prompt: str,
@@ -388,6 +398,8 @@ class ConversationRunner(Protocol):
     async def load_background_wake_state(self) -> BackgroundWakeState: ...
 
     async def save_background_wake_state(self, state: BackgroundWakeState) -> None: ...
+
+    async def compact_now(self) -> ContextCompactionCommandResult: ...
 
 
 class ApprovalController(Protocol):
@@ -2985,12 +2997,12 @@ class ReasoningEffortScreen(ModalScreen[ReasoningEffort | None]):
                 effort.value,
                 secondary=(
                     f"{ui_text(self.language, f'effort.description.{effort.value}')} · "
-                    f"{ui_text(self.language, 'effort.workflow_planned')}"
+                    f"{ui_text(self.language, 'effort.workflow_delegation')}"
                     if effort is ReasoningEffort.ULTRACODE
                     else ui_text(self.language, f"effort.description.{effort.value}")
                 ),
                 selected=effort is self.selected,
-                muted=effort is ReasoningEffort.ULTRACODE,
+                muted=False,
                 primary_width=14,
                 secondary_justify="left",
                 id=f"effort-choice-{index}",
@@ -3086,8 +3098,42 @@ class PermissionApprovalScreen(ModalScreen[PermissionApproval]):
         super().__init__()
         self.request = request
         self.language = language
+        self._scope_button_candidates: dict[str, PermissionScopeCandidate] = {}
 
     def compose(self) -> ComposeResult:
+        scope_widgets: list[Widget] = []
+        if self.request.scope_candidates:
+            scope_widgets.append(
+                Static(
+                    Text(ui_text(self.language, "approval.scope.heading")),
+                    id="approval-scope-heading",
+                )
+            )
+            for candidate in self.request.scope_candidates:
+                if candidate.kind is PermissionScopeKind.WORKSPACE_EDITS:
+                    button_id = "approval-allow-scope-workspace-edits"
+                    label_key = "approval.scope.workspace_edits"
+                    label_kwargs = {"root": candidate.workspace_root or "(unknown)"}
+                elif candidate.kind is PermissionScopeKind.COMMAND_FAMILY:
+                    family = (
+                        candidate.command_family.value if candidate.command_family else "(unknown)"
+                    )
+                    button_id = f"approval-allow-scope-command-family-{family}"
+                    label_key = "approval.scope.command_family"
+                    label_kwargs = {
+                        "family": family,
+                        "root": candidate.workspace_root or "(unknown)",
+                    }
+                else:
+                    continue
+                self._scope_button_candidates[button_id] = candidate
+                scope_widgets.append(
+                    Button(
+                        ui_text(self.language, label_key, **label_kwargs),
+                        variant="primary",
+                        id=button_id,
+                    )
+                )
         yield Vertical(
             Label(ui_text(self.language, "approval.title"), id="approval-title"),
             Static(
@@ -3110,6 +3156,7 @@ class PermissionApprovalScreen(ModalScreen[PermissionApproval]):
                 ),
                 id="approval-reason",
             ),
+            *scope_widgets,
             Horizontal(
                 Button(
                     ui_text(self.language, "approval.allow_once"),
@@ -3148,6 +3195,10 @@ class PermissionApprovalScreen(ModalScreen[PermissionApproval]):
             "approval-deny": PermissionApproval.deny(),
         }
         approval = choices.get(event.button.id or "")
+        if approval is None:
+            candidate = self._scope_button_candidates.get(event.button.id or "")
+            if candidate is not None:
+                approval = PermissionApproval.allow_scope(candidate)
         if approval is not None:
             self.dismiss(approval)
 
@@ -3859,6 +3910,7 @@ class NeuroCodeApp(App[None]):
         execution_record: SessionExecutionRecord | None = None,
         tool_output_artifact_service: SessionToolOutputArtifactApplicationService | None = None,
         read_only_subagent_service: ReadOnlySubagentApplicationService | None = None,
+        subagent_parent_capability_provider: Callable[[], SubagentCapabilitySet] | None = None,
         subagent_relationship_query: SubagentRelationshipQueryController | None = None,
         subagent_relationship_lifecycle: SubagentRelationshipLifecycleController | None = None,
         provider_name: str,
@@ -3952,6 +4004,7 @@ class NeuroCodeApp(App[None]):
         self._initial_items = tuple(initial_items)
         self._tool_output_artifact_service = tool_output_artifact_service
         self._read_only_subagent_service = read_only_subagent_service
+        self._subagent_parent_capability_provider = subagent_parent_capability_provider
         self._subagent_relationship_query = subagent_relationship_query
         self._subagent_relationship_lifecycle = subagent_relationship_lifecycle
         runner_record = getattr(runner, "execution_record", None)
@@ -4121,6 +4174,13 @@ class NeuroCodeApp(App[None]):
                 cwd=self._cwd,
             )
             self._write_recoverable_resume_notice(self._execution_record)
+            self.run_worker(
+                self._announce_recovery_state(),
+                name="crash-recovery-inspection",
+                group="session",
+                exclusive=False,
+                exit_on_error=False,
+            )
         else:
             self._write_ui_entry(
                 "system",
@@ -4708,8 +4768,7 @@ class NeuroCodeApp(App[None]):
         识别可操作的付款失败,但不解析或暴露 Provider 原始载荷.
         """
 
-        detail = str(error).casefold()
-        return "http 402" in detail or "insufficient balance" in detail
+        return error.failure.status_code == 402
 
     async def _handle_event(self, event: AgentEvent) -> None:
         data = event.data
@@ -4757,6 +4816,15 @@ class NeuroCodeApp(App[None]):
             self._turn_activity_tool_name = None
             self._turn_activity_tool_started_at = None
             self._refresh_turn_activity()
+        elif event.kind is AgentEventKind.ULTRACODE_DELEGATION_PROGRESS:
+            decision = data.get("decision")
+            state = data.get("state")
+            if isinstance(decision, str) and isinstance(state, str):
+                self._turn_activity_kind = "orchestrating"
+                self._turn_activity_tool_name = None
+                self._turn_activity_tool_started_at = None
+                self._refresh_turn_activity()
+                self._write_entry("status", f"Ultracode {decision} · {state}")
         elif event.kind is AgentEventKind.REASONING_DELTA:
             text = data.get("text")
             if isinstance(text, str) and text:
@@ -5553,6 +5621,9 @@ class NeuroCodeApp(App[None]):
             else:
                 await self._select_session(requested_session)
             return
+        if command == "recover":
+            await self._dispatch_recovery_command(arguments)
+            return
         if command in {"rename", "title"}:
             await self._rename_session(arguments)
             return
@@ -5625,8 +5696,141 @@ class NeuroCodeApp(App[None]):
                 profile=profile,
                 cwd=self._cwd,
             )
+        elif command in {"compact", "context"}:
+            await self._run_context_compaction()
         else:
             self._write_ui_entry("error", "command.unknown", command=command)
+
+    async def _dispatch_recovery_command(self, arguments: str) -> None:
+        tokens = arguments.split()
+        if not tokens or tokens[0].casefold() == "inspect":
+            if len(tokens) > 1:
+                self._write_ui_entry("error", "recovery.usage")
+                return
+            await self._announce_recovery_state(verbose=True)
+            return
+        if len(tokens) != 2 or tokens[0].casefold() not in {"abandon", "retry"}:
+            self._write_ui_entry("error", "recovery.usage")
+            return
+        owner = self._session_selection_owner()
+        if owner is None:
+            self._write_ui_entry("error", "recovery.unavailable")
+            return
+        if self._turn_worker is not None and self._turn_worker.is_running:
+            self._write_ui_entry("error", "turn.running")
+            return
+        action, turn_id = tokens[0].casefold(), tokens[1]
+        if action == "abandon":
+            try:
+                result = await owner.abandon_recovery(turn_id)
+            except Exception as error:
+                self._write_entry("error", f"{type(error).__name__}: {error}")
+                return
+            self._write_ui_entry(
+                "status",
+                "session.recovery.abandoned",
+                turn_id=result.attempt.turn_id,
+            )
+            return
+
+        self._assistant_parts.clear()
+        self._first_token_seen = False
+        self._turn_completion = None
+        self._terminal_execution_status = None
+        self._terminal_execution_recoverable = False
+        self._finalizing = False
+        self._begin_pending_assistant()
+        self._turn_worker = self.run_worker(
+            self._run_recovery_retry(owner, turn_id),
+            name="agent-recovery-retry",
+            group="agent",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _run_recovery_retry(
+        self,
+        owner: SessionController,
+        turn_id: str,
+    ) -> None:
+        await self._run_agent_turn(lambda: owner.retry_recovery(turn_id, sink=self._handle_event))
+
+    async def _announce_recovery_state(self, *, verbose: bool = False) -> None:
+        owner = self._session_selection_owner()
+        if owner is None:
+            return
+        try:
+            inspections = await owner.inspect_recovery()
+        except Exception:
+            return
+        visible = tuple(
+            inspection
+            for inspection in inspections
+            if verbose or inspection.attempt.resolution is None
+        )
+        if not visible:
+            if verbose:
+                self._write_ui_entry("status", "recovery.none")
+            return
+        for inspection in visible:
+            attempt = inspection.attempt
+            input_state = "exact" if attempt.input_reconstructable else "unavailable"
+            if verbose:
+                self._write_ui_entry(
+                    "system",
+                    "recovery.item",
+                    turn_id=attempt.turn_id,
+                    status=attempt.status.value,
+                    stage=attempt.last_stage.value,
+                    input_state=input_state,
+                    reason=attempt.status_reason,
+                    retry_available=str(attempt.retry_available).lower(),
+                    abandon_available=str(attempt.abandon_available).lower(),
+                )
+                continue
+            if attempt.status is TurnRecoveryStatus.SAFELY_RETRYABLE and attempt.retry_available:
+                self._write_ui_entry(
+                    "recoverable",
+                    "session.recovery.safe",
+                    turn_id=attempt.turn_id,
+                )
+            elif attempt.status is TurnRecoveryStatus.SAFELY_RETRYABLE:
+                self._write_ui_entry(
+                    "recoverable",
+                    "session.recovery.retry_unavailable",
+                    turn_id=attempt.turn_id,
+                )
+            elif attempt.status is TurnRecoveryStatus.INDETERMINATE:
+                self._write_ui_entry(
+                    "recoverable",
+                    "session.recovery.indeterminate",
+                    turn_id=attempt.turn_id,
+                    stage=attempt.last_stage.value,
+                )
+
+    async def _run_context_compaction(self) -> None:
+        if self._turn_worker is not None and self._turn_worker.is_running:
+            self._write_ui_entry("error", "turn.running")
+            return
+        try:
+            result = await self._runner.compact_now()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self._write_ui_entry(
+                "error",
+                "context.compaction_failed",
+                error=self._safe_tool_text(str(error)),
+            )
+            return
+        self._context_used_tokens = estimate_context_tokens(self._runner.items)
+        self._context_usage_estimated = True
+        self._refresh_runtime_bar()
+        self._write_ui_entry(
+            "status",
+            "context.compaction_result",
+            status=result.status.value,
+        )
 
     async def _run_read_only_subagent(self, raw_prompt: str) -> None:
         """Start one explicit, bounded read-only child without parent transcript reuse.
@@ -5662,8 +5866,13 @@ class NeuroCodeApp(App[None]):
         if service is None:
             return
         try:
+            parent_capability_provider = self._subagent_parent_capability_provider
+            if parent_capability_provider is None:
+                raise ConfigurationError("active parent capability metadata is unavailable")
+            parent_capabilities = parent_capability_provider()
             projection = await service.run_subagent(
                 RunSubagentRequest(session_id, prompt),
+                parent_capabilities=parent_capabilities,
             )
         except asyncio.CancelledError:
             self._write_ui_entry("status", "subagent.cancelled")
@@ -6033,7 +6242,7 @@ class NeuroCodeApp(App[None]):
         if result.requested is ReasoningEffort.ULTRACODE:
             self._write_ui_entry(
                 "status",
-                "effort.changed_fallback",
+                "effort.changed_ultracode",
                 requested=result.requested.value,
                 effective=result.effective.value,
             )
@@ -6408,6 +6617,7 @@ class NeuroCodeApp(App[None]):
                 "session.already_open",
                 session_id=result.session_id,
             )
+            await self._announce_recovery_state()
             return
 
         self._queued_interjections.clear()
@@ -6449,6 +6659,7 @@ class NeuroCodeApp(App[None]):
             stopped=self._stopped_task_note(result.stopped_background_tasks),
         )
         self._write_recoverable_resume_notice(self._execution_record)
+        await self._announce_recovery_state()
 
     async def _add_plan_comment(self, arguments: str) -> None:
         controller = self._plan_controller

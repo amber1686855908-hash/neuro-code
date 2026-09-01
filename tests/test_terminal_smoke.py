@@ -109,15 +109,28 @@ def test_production_cli_composes_and_exits_with_the_headless_driver() -> None:
         environment = _smoke_environment(root, state)
         environment["TEXTUAL_DRIVER"] = _HEADLESS_DRIVER
 
-        completed = subprocess.run(
-            [sys.executable, "-m", "neuro_code", "--cwd", str(root)],
-            cwd=_PROJECT_ROOT,
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=15,
-            check=False,
-        )
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-m", "neuro_code", "--cwd", str(root)],
+                cwd=_PROJECT_ROOT,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            stdout = error.stdout or b""
+            stderr = error.stderr or b""
+            if isinstance(stdout, str):
+                stdout = stdout.encode("utf-8", errors="replace")
+            if isinstance(stderr, str):
+                stderr = stderr.encode("utf-8", errors="replace")
+            pytest.fail(
+                "production CLI did not exit within 15 seconds\n"
+                f"stdout:\n{stdout.decode('utf-8', errors='replace')}\n"
+                f"stderr:\n{stderr.decode('utf-8', errors='replace')}"
+            )
 
         output = completed.stdout + completed.stderr
         assert completed.returncode == 0, output.decode("utf-8", errors="replace")

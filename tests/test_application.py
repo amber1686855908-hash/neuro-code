@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from collections.abc import AsyncIterator, Sequence
@@ -25,9 +26,10 @@ from neuro_code.application.ports.model import ModelCapabilitySet, ModelProvider
 from neuro_code.application.ports.sandbox import LocalProcessSandbox
 from neuro_code.application.runtime.supervision import ExecutionControlMode
 from neuro_code.application.sessions import GetSessionSummaryRequest, SessionApplicationService
+from neuro_code.application.sessions.binding import ConversationBindingResourceScope
 from neuro_code.application.sessions.summary import SessionSummaryQueryService
 from neuro_code.application.settings import ApplicationSettings
-from neuro_code.application.workflows import IsolatedSubagentExecutionService
+from neuro_code.application.workflows import IsolatedSubagentExecutionService, SubagentCapabilitySet
 from neuro_code.bootstrap.composition import ApplicationComposition
 from neuro_code.configuration.app import AppConfig, ProviderProfile
 from neuro_code.domain.conversation.context import ModelContext
@@ -158,6 +160,102 @@ context_window_tokens = 65536
 """,
             encoding="utf-8",
         )
+
+    async def test_idle_lsp_service_does_not_delay_composition_close(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            self._write_config(state)
+            with patch.dict(
+                "os.environ",
+                {
+                    "HOME": str(root),
+                    "NEURO_CODE_HOME": str(state),
+                    "FIXTURE_KEY": "fixture-key",
+                },
+                clear=True,
+            ):
+                application = await ApplicationComposition.open(
+                    ApplicationSettings(cwd=root),
+                    provider_factory=lambda config, failover: ApplicationProviderFixture(),
+                )
+                binding = await application.create_binding()
+                self.assertEqual(len(application._lsp_services), 1)
+                manager = next(iter(application._lsp_services))
+                await binding.close()
+                await binding.close()
+                self.assertTrue(manager._closed)
+                self.assertEqual(manager._routes, {})
+                self.assertEqual(application._lsp_services, set())
+                await asyncio.wait_for(application.close(), timeout=1.0)
+                self.assertEqual(application._lsp_services, set())
+
+    async def test_binding_resource_close_is_shared_idempotent_and_cancellation_safe(self) -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        close_calls = 0
+
+        async def close_resources() -> None:
+            nonlocal close_calls
+            close_calls += 1
+            started.set()
+            await release.wait()
+
+        resources = ConversationBindingResourceScope(close_resources)
+        first_close = asyncio.create_task(resources.close())
+        await started.wait()
+        first_close.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await first_close
+        release.set()
+        await resources.close()
+        await resources.close()
+        self.assertEqual(close_calls, 1)
+
+    async def test_capability_bound_child_uses_exact_registry_and_context_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            self._write_config(state)
+            with patch.dict(
+                "os.environ",
+                {
+                    "HOME": str(root),
+                    "NEURO_CODE_HOME": str(state),
+                    "FIXTURE_KEY": "fixture-key",
+                },
+                clear=True,
+            ):
+                application = await ApplicationComposition.open(
+                    ApplicationSettings(cwd=root),
+                    provider_factory=lambda config, failover: ApplicationProviderFixture(),
+                )
+                try:
+                    capabilities = SubagentCapabilitySet.from_runtime(
+                        tool_names=(
+                            "read_file",
+                            "read_files",
+                            "list_dir",
+                            "list_tree",
+                            "glob",
+                            "grep",
+                            "grep_many",
+                            "skill",
+                        ),
+                        cwd=root,
+                        sandbox_profile=SandboxProfile.OFF,
+                        enable_background_tasks=False,
+                        max_steps=3,
+                    )
+                    binding = await application.create_binding(capabilities=capabilities)
+                    self.assertEqual(binding.capabilities, capabilities)
+                    self.assertEqual(
+                        frozenset(binding.runner._runtime._tools.names()),
+                        capabilities.allowed_tool_names,
+                    )
+                    self.assertIsNone(binding.runner._runtime._tool_context.background_tasks)
+                finally:
+                    await application.close()
 
     @staticmethod
     def _write_gemini_web_config(

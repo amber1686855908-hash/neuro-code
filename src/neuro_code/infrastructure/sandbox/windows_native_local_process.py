@@ -97,6 +97,7 @@ _SUPPORTED_PURPOSES = frozenset(
         LocalProcessPurpose.BASH,
         LocalProcessPurpose.BACKGROUND_BASH,
         LocalProcessPurpose.MCP_STDIO,
+        LocalProcessPurpose.LSP_SERVER,
     }
 )
 _SUPPORTED_STDIO = frozenset(
@@ -504,7 +505,9 @@ class WindowsNativeLocalProcessSandbox(LocalProcessSandbox):
         if request.sandbox_profile is not self._profile:
             raise SandboxError("Windows native sandbox profile does not match the session")
         if request.purpose not in _SUPPORTED_PURPOSES:
-            raise SandboxError("Windows W3 supports only BASH, background Bash, and MCP stdio")
+            raise SandboxError(
+                "Windows W3 supports only BASH, background Bash, MCP stdio, and LSP servers"
+            )
         if request.stdio_mode not in _SUPPORTED_STDIO:
             raise SandboxError("Windows W3 does not provide an interactive PTY sandbox")
         if request.stdio_mode is LocalProcessStdioMode.PROTOCOL and request.uses_shell:

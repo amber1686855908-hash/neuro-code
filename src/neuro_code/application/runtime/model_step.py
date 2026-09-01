@@ -69,6 +69,7 @@ class ModelStepProcessor:
         session_id: str | None,
         can_adopt_provider_origin: bool,
         on_imperfect: Callable[[], None],
+        on_output_started: Callable[[str], Awaitable[None]] | None = None,
     ) -> ModelStepResult:
         """Consume one model stream, emitting normalized events as it goes.
 
@@ -81,6 +82,14 @@ class ModelStepProcessor:
         selected_provider: ModelProviderSelected | None = None
         backend_tool_started_at: dict[str, float] = {}
         thinking_completed = False
+        output_started = False
+
+        async def mark_output_started(output_kind: str) -> None:
+            nonlocal output_started
+            if output_started or on_output_started is None:
+                return
+            await on_output_started(output_kind)
+            output_started = True
 
         async def complete_thinking() -> None:
             nonlocal thinking_completed
@@ -104,6 +113,8 @@ class ModelStepProcessor:
                         "model": model_event.model,
                         "error_type": model_event.error_type,
                         "message": model_event.message,
+                        "failure_kind": model_event.failure_kind,
+                        "status_code": model_event.status_code,
                     },
                 )
             elif isinstance(model_event, ModelProviderSelected):
@@ -134,11 +145,13 @@ class ModelStepProcessor:
             elif isinstance(model_event, ModelTextDelta):
                 await complete_thinking()
                 if model_event.text:
+                    await mark_output_started("text")
                     on_imperfect()
                 step_text.append(model_event.text)
                 await emit(AgentEventKind.TEXT_DELTA, {"text": model_event.text})
             elif isinstance(model_event, ModelReasoningDelta):
                 if model_event.text:
+                    await mark_output_started("reasoning")
                     on_imperfect()
                 step_reasoning.append(model_event.text)
                 await emit(
@@ -146,6 +159,7 @@ class ModelStepProcessor:
                     {"text": model_event.text},
                 )
             elif isinstance(model_event, ModelBackendToolStarted):
+                await mark_output_started("backend_tool_started")
                 await complete_thinking()
                 on_imperfect()
                 backend_tool_started_at[model_event.call_id] = monotonic()
@@ -154,6 +168,7 @@ class ModelStepProcessor:
                     {"id": model_event.call_id, "name": model_event.name},
                 )
             elif isinstance(model_event, ModelBackendToolCompleted):
+                await mark_output_started("backend_tool_completed")
                 await complete_thinking()
                 on_imperfect()
                 started_at = backend_tool_started_at.pop(
@@ -169,10 +184,12 @@ class ModelStepProcessor:
                     },
                 )
             elif isinstance(model_event, ModelToolCall):
+                await mark_output_started("tool_call")
                 await complete_thinking()
                 on_imperfect()
                 tool_calls.append(model_event.call)
             elif isinstance(model_event, ModelCompleted):
+                await mark_output_started("completed")
                 await complete_thinking()
                 on_imperfect()
                 completion = model_event

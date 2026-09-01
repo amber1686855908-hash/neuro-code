@@ -4,8 +4,16 @@
 
 from neuro_code.domain.permissions.bash_commands import (
     BashCommandAnalysis,
+    BashCommandFamily,
     BashCommandSegment,
     analyze_bash_command,
+    classify_bash_command_family,
 )
 
-__all__ = ["BashCommandAnalysis", "BashCommandSegment", "analyze_bash_command"]
+__all__ = [
+    "BashCommandAnalysis",
+    "BashCommandFamily",
+    "BashCommandSegment",
+    "analyze_bash_command",
+    "classify_bash_command_family",
+]

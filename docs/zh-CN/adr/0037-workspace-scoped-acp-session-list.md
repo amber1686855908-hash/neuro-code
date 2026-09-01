@@ -42,8 +42,11 @@
 - 无过滤 request 仍保持工作区隔离，cursor token 不泄露内部 ID 或跨工作区元数据。
 - keyset pagination 避免无界 offset，并对未变化行保持确定性。并发 session 更新可能让
   行在分页窗口之间移动；在没有数据库 snapshot 时，这是正常的尽力 cursor 语义。
-- ACP 实现仍是 partial。session resume/delete/fork、非 stdio MCP 传输与非工具 MCP
-  能力、额外目录、多媒体 prompt/历史、客户端文件系统/终端调用、WebSocket 传输和
-  自定义扩展仍不支持。
+- ACP 实现仍是 partial。后续有界切片实现了 session resume/delete/fork、有界且按 profile 门控的
+  额外目录、stdio/Streamable HTTP/legacy SSE MCP server，以及针对 resource/resource-template
+  发现、resource 读取、prompt 发现/获取、sampling/elicitation callback 和动态刷新的私有非工具
+  MCP 投影；也实现了能力门控的客户端文件系统/终端调用、WebSocket 传输和其他私有 extension。
+  二进制多媒体历史回放、ACP-transport MCP server declaration、持久化 MCP 配置、交互式客户端
+  终端 input/resize/PTY framing 与完整一致性仍不支持。
 - ADR 0050 后续实现了 resume/delete/fork，同时保持本 ADR 的工作区范围、持久 alias
   与有界 list 行为。

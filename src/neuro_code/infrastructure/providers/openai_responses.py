@@ -37,13 +37,22 @@ from neuro_code.domain.conversation.messages import (
     ToolCall,
 )
 from neuro_code.domain.tools import ToolDefinition
+from neuro_code.infrastructure.providers.failure_conformance import (
+    ProviderFailureProtocol,
+    classify_provider_failure,
+)
 from neuro_code.infrastructure.providers.image_references import (
     OPENAI_IMAGE_MEDIA_TYPES,
     OPENAI_MAX_INLINE_IMAGE_BYTES,
     InlineImageReference,
     parse_image_reference,
 )
-from neuro_code.shared.errors import ConfigurationError, ProviderError
+from neuro_code.shared.errors import (
+    ConfigurationError,
+    ProviderError,
+    ProviderFailureKind,
+    ProviderFailureOrigin,
+)
 
 _NATIVE_SOURCE_PROVIDERS = frozenset({UPSTREAM_IMPORT_PROVIDER, "xai-responses"})
 _OUTPUT_BACKEND_TYPES = {
@@ -348,6 +357,9 @@ class OpenAIResponsesProvider:
                 assert part.text is not None
                 blocks.append({"type": "input_text", "text": part.text})
                 continue
+            if part.kind is not ContentPartKind.IMAGE:
+                blocks.append({"type": "input_text", "text": part.model_placeholder})
+                continue
             assert part.url is not None
             reference = parse_image_reference(
                 part.url,
@@ -390,7 +402,7 @@ class OpenAIResponsesProvider:
             return items
 
         if not message.tool_call_id:
-            raise ProviderError("Responses API tool results require a tool call id")
+            raise ProviderError.protocol("Responses API tool results require a tool call id")
         output: str | list[dict[str, Any]] = cls._image_content(message)
         return [
             {
@@ -674,19 +686,21 @@ class OpenAIResponsesProvider:
             name = item.get("name")
             raw_arguments = item.get("arguments", "{}")
             if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
-                raise ProviderError("Responses API emitted an incomplete function call")
+                raise ProviderError.protocol("Responses API emitted an incomplete function call")
             if call_id in identifiers:
-                raise ProviderError(f"Responses API emitted duplicate function call id {call_id!r}")
+                raise ProviderError.protocol(
+                    f"Responses API emitted duplicate function call id {call_id!r}"
+                )
             try:
                 arguments = (
                     json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
                 )
             except json.JSONDecodeError as error:
-                raise ProviderError(
+                raise ProviderError.protocol(
                     f"Responses API function call {name!r} contained invalid JSON arguments"
                 ) from error
             if not isinstance(arguments, Mapping):
-                raise ProviderError(
+                raise ProviderError.protocol(
                     f"Responses API function call {name!r} arguments must be a JSON object"
                 )
             identifiers.add(call_id)
@@ -838,7 +852,7 @@ class OpenAIResponsesProvider:
         try:
             import httpx
         except ImportError as error:
-            raise ProviderError(
+            raise ProviderError.local(
                 "httpx is required for live model requests; install the project"
             ) from error
 
@@ -863,8 +877,17 @@ class OpenAIResponsesProvider:
             ):
                 if response.status_code >= 400:
                     detail = self._safe_detail((await response.aread()).decode("utf-8", "replace"))
-                    raise ProviderError(
-                        f"Responses API request failed with HTTP {response.status_code}: {detail}"
+                    raise ProviderError.from_http(
+                        response.status_code,
+                        detail,
+                        headers=response.headers,
+                        failure_kind=classify_provider_failure(
+                            ProviderFailureProtocol.OPENAI_RESPONSES,
+                            detail,
+                        ),
+                        provider=self._provider_name,
+                        model=self._model,
+                        redaction_values=(self._api_key, *self._http_policy.redaction_values),
                     )
                 async for line in response.aiter_lines():
                     if not line.startswith("data:"):
@@ -875,11 +898,17 @@ class OpenAIResponsesProvider:
                     try:
                         event = json.loads(payload)
                     except json.JSONDecodeError as error:
-                        raise ProviderError(
-                            "Responses API returned malformed streaming JSON"
+                        raise ProviderError.protocol(
+                            "Responses API returned malformed streaming JSON",
+                            provider=self._provider_name,
+                            model=self._model,
                         ) from error
                     if not isinstance(event, Mapping):
-                        raise ProviderError("Responses API emitted a non-object streaming event")
+                        raise ProviderError.protocol(
+                            "Responses API emitted a non-object streaming event",
+                            provider=self._provider_name,
+                            model=self._model,
+                        )
                     event_type = event.get("type")
                     backend_transition = self._stream_backend_transition(event)
                     if backend_transition is not None:
@@ -910,28 +939,55 @@ class OpenAIResponsesProvider:
                     elif event_type in {"response.completed", "response.incomplete"}:
                         raw_response = event.get("response")
                         if not isinstance(raw_response, Mapping):
-                            raise ProviderError("Responses API terminal event omitted its response")
+                            raise ProviderError.protocol(
+                                "Responses API terminal event omitted its response",
+                                provider=self._provider_name,
+                                model=self._model,
+                            )
                         terminal = raw_response
                     elif event_type in {"response.failed", "error", "response.error"}:
                         detail = self._safe_detail(self._failure_detail(event))
-                        raise ProviderError(f"Responses API failed: {detail}")
+                        envelope = json.dumps(event, ensure_ascii=False)
+                        raise ProviderError.classified(
+                            classify_provider_failure(
+                                ProviderFailureProtocol.OPENAI_RESPONSES,
+                                envelope,
+                            )
+                            or ProviderFailureKind.UNKNOWN,
+                            f"Responses API failed: {detail}",
+                            provider=self._provider_name,
+                            model=self._model,
+                            origin=ProviderFailureOrigin.PROVIDER,
+                            redaction_values=(self._api_key, *self._http_policy.redaction_values),
+                        )
         except ProviderError:
             raise
         except Exception as error:
-            detail = self._safe_detail(str(error))
-            raise ProviderError(
-                f"Responses API stream failed: {type(error).__name__}: {detail}"
+            raise ProviderError.from_runtime(
+                error,
+                provider=self._provider_name,
+                model=self._model,
+                redaction_values=(self._api_key, *self._http_policy.redaction_values),
+                prefix="Responses API stream failed",
             ) from error
 
         if terminal is None:
-            raise ProviderError("Responses API stream ended without a terminal response")
+            raise ProviderError.protocol(
+                "Responses API stream ended without a terminal response",
+                provider=self._provider_name,
+                model=self._model,
+            )
         if not isinstance(terminal.get("output"), list):
-            raise ProviderError("Responses API terminal response omitted its output items")
+            raise ProviderError.protocol(
+                "Responses API terminal response omitted its output items",
+                provider=self._provider_name,
+                model=self._model,
+            )
         if self._response_observer is not None:
             try:
                 self._response_observer(terminal)
             except Exception as error:
-                raise ProviderError(
+                raise ProviderError.local(
                     f"Responses API response observer failed: {type(error).__name__}"
                 ) from error
         for item in self._response_output(terminal):

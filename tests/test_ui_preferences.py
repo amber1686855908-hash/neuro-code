@@ -68,7 +68,7 @@ class JsonUiPreferencesStoreTests(unittest.IsolatedAsyncioTestCase):
             path = Path(directory) / "state" / "ui-preferences.json"
             store = JsonUiPreferencesStore(path)
 
-            await store.save_reasoning_effort(ReasoningEffort.XHIGH)
+            await store.save_reasoning_effort(ReasoningEffort.MAX)
             await store.save_interaction_mode(InteractionMode.PLAN)
             await store.save_language(UiLanguage.SIMPLIFIED_CHINESE)
 
@@ -79,7 +79,7 @@ class JsonUiPreferencesStoreTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(
                 await restored.load_reasoning_effort(),
-                ReasoningEffort.XHIGH,
+                ReasoningEffort.MAX,
             )
             self.assertEqual(await restored.load_interaction_mode(), InteractionMode.PLAN)
             if os.name == "posix":
