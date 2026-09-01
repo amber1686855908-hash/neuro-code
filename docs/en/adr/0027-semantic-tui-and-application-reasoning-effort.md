@@ -48,10 +48,12 @@ sub-agent workflow is active when only Neuro Code's own review policy exists.
   profile names, and placeholders for free-form arguments. `Tab` applies the
   first candidate only in the main slash-command prompt and does not replace
   modal focus traversal.
-- `ReasoningEffort` defines five provider-neutral choices: `low` (`○`), `medium`
-  (`◐`), `high` (`●`), `xhigh` (`⬤`), and `ultracode` (`⚡`). `high` is the
-  default. They describe increasing application review depth, not a guaranteed
-  hidden-reasoning token budget.
+- `ReasoningEffort` defines six provider-neutral choices: `low` (`○`), `medium`
+  (`◐`), `high` (`●`), `xhigh` (`⬤`), `max` (`◆`), and `ultracode` (`⚡`).
+  `high` is the default. `max` is the deepest ordinary single-agent policy;
+  `ultracode` is the explicit application-level entry for bounded orchestration. These values
+  describe increasing application review depth, not a guaranteed hidden-reasoning
+  token budget.
 - `Ctrl+E`, bare `/effort`, and bare `/reasoning` open the TUI picker;
   `/effort LEVEL` and `/reasoning LEVEL` select directly. `--effort LEVEL`
   works for both interactive and headless composition. Changes are rejected
@@ -70,12 +72,15 @@ sub-agent workflow is active when only Neuro Code's own review policy exists.
   `ModelContext`. The injected guidance is excluded from persisted
   `SessionItem` values.
 - Provider adapters do not blindly turn `ModelContext.reasoning_effort` into a
-  proprietary request field. A native mapping may be added only behind an
-  explicit, tested provider/model capability; no such mapping is implemented in
-  this slice.
-- `ultracode` has requested value `ultracode` and effective policy `xhigh`.
-  The picker, runtime bar, and status message expose that fallback. It does not
-  start sub-agents because workflow orchestration is not implemented.
+  proprietary request field. The explicit Kimi K3 and GLM 5.3/5.2 dialects map
+  `max` to their configured native `max` field; other dialects omit a native
+  effort field and still receive application guidance. Every mapping remains
+  provider/model-specific and testable.
+- `ultracode` has requested value `ultracode` and provider-compatible policy
+  projection `max`. The picker and runtime bar may show that projection, while
+  an explicit user turn enters the durable application delegation service and
+  selects exactly one `MAIN_MAX` or `BOUNDED_SWARM` path. Providers never
+  receive an invented native `ultracode` value. See [ADR 0141](adr/0141-automatic-ultracode-delegation.md).
 
 ## Consequences
 
@@ -95,9 +100,8 @@ cost. The policy instruction adds a small amount of request context and is
 deliberately regenerated rather than persisted.
 
 ADR 0029 subsequently adds bounded in-place tool cards, and ADR 0030 adds
-bounded interactive detail toggling. Mermaid, inline media, provider-native
-effort mapping, and workflow/sub-agent orchestration remain later vertical
-slices.
+bounded interactive detail toggling. Mermaid, inline media, and workflow/sub-agent
+orchestration remain later vertical slices.
 
 ## Compatibility note
 

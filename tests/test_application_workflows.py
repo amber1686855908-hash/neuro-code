@@ -29,12 +29,14 @@ from neuro_code.application.workflows import (
     SubagentExecutor,
     SubagentRunResult,
 )
+from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
 from neuro_code.bootstrap.composition import ApplicationComposition
 from neuro_code.bootstrap.subagent import (
     READ_ONLY_SUBAGENT_TOOL_NAMES,
     CompositionReadOnlySubagentRuntimeFactory,
 )
 from neuro_code.configuration.app import AppConfig, ProviderProfile
+from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.session_tasks import (
     SessionTask,
     SessionTaskKind,
@@ -92,6 +94,7 @@ class IsolatedSubagentStoreFixture(SubagentStoreFixture):
 class IsolatedRuntimeFixture:
     def __init__(self, child_session_id: str = "child-session") -> None:
         self.child_session_id = child_session_id
+        self.capability_fingerprint = "fixture-capability"
         self.result = AgentRunResult(child_session_id, "child result", (), (), (), 1)
         self.error: BaseException | None = None
         self.closed = 0
@@ -115,15 +118,34 @@ class IsolatedRuntimeFixture:
 class IsolatedRuntimeFactoryFixture:
     def __init__(self, runtime: IsolatedRuntimeFixture) -> None:
         self.runtime = runtime
-        self.requests: list[tuple[RunSubagentRequest, str]] = []
+        self.requests: list[tuple[RunSubagentRequest, str, SubagentCapabilitySet]] = []
+
+    def requested_capabilities(
+        self,
+        request: RunSubagentRequest,
+        *,
+        parent_capabilities: SubagentCapabilitySet,
+    ) -> SubagentCapabilitySet:
+        return _subagent_parent_capability(
+            cwd=parent_capabilities.cwd,
+            roots=parent_capabilities.workspace_roots,
+            max_steps=min(request.max_steps, parent_capabilities.max_steps),
+            tools=tuple(
+                name
+                for name in READ_ONLY_SUBAGENT_TOOL_NAMES
+                if name in parent_capabilities.allowed_tool_names
+            ),
+        )
 
     async def create(
         self,
         request: RunSubagentRequest,
         *,
         parent_task_id: str,
+        capabilities: SubagentCapabilitySet,
     ) -> IsolatedSubagentRuntime:
-        self.requests.append((request, parent_task_id))
+        self.requests.append((request, parent_task_id, capabilities))
+        self.runtime.capability_fingerprint = capabilities.fingerprint
         return self.runtime
 
 
@@ -178,10 +200,12 @@ class CompositionSubagentBindingFactoryFixture:
         self.calls.append(kwargs)
         if self.fail:
             raise RuntimeError("child binding failed")
+        capabilities = cast(SubagentCapabilitySet, kwargs["capabilities"])
         return ConversationBinding(
             CompositionSubagentRunnerFixture(),
             self.config.provider,
             self.scope,
+            capabilities,
         )
 
 
@@ -202,6 +226,28 @@ def _subagent_test_config() -> AppConfig:
         default_provider="xai",
         selected_provider="xai",
     )
+
+
+def _subagent_parent_capability(
+    *,
+    cwd: Path = Path("/workspace"),
+    roots: tuple[Path, ...] = (Path("/workspace"),),
+    sandbox_profile: SandboxProfile = SandboxProfile.OFF,
+    max_steps: int = 8,
+    tools: tuple[str, ...] = READ_ONLY_SUBAGENT_TOOL_NAMES,
+) -> SubagentCapabilitySet:
+    return SubagentCapabilitySet.from_runtime(
+        tool_names=tools,
+        cwd=cwd,
+        additional_workspace_roots=roots[1:],
+        sandbox_profile=sandbox_profile,
+        enable_background_tasks=False,
+        max_steps=max_steps,
+    )
+
+
+def _subagent_global_policy() -> SubagentCapabilitySet:
+    return _subagent_parent_capability(max_steps=96)
 
 
 class PlanExecutionControllerFixture:
@@ -283,8 +329,13 @@ class PlanExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsInstance(scheduling_service, PlanSchedulingService)
 
+        with self.assertRaisesRegex(ConfigurationError, "test-only"):
+            composition.bind_subagent_executor(
+                lambda: cast(SubagentExecutor, self.controller),
+            )
         subagent_service = composition.bind_subagent_executor(
-            lambda: cast(SubagentExecutor, self.controller)
+            lambda: cast(SubagentExecutor, self.controller),
+            _test_only=True,
         )
         self.assertIsInstance(subagent_service, SubagentExecutionService)
 
@@ -457,15 +508,20 @@ class IsolatedSubagentExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.store = IsolatedSubagentStoreFixture()
         self.runtime = IsolatedRuntimeFixture()
         self.factory = IsolatedRuntimeFactoryFixture(self.runtime)
+        self.parent_capabilities = _subagent_parent_capability()
+        self.global_policy = _subagent_global_policy()
         self.service = IsolatedSubagentExecutionService(
             cast(SessionStore, self.store),
             cast(IsolatedSubagentRuntimeFactory, self.factory),
+            global_policy=self.global_policy,
+            requested_capability_factory=self.factory.requested_capabilities,
             timeout_seconds=0.05,
         )
 
     async def test_success_persists_child_link_before_completion(self) -> None:
         result = await self.service.run_subagent(
-            RunSubagentRequest("parent-session", "inspect the repository", max_steps=3)
+            RunSubagentRequest("parent-session", "inspect the repository", max_steps=3),
+            parent_capabilities=self.parent_capabilities,
         )
 
         self.assertEqual(len(self.store.created), 1)
@@ -478,6 +534,143 @@ class IsolatedSubagentExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(result.task.status, SessionTaskStatus.COMPLETED)
         self.assertEqual(self.runtime.closed, 1)
         self.assertEqual(self.factory.requests[0][0].max_steps, 3)
+        self.assertLessEqual(self.factory.requests[0][2], self.parent_capabilities)
+
+    async def test_missing_parent_capabilities_fails_before_child_task_creation(self) -> None:
+        with self.assertRaisesRegex(ConfigurationError, "parent subagent capability"):
+            await self.service.run_subagent(
+                RunSubagentRequest("parent-session", "inspect"),
+                parent_capabilities=cast(SubagentCapabilitySet, None),
+            )
+
+        self.assertEqual(self.store.created, [])
+        self.assertEqual(self.factory.requests, [])
+
+    async def test_requested_capability_cannot_restore_parent_workspace(self) -> None:
+        parent = _subagent_parent_capability(
+            cwd=Path("/workspace/project/src"),
+            roots=(Path("/workspace/project/src"),),
+        )
+
+        def request_factory(
+            request: RunSubagentRequest,
+            *,
+            parent_capabilities: SubagentCapabilitySet,
+        ) -> SubagentCapabilitySet:
+            del request, parent_capabilities
+            return _subagent_parent_capability(
+                cwd=Path("/workspace"),
+                roots=(Path("/workspace"),),
+                tools=("read_file",),
+            )
+
+        service = IsolatedSubagentExecutionService(
+            cast(SessionStore, self.store),
+            cast(IsolatedSubagentRuntimeFactory, self.factory),
+            global_policy=self.global_policy,
+            requested_capability_factory=request_factory,
+            timeout_seconds=0.05,
+        )
+        with self.assertRaisesRegex(ConfigurationError, "exceeds parent"):
+            await service.run_subagent(
+                RunSubagentRequest("parent-session", "inspect"),
+                parent_capabilities=parent,
+            )
+
+        self.assertEqual(self.store.created, [])
+        self.assertEqual(self.factory.requests, [])
+
+    async def test_requested_capability_cannot_restore_tools_or_mcp(self) -> None:
+        parent = _subagent_parent_capability(tools=("read_file",))
+
+        def request_factory(
+            request: RunSubagentRequest,
+            *,
+            parent_capabilities: SubagentCapabilitySet,
+        ) -> SubagentCapabilitySet:
+            del request
+            return SubagentCapabilitySet.from_runtime(
+                tool_names=("read_file", "apply_patch", "bash", "mcp_lookup"),
+                cwd=parent_capabilities.cwd,
+                sandbox_profile=parent_capabilities.sandbox_profile,
+                enable_background_tasks=True,
+                max_steps=parent_capabilities.max_steps,
+                mcp_tool_names=("mcp_lookup",),
+                mcp_server_names=("fixture",),
+            )
+
+        service = IsolatedSubagentExecutionService(
+            cast(SessionStore, self.store),
+            cast(IsolatedSubagentRuntimeFactory, self.factory),
+            global_policy=self.global_policy,
+            requested_capability_factory=request_factory,
+            timeout_seconds=0.05,
+        )
+        with self.assertRaisesRegex(ConfigurationError, "exceeds parent"):
+            await service.run_subagent(
+                RunSubagentRequest("parent-session", "inspect"),
+                parent_capabilities=parent,
+            )
+
+        self.assertEqual(self.store.created, [])
+        self.assertEqual(self.factory.requests, [])
+
+    async def test_requested_capability_cannot_downgrade_parent_sandbox(self) -> None:
+        parent = _subagent_parent_capability(sandbox_profile=SandboxProfile.STRICT)
+
+        def request_factory(
+            request: RunSubagentRequest,
+            *,
+            parent_capabilities: SubagentCapabilitySet,
+        ) -> SubagentCapabilitySet:
+            del request, parent_capabilities
+            return _subagent_parent_capability(sandbox_profile=SandboxProfile.OFF)
+
+        service = IsolatedSubagentExecutionService(
+            cast(SessionStore, self.store),
+            cast(IsolatedSubagentRuntimeFactory, self.factory),
+            global_policy=self.global_policy,
+            requested_capability_factory=request_factory,
+            timeout_seconds=0.05,
+        )
+        with self.assertRaisesRegex(ConfigurationError, "exceeds parent"):
+            await service.run_subagent(
+                RunSubagentRequest("parent-session", "inspect"),
+                parent_capabilities=parent,
+            )
+
+        self.assertEqual(self.store.created, [])
+        self.assertEqual(self.factory.requests, [])
+
+    async def test_runtime_fingerprint_mismatch_fails_closed(self) -> None:
+        class MismatchingFactory(IsolatedRuntimeFactoryFixture):
+            async def create(
+                self,
+                request: RunSubagentRequest,
+                *,
+                parent_task_id: str,
+                capabilities: SubagentCapabilitySet,
+            ) -> IsolatedSubagentRuntime:
+                del request, parent_task_id, capabilities
+                return self.runtime
+
+        runtime = IsolatedRuntimeFixture()
+        factory = MismatchingFactory(runtime)
+        service = IsolatedSubagentExecutionService(
+            cast(SessionStore, self.store),
+            cast(IsolatedSubagentRuntimeFactory, factory),
+            global_policy=self.global_policy,
+            requested_capability_factory=factory.requested_capabilities,
+            timeout_seconds=0.05,
+        )
+        with self.assertRaisesRegex(ConfigurationError, "metadata is inconsistent"):
+            await service.run_subagent(
+                RunSubagentRequest("parent-session", "inspect"),
+                parent_capabilities=self.parent_capabilities,
+            )
+
+        self.assertEqual(self.store.updated[0][1].status, SessionTaskStatus.FAILED)
+        self.assertEqual(runtime.closed, 1)
 
     async def test_runtime_failure_is_failed_and_child_link_remains_discoverable(self) -> None:
         error = RuntimeError("child provider failed")
@@ -485,7 +678,8 @@ class IsolatedSubagentExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(RuntimeError, "child provider failed"):
             await self.service.run_subagent(
-                RunSubagentRequest("parent-session", "inspect the repository")
+                RunSubagentRequest("parent-session", "inspect the repository"),
+                parent_capabilities=self.parent_capabilities,
             )
 
         self.assertEqual(len(self.store.links), 1)
@@ -497,7 +691,10 @@ class IsolatedSubagentExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.runtime.result = AgentRunResult("other-child", "child result", (), (), (), 1)
 
         with self.assertRaisesRegex(ConfigurationError, "different child session"):
-            await self.service.run_subagent(RunSubagentRequest("parent-session", "inspect"))
+            await self.service.run_subagent(
+                RunSubagentRequest("parent-session", "inspect"),
+                parent_capabilities=self.parent_capabilities,
+            )
         self.assertIs(self.store.updated[0][1].status, SessionTaskStatus.FAILED)
         self.assertEqual(self.runtime.closed, 1)
 
@@ -511,11 +708,16 @@ class IsolatedSubagentExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         service = IsolatedSubagentExecutionService(
             cast(SessionStore, store),
             cast(IsolatedSubagentRuntimeFactory, self.factory),
+            global_policy=self.global_policy,
+            requested_capability_factory=self.factory.requested_capabilities,
             timeout_seconds=0.05,
         )
 
         with self.assertRaisesRegex(RuntimeError, "link persistence failed"):
-            await service.run_subagent(RunSubagentRequest("parent-session", "inspect"))
+            await service.run_subagent(
+                RunSubagentRequest("parent-session", "inspect"),
+                parent_capabilities=self.parent_capabilities,
+            )
         self.assertEqual(store.deleted, ["child-session"])
         self.assertEqual(self.runtime.closed, 1)
         self.assertIs(store.updated[0][1].status, SessionTaskStatus.FAILED)
@@ -525,7 +727,8 @@ class IsolatedSubagentExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(SubagentTimeoutError):
             await self.service.run_subagent(
-                RunSubagentRequest("parent-session", "inspect the repository")
+                RunSubagentRequest("parent-session", "inspect the repository"),
+                parent_capabilities=self.parent_capabilities,
             )
 
         self.assertEqual(len(self.store.links), 1)
@@ -536,7 +739,8 @@ class IsolatedSubagentExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.runtime.wait_forever = True
         running = asyncio.create_task(
             self.service.run_subagent(
-                RunSubagentRequest("parent-session", "inspect the repository")
+                RunSubagentRequest("parent-session", "inspect the repository"),
+                parent_capabilities=self.parent_capabilities,
             )
         )
         await self.runtime.started.wait()
@@ -553,6 +757,8 @@ class IsolatedSubagentExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
             IsolatedSubagentExecutionService(
                 cast(SessionStore, self.store),
                 cast(IsolatedSubagentRuntimeFactory, self.factory),
+                global_policy=self.global_policy,
+                requested_capability_factory=self.factory.requested_capabilities,
                 timeout_seconds=0,
             )
 
@@ -565,13 +771,32 @@ class IsolatedSubagentExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         class BlockingFactory:
             runtime = IsolatedRuntimeFixture()
 
+            def requested_capabilities(
+                self,
+                request: RunSubagentRequest,
+                *,
+                parent_capabilities: SubagentCapabilitySet,
+            ) -> SubagentCapabilitySet:
+                return _subagent_parent_capability(
+                    cwd=parent_capabilities.cwd,
+                    roots=parent_capabilities.workspace_roots,
+                    max_steps=min(request.max_steps, parent_capabilities.max_steps),
+                    tools=tuple(
+                        name
+                        for name in READ_ONLY_SUBAGENT_TOOL_NAMES
+                        if name in parent_capabilities.allowed_tool_names
+                    ),
+                )
+
             async def create(
                 self,
                 request: RunSubagentRequest,
                 *,
                 parent_task_id: str,
+                capabilities: SubagentCapabilitySet,
             ) -> IsolatedSubagentRuntime:
                 del request, parent_task_id
+                self.runtime.capability_fingerprint = capabilities.fingerprint
                 await release.wait()
                 return self.runtime
 
@@ -579,10 +804,15 @@ class IsolatedSubagentExecutionServiceTests(unittest.IsolatedAsyncioTestCase):
         service = IsolatedSubagentExecutionService(
             cast(SessionStore, self.store),
             cast(IsolatedSubagentRuntimeFactory, factory),
+            global_policy=self.global_policy,
+            requested_capability_factory=factory.requested_capabilities,
             timeout_seconds=0.05,
         )
         running = asyncio.create_task(
-            service.run_subagent(RunSubagentRequest("parent-session", "inspect"))
+            service.run_subagent(
+                RunSubagentRequest("parent-session", "inspect"),
+                parent_capabilities=self.parent_capabilities,
+            )
         )
         await asyncio.sleep(0)
         running.cancel()
@@ -598,9 +828,12 @@ class ReadOnlySubagentApplicationServiceTests(unittest.IsolatedAsyncioTestCase):
         self.store = IsolatedSubagentStoreFixture()
         self.runtime = IsolatedRuntimeFixture()
         self.factory = IsolatedRuntimeFactoryFixture(self.runtime)
+        self.parent_capabilities = _subagent_parent_capability()
         controller = IsolatedSubagentExecutionService(
             cast(SessionStore, self.store),
             cast(IsolatedSubagentRuntimeFactory, self.factory),
+            global_policy=_subagent_global_policy(),
+            requested_capability_factory=self.factory.requested_capabilities,
             timeout_seconds=0.05,
         )
         self.controller = controller
@@ -619,7 +852,8 @@ class ReadOnlySubagentApplicationServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_short_response_is_not_marked_truncated(self) -> None:
         projection = await self.service.run_subagent(
-            RunSubagentRequest("parent-session", "inspect the repository")
+            RunSubagentRequest("parent-session", "inspect the repository"),
+            parent_capabilities=self.parent_capabilities,
         )
 
         self.assertEqual(projection.response, "child result")
@@ -636,7 +870,8 @@ class ReadOnlySubagentApplicationServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         projection = await self.service.run_subagent(
-            RunSubagentRequest("parent-session", "inspect the repository")
+            RunSubagentRequest("parent-session", "inspect the repository"),
+            parent_capabilities=self.parent_capabilities,
         )
 
         self.assertEqual(projection.parent_session_id, "parent-session")
@@ -664,9 +899,10 @@ class ReadOnlySubagentApplicationServiceTests(unittest.IsolatedAsyncioTestCase):
                 self,
                 request: RunSubagentRequest,
                 *,
+                parent_capabilities: SubagentCapabilitySet,
                 sink: EventSink | None = None,
             ) -> SubagentRunResult:
-                del request, sink
+                del request, parent_capabilities, sink
                 return SubagentRunResult(
                     task,
                     AgentRunResult("child-session", "result", (), (), (), 1),
@@ -674,14 +910,18 @@ class ReadOnlySubagentApplicationServiceTests(unittest.IsolatedAsyncioTestCase):
 
         service = ReadOnlySubagentApplicationService(ControllerWithoutLink())
         with self.assertRaisesRegex(ConfigurationError, "parent link"):
-            await service.run_subagent(RunSubagentRequest("parent-session", "inspect"))
+            await service.run_subagent(
+                RunSubagentRequest("parent-session", "inspect"),
+                parent_capabilities=self.parent_capabilities,
+            )
 
     async def test_projection_does_not_convert_child_failure(self) -> None:
         self.runtime.error = RuntimeError("child provider failed")
 
         with self.assertRaisesRegex(RuntimeError, "child provider failed"):
             await self.service.run_subagent(
-                RunSubagentRequest("parent-session", "inspect the repository")
+                RunSubagentRequest("parent-session", "inspect the repository"),
+                parent_capabilities=self.parent_capabilities,
             )
         self.assertIs(self.store.updated[0][1].status, SessionTaskStatus.FAILED)
 
@@ -694,6 +934,7 @@ class CompositionReadOnlySubagentRuntimeFactoryTests(unittest.IsolatedAsyncioTes
         self.factory = CompositionReadOnlySubagentRuntimeFactory(
             cast(ApplicationComposition, self.composition)
         )
+        self.parent_capabilities = _subagent_parent_capability()
 
     def test_composition_exposes_a_safe_result_projection_service(self) -> None:
         composition = object.__new__(ApplicationComposition)
@@ -704,16 +945,26 @@ class CompositionReadOnlySubagentRuntimeFactoryTests(unittest.IsolatedAsyncioTes
         self.assertIsInstance(service, ReadOnlySubagentApplicationService)
 
     async def test_factory_creates_fresh_read_only_binding_and_closes_it(self) -> None:
+        request = RunSubagentRequest("parent-session", "inspect", max_steps=3)
+        capabilities = self.factory.requested_capabilities(
+            request,
+            parent_capabilities=self.parent_capabilities,
+        )
         runtime = await self.factory.create(
-            RunSubagentRequest("parent-session", "inspect", max_steps=3),
+            request,
             parent_task_id="subagent-task",
+            capabilities=capabilities,
         )
 
         self.assertEqual(self.store.created[0][1:3], ("xai", "fixture-model"))
         call = self.composition.calls[0]
         self.assertEqual(call["resume_id"], "child-session")
-        self.assertEqual(call["max_steps"], 3)
-        self.assertEqual(call["allowed_tool_names"], READ_ONLY_SUBAGENT_TOOL_NAMES)
+        binding_capabilities = cast(SubagentCapabilitySet, call["capabilities"])
+        self.assertEqual(binding_capabilities.max_steps, 3)
+        self.assertEqual(
+            binding_capabilities.allowed_tool_names,
+            frozenset(READ_ONLY_SUBAGENT_TOOL_NAMES),
+        )
         self.assertEqual(
             READ_ONLY_SUBAGENT_TOOL_NAMES,
             (
@@ -727,7 +978,7 @@ class CompositionReadOnlySubagentRuntimeFactoryTests(unittest.IsolatedAsyncioTes
                 "skill",
             ),
         )
-        self.assertFalse(call["enable_background_tasks"])
+        self.assertFalse(capabilities.background_tasks)
         selected = cast(AppConfig, call["config"])
         self.assertEqual(selected.provider.builtin_tools, ())
 
@@ -739,12 +990,47 @@ class CompositionReadOnlySubagentRuntimeFactoryTests(unittest.IsolatedAsyncioTes
         with self.assertRaisesRegex(ConfigurationError, "runtime is closed"):
             await runtime.run("inspect")
 
+    async def test_factory_request_intersects_a_restricted_parent_manifest(self) -> None:
+        parent = _subagent_parent_capability(
+            cwd=Path("/workspace/project/src"),
+            roots=(Path("/workspace/project/src"),),
+            tools=("read_file",),
+            max_steps=4,
+        )
+        capabilities = self.factory.requested_capabilities(
+            RunSubagentRequest("parent-session", "inspect", max_steps=8),
+            parent_capabilities=parent,
+        )
+
+        self.assertEqual(capabilities.allowed_tool_names, frozenset({"read_file"}))
+        self.assertEqual(capabilities.cwd, parent.cwd)
+        self.assertEqual(capabilities.workspace_roots, parent.workspace_roots)
+        self.assertEqual(capabilities.max_steps, parent.max_steps)
+        self.assertLessEqual(capabilities, parent)
+
+    async def test_factory_rejects_unsafe_capability_even_before_binding(self) -> None:
+        with self.assertRaisesRegex(ConfigurationError, "unsafe capability"):
+            await self.factory.create(
+                RunSubagentRequest("parent-session", "inspect"),
+                parent_task_id="subagent-task",
+                capabilities=_subagent_parent_capability(
+                    tools=("read_file", "apply_patch"),
+                ),
+            )
+
+        self.assertEqual(self.store.created, [])
+
     async def test_binding_failure_removes_child_session(self) -> None:
         self.composition.fail = True
 
         with self.assertRaisesRegex(RuntimeError, "child binding failed"):
+            request = RunSubagentRequest("parent-session", "inspect")
             await self.factory.create(
-                RunSubagentRequest("parent-session", "inspect"),
+                request,
                 parent_task_id="subagent-task",
+                capabilities=self.factory.requested_capabilities(
+                    request,
+                    parent_capabilities=self.parent_capabilities,
+                ),
             )
         self.assertEqual(self.store.deleted, ["child-session"])

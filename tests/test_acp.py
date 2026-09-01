@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import builtins
+import sys
 import tempfile
 import unittest
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import ModuleType
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -46,27 +49,27 @@ from acp.schema import (
 )
 
 import neuro_code.acp as acp_module
+import neuro_code.interfaces.acp.content as content_module
+import neuro_code.interfaces.acp.mcp_config as mcp_config_module
+import neuro_code.interfaces.acp.updates as updates_module
 from neuro_code.acp import (
+    ACP_CONTEXT_COMPACTION_EXTENSION,
+    ACP_MCP_EXTENSION,
     ACP_READ_ONLY_SUBAGENT_EXTENSION,
     ACP_STDIO_BUFFER_LIMIT_BYTES,
     ACP_SUBAGENT_LIFECYCLE_EXTENSION,
     ACP_TOOL_OUTPUT_ARTIFACT_EXTENSION,
-    MAX_ANNOTATION_AUDIENCE,
-    MAX_EMBEDDED_TEXT_RESOURCE_BYTES,
-    MAX_EMBEDDED_TEXT_RESOURCES,
-    MAX_IMAGE_BLOCKS,
-    MAX_PROMPT_BLOCKS,
-    MAX_PROMPT_BYTES,
-    MAX_RESOURCE_LINKS,
-    MAX_TEXT_BLOCK_BYTES,
-    MAX_TEXT_BLOCKS,
     NeuroCodeAcpAgent,
-    convert_prompt_content,
     serve_acp,
 )
 from neuro_code.application.acp.contracts import (
+    AcpMcpQueryError,
+    AcpMcpToolError,
     AcpSubagentLifecycleQuery,
     AcpSubagentLifecycleQueryError,
+    AcpToolOutputArtifactQuery,
+    AcpToolOutputArtifactQueryError,
+    AcpTurnRecoveryQuery,
 )
 from neuro_code.application.acp.service import AcpApplicationService
 from neuro_code.application.memory.compaction_runtime import (
@@ -75,6 +78,13 @@ from neuro_code.application.memory.compaction_runtime import (
 )
 from neuro_code.application.permissions.contracts import PermissionApproval, PermissionRequest
 from neuro_code.application.ports.approval import PermissionApprover
+from neuro_code.application.ports.mcp import (
+    McpPrompt,
+    McpPromptMessage,
+    McpResource,
+    McpResourceContent,
+    McpResourceTemplate,
+)
 from neuro_code.application.ports.model import ModelProvider
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.tools import ToolOutputArtifact, ToolOutputArtifactRead
@@ -95,7 +105,9 @@ from neuro_code.application.sessions import (
     SubagentRelationshipActionResult,
     SubagentRelationshipLifecycleController,
 )
+from neuro_code.application.sessions.binding import ConversationBindingResourceScope
 from neuro_code.application.sessions.profile_conversation import ConversationBinding
+from neuro_code.application.settings import ApplicationSettings
 from neuro_code.application.tools import (
     ListSessionToolOutputArtifactsRequest,
     ReadSessionToolOutputArtifactRequest,
@@ -107,6 +119,7 @@ from neuro_code.application.workflows import (
     RunSubagentRequest,
     SubagentResultProjection,
 )
+from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
 from neuro_code.bootstrap.composition import ApplicationComposition
 from neuro_code.bootstrap.entrypoints import BootstrapCliServices
 from neuro_code.configuration.app import AppConfig, ProviderProfile
@@ -137,6 +150,18 @@ from neuro_code.domain.session_tasks import SessionTaskStatus
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.domain.tools import ToolDefinition, ToolResult
 from neuro_code.infrastructure.sandbox.local_process import ProcessTreeLocalProcessSandbox
+from neuro_code.interfaces.acp.content import (
+    MAX_ANNOTATION_AUDIENCE,
+    MAX_EMBEDDED_TEXT_RESOURCE_BYTES,
+    MAX_EMBEDDED_TEXT_RESOURCES,
+    MAX_IMAGE_BLOCKS,
+    MAX_PROMPT_BLOCKS,
+    MAX_PROMPT_BYTES,
+    MAX_RESOURCE_LINKS,
+    MAX_TEXT_BLOCK_BYTES,
+    MAX_TEXT_BLOCKS,
+    convert_prompt_content,
+)
 from neuro_code.interfaces.acp.serialization import (
     execution_outcome_metadata,
     execution_outcome_stop_reason,
@@ -336,8 +361,38 @@ class McpToolFixture:
 class McpCollectionFixture:
     def __init__(self, cleanup_events: list[str] | None = None) -> None:
         self.tools = (McpToolFixture(),)
+        self.resources = (
+            McpResource(
+                "fixture",
+                "resource",
+                "fixture://resource",
+                description="safe resource",
+            ),
+        )
+        self.resource_templates = (
+            McpResourceTemplate("fixture", "template", "fixture://resource/{name}"),
+        )
+        self.prompts = (McpPrompt("fixture", "prompt", description="safe prompt"),)
         self.close_calls = 0
         self._cleanup_events = cleanup_events
+
+    async def refresh(self) -> None:
+        return
+
+    async def read_resource(self, uri: str) -> tuple[McpResourceContent, ...]:
+        if uri != "fixture://resource":
+            raise RuntimeError("missing resource")
+        return (McpResourceContent(uri, "text/plain", text="safe resource text"),)
+
+    async def get_prompt(
+        self,
+        name: str,
+        arguments: dict[str, str] | None = None,
+    ) -> tuple[McpPromptMessage, ...]:
+        del arguments
+        if name != "prompt":
+            raise RuntimeError("missing prompt")
+        return (McpPromptMessage("user", {"type": "text", "text": "safe prompt text"}),)
 
     async def close(self) -> None:
         self.close_calls += 1
@@ -368,6 +423,7 @@ class RunnerFixture:
         self._failure = failure
         self._wrap_cancellation = wrap_cancellation
         self._outcome = outcome
+        self.external_tools: tuple[Any, ...] = ()
         self._approver: PermissionApprover | None = None
         self._started = asyncio.Event()
         self._release = asyncio.Event()
@@ -479,6 +535,14 @@ class RunnerFixture:
     def attach_approver(self, approver: PermissionApprover | None) -> None:
         self._approver = approver
 
+    def replace_external_tools(
+        self,
+        tools: Sequence[Any],
+        previous_names: Sequence[str] = (),
+    ) -> None:
+        del previous_names
+        self.external_tools = tuple(tools)
+
     async def wait_started(self) -> None:
         await self._started.wait()
 
@@ -528,7 +592,14 @@ class ReadOnlySubagentServiceFixture:
         self.projection = projection
         self.requests: list[RunSubagentRequest] = []
 
-    async def run_subagent(self, request: RunSubagentRequest) -> SubagentResultProjection:
+    async def run_subagent(
+        self,
+        request: RunSubagentRequest,
+        *,
+        parent_capabilities: SubagentCapabilitySet,
+    ) -> SubagentResultProjection:
+        if not isinstance(parent_capabilities, SubagentCapabilitySet):
+            raise AssertionError("fixture parent capability is missing")
         self.requests.append(request)
         return self.projection
 
@@ -589,6 +660,13 @@ class ApplicationFixture:
         self.artifact_service: SessionToolOutputArtifactApplicationService | None = None
         self.subagent_service: ReadOnlySubagentServiceFixture | None = None
         self.subagent_lifecycle_service: SubagentRelationshipLifecycleController | None = None
+        self.parent_capabilities = SubagentCapabilitySet.from_runtime(
+            tool_names=("read_file",),
+            cwd=self.config.cwd,
+            sandbox_profile=self.config.sandbox_profile,
+            enable_background_tasks=False,
+            max_steps=8,
+        )
 
     async def config_for_session_resume(self, session_id: str) -> AppConfig:
         del session_id
@@ -644,6 +722,7 @@ class ApplicationFixture:
             runner,
             cast(ModelProvider, ProviderFixture()),
             cast(Any, background),
+            self.parent_capabilities,
         )
 
 
@@ -896,6 +975,16 @@ async def initialized_subagent_agent(
     client = AcpClientFixture()
     agent.on_connect(cast(Client, client))
     await agent.initialize(1, ClientCapabilities(terminal=True))
+    application._runners.append(RunnerFixture(session_id="subagent-internal"))
+    binding = await application.create_binding(resume_id="subagent-internal")
+    agent._sessions["acp-subagent"] = acp_module._AcpSession(
+        session_id="acp-subagent",
+        binding=binding,
+        approvals=cast(Any, object()),
+        context_window_tokens=None,
+        mcp_tools=None,
+        internal_session_id="subagent-internal",
+    )
     return agent, application, subagent_service
 
 
@@ -936,6 +1025,83 @@ def _acp_service(application: ApplicationFixture) -> AcpApplicationService:
 
 
 class PromptContentTests(unittest.TestCase):
+    def test_acp_artifact_and_lifecycle_value_objects_reject_invalid_fields(self) -> None:
+        mcp_error = AcpMcpToolError("bounded_failure")
+        self.assertEqual(mcp_error.reason, "bounded_failure")
+        with self.assertRaises(AcpSubagentLifecycleQueryError):
+            AcpSubagentLifecycleQuery("", "task-1", SubagentRelationshipAction.RESUME)
+        with self.assertRaises(AcpSubagentLifecycleQueryError):
+            AcpSubagentLifecycleQuery("session-1", "task-1", "resume")  # type: ignore[arg-type]
+        with self.assertRaises(AcpToolOutputArtifactQueryError):
+            AcpToolOutputArtifactQuery("")
+        with self.assertRaises(AcpToolOutputArtifactQueryError):
+            AcpToolOutputArtifactQuery("session-1", limit=0)
+        with self.assertRaises(AcpToolOutputArtifactQueryError):
+            AcpToolOutputArtifactQuery("session-1", max_bytes=0)
+
+    def test_acp_turn_recovery_query_is_strict_and_typed(self) -> None:
+        inspect_query = AcpTurnRecoveryQuery.from_payload({"sessionId": "acp-session"})
+        self.assertEqual(inspect_query.operation, "inspect")
+        self.assertIsNone(inspect_query.turn_id)
+
+        abandon_query = AcpTurnRecoveryQuery.from_payload(
+            {
+                "sessionId": "acp-session",
+                "operation": "abandon",
+                "turnId": "turn-1",
+                "reason": "operator decision",
+            }
+        )
+        self.assertEqual(abandon_query.operation, "abandon")
+        self.assertEqual(abandon_query.turn_id, "turn-1")
+        retry_query = AcpTurnRecoveryQuery.from_payload(
+            {"sessionId": "acp-session", "operation": "retry", "turnId": "turn-1"}
+        )
+        self.assertEqual(retry_query.operation, "retry")
+
+        invalid_payloads = (
+            {},
+            {"sessionId": ""},
+            None,
+            {"sessionId": "acp-session", "extra": True},
+            {"sessionId": "acp-session", "operation": 1},
+            {"sessionId": "acp-session", "turnId": 1},
+            {"sessionId": "acp-session", "reason": 1},
+            {"sessionId": "acp-session", "operation": "unsupported"},
+            {"sessionId": "acp-session", "operation": "abandon"},
+            {
+                "sessionId": "acp-session",
+                "operation": "inspect",
+                "turnId": "turn-1",
+            },
+            {
+                "sessionId": "acp-session",
+                "operation": "abandon",
+                "turnId": "",
+            },
+            {
+                "sessionId": "acp-session",
+                "operation": "abandon",
+                "turnId": "turn-1",
+                "reason": "",
+            },
+            {
+                "sessionId": "acp-session",
+                "operation": "abandon",
+                "turnId": "turn-1",
+                "reason": "\x00bad",
+            },
+            {
+                "sessionId": "acp-session",
+                "operation": "abandon",
+                "turnId": "turn-1",
+                "reason": "x" * 513,
+            },
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload), self.assertRaises(AcpMcpQueryError):
+                AcpTurnRecoveryQuery.from_payload(payload)
+
     def test_acp_subagent_lifecycle_query_is_strict_and_typed(self) -> None:
         query = AcpSubagentLifecycleQuery.from_payload(
             {
@@ -1185,7 +1351,6 @@ class PromptContentTests(unittest.TestCase):
             ),
         )
         cases = (
-            (blob, "embedded_resource_blob_unsupported"),
             (
                 EmbeddedResourceContentBlock(
                     type="resource",
@@ -1211,6 +1376,8 @@ class PromptContentTests(unittest.TestCase):
                 "embedded_resource_text_too_large",
             ),
         )
+        converted_blob = convert_prompt_content([blob])
+        self.assertEqual(converted_blob.content_parts[0].kind.value, "blob")
         for resource, reason in cases:
             with self.subTest(reason=reason), self.assertRaises(RequestError) as error:
                 convert_prompt_content([resource])
@@ -1225,8 +1392,8 @@ class PromptContentTests(unittest.TestCase):
         self.assertEqual(count_error.exception.data["reason"], "too_many_embedded_text_resources")
 
         with (
-            patch.object(acp_module, "MAX_EMBEDDED_TEXT_RESOURCE_BYTES", 4),
-            patch.object(acp_module, "MAX_EMBEDDED_TEXT_TOTAL_BYTES", 3),
+            patch.object(content_module, "MAX_EMBEDDED_TEXT_RESOURCE_BYTES", 4),
+            patch.object(content_module, "MAX_EMBEDDED_TEXT_TOTAL_BYTES", 3),
             self.assertRaises(RequestError) as total_size_error,
         ):
             small = EmbeddedResourceContentBlock(
@@ -1239,18 +1406,17 @@ class PromptContentTests(unittest.TestCase):
             "embedded_text_resources_too_large",
         )
 
-    def test_unsupported_and_oversized_content_is_rejected(self) -> None:
+    def test_audio_is_preserved_and_invalid_audio_is_rejected(self) -> None:
+        converted = convert_prompt_content(
+            [AudioContentBlock(type="audio", data="AA==", mime_type="audio/wav")]
+        )
+        self.assertEqual(converted.content_parts[0].kind.value, "audio")
+
         with self.assertRaises(RequestError) as audio_error:
             convert_prompt_content(
-                [
-                    AudioContentBlock(
-                        type="audio",
-                        data="AA==",
-                        mime_type="audio/wav",
-                    )
-                ]
+                [AudioContentBlock(type="audio", data="not-base64", mime_type="audio/wav")]
             )
-        self.assertEqual(audio_error.exception.data["reason"], "unsupported_prompt_content")
+        self.assertEqual(audio_error.exception.data["reason"], "audio_data_invalid")
 
         with self.assertRaises(RequestError) as text_error:
             convert_prompt_content(
@@ -1445,7 +1611,7 @@ class PromptContentTests(unittest.TestCase):
             )
         self.assertEqual(empty_data_error.exception.data["reason"], "image_block_too_large")
 
-        with patch.object(acp_module, "MAX_IMAGE_BLOCK_BYTES", 1):
+        with patch.object(content_module, "MAX_IMAGE_BLOCK_BYTES", 1):
             oversized = ImageContentBlock(
                 type="image",
                 data=base64.b64encode(b"ab").decode("ascii"),
@@ -1456,8 +1622,8 @@ class PromptContentTests(unittest.TestCase):
         self.assertEqual(size_error.exception.data["reason"], "image_block_too_large")
 
         with (
-            patch.object(acp_module, "MAX_IMAGE_BLOCK_BYTES", 4),
-            patch.object(acp_module, "MAX_IMAGE_TOTAL_BYTES", 3),
+            patch.object(content_module, "MAX_IMAGE_BLOCK_BYTES", 4),
+            patch.object(content_module, "MAX_IMAGE_TOTAL_BYTES", 3),
             self.assertRaises(RequestError) as total_size_error,
         ):
             small_image = ImageContentBlock(
@@ -1692,7 +1858,7 @@ class McpConfigurationTests(unittest.TestCase):
             with self.subTest(reason=reason):
                 self._assert_reason(servers, reason, protected=protected)
 
-        with patch.object(acp_module, "MAX_MCP_CONFIGURATION_BYTES", 1):
+        with patch.object(mcp_config_module, "MAX_MCP_CONFIGURATION_BYTES", 1):
             self._assert_reason(
                 [self._server()],
                 "mcp_configuration_too_large",
@@ -1700,6 +1866,226 @@ class McpConfigurationTests(unittest.TestCase):
 
 
 class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_websocket_server_validates_host_and_port_before_binding(self) -> None:
+        for kwargs, reason in (
+            ({"host": ""}, "host"),
+            ({"host": "fixture\x00"}, "host"),
+            ({"port": -1}, "port"),
+            ({"port": 65_536}, "port"),
+            ({"port": True}, "port"),
+        ):
+            with (
+                self.subTest(reason=reason, kwargs=kwargs),
+                self.assertRaisesRegex(ConfigurationError, reason),
+            ):
+                await acp_module.serve_acp_websocket(cast(Any, object()), **kwargs)
+
+        original_import = builtins.__import__
+
+        def reject_websockets(name: str, *args: Any, **kwargs: Any) -> Any:
+            if name == "websockets.asyncio.server":
+                raise ImportError("fixture dependency missing")
+            return original_import(name, *args, **kwargs)
+
+        with (
+            patch("builtins.__import__", side_effect=reject_websockets),
+            self.assertRaisesRegex(ConfigurationError, "requires the websockets dependency"),
+        ):
+            await acp_module.serve_acp_websocket(cast(Any, object()))
+
+    async def test_private_compaction_command_projects_safe_result_and_maps_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = RunnerFixture()
+            agent, _, _ = await initialized_agent(Path(directory), [runner])
+            session = await agent.new_session(directory)
+            active = agent._sessions[session.session_id]
+            assert active.binding is not None
+            active.binding.runner.compact_now = AsyncMock(
+                return_value=ContextCompactionCommandResult(
+                    status=ContextCompactionCommandStatus.NOT_NEEDED,
+                    triggered=False,
+                )
+            )
+            result = await agent.ext_method(
+                ACP_CONTEXT_COMPACTION_EXTENSION,
+                {"sessionId": session.session_id},
+            )
+            self.assertEqual(result, {"status": "not_needed", "triggered": False})
+            active.binding.runner.compact_now.return_value = ContextCompactionCommandResult(
+                status=ContextCompactionCommandStatus.BUDGET_LIMITED,
+                triggered=False,
+                outcome=AgentExecutionOutcome(
+                    AgentExecutionStatus.BUDGET_LIMITED,
+                    SupervisorReasonCode.WALL_TIME_BUDGET,
+                    finalized=False,
+                    recoverable=True,
+                ),
+            )
+            limited = await agent.ext_method(
+                ACP_CONTEXT_COMPACTION_EXTENSION,
+                {"sessionId": session.session_id},
+            )
+            self.assertEqual(limited["outcome"]["reason_code"], "wall_time_budget")
+
+            for failure, reason in (
+                (ProviderError("provider"), "provider_failure"),
+                (ConfigurationError("unavailable"), "compaction_unavailable"),
+                (RuntimeError("unexpected"), "compaction_failed"),
+            ):
+                with self.subTest(reason=reason):
+                    active.binding.runner.compact_now.side_effect = failure
+                    with self.assertRaises(RequestError) as error:
+                        await agent.ext_method(
+                            ACP_CONTEXT_COMPACTION_EXTENSION,
+                            {"sessionId": session.session_id},
+                        )
+                    self.assertEqual(error.exception.data["reason"], reason)
+                    active.binding.runner.compact_now.side_effect = None
+            await agent.shutdown()
+
+    async def test_private_mcp_extension_lists_reads_prompts_and_refreshes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent, _, _ = await initialized_agent(Path(directory), [RunnerFixture()])
+            collection = McpCollectionFixture()
+            with patch.object(
+                agent,
+                "_open_mcp_tools",
+                new=AsyncMock(return_value=collection),
+            ) as open_mcp:
+                session = await agent.new_session(
+                    directory,
+                    mcp_servers=[
+                        McpServerStdio(name="fixture", command="fixture", args=[], env=[])
+                    ],
+                )
+                listed = await agent.ext_method(
+                    ACP_MCP_EXTENSION,
+                    {"sessionId": session.session_id, "operation": "list"},
+                )
+                read = await agent.ext_method(
+                    ACP_MCP_EXTENSION,
+                    {
+                        "sessionId": session.session_id,
+                        "operation": "read_resource",
+                        "uri": "fixture://resource",
+                    },
+                )
+                prompt = await agent.ext_method(
+                    ACP_MCP_EXTENSION,
+                    {
+                        "sessionId": session.session_id,
+                        "operation": "get_prompt",
+                        "name": "prompt",
+                        "arguments": {"topic": "testing"},
+                    },
+                )
+                refreshed = await agent.ext_method(
+                    ACP_MCP_EXTENSION,
+                    {"sessionId": session.session_id, "operation": "refresh"},
+                )
+            await agent.shutdown()
+
+        self.assertEqual(open_mcp.await_count, 1)
+        self.assertEqual(listed["toolCount"], 1)
+        self.assertEqual(listed["resources"][0]["uri"], "fixture://resource")
+        self.assertEqual(read["contents"][0]["text"], "safe resource text")
+        self.assertEqual(prompt["messages"][0]["content"]["text"], "safe prompt text")
+        self.assertTrue(refreshed["refreshed"])
+
+    async def test_mcp_sampling_and_elicitation_callbacks_use_bounded_private_methods(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent, _, client = await initialized_agent(Path(directory), [])
+            client.ext_method = AsyncMock(
+                side_effect=[
+                    {"role": "assistant", "content": {"type": "text", "text": "sampled"}},
+                    {"action": "accept", "content": {"answer": "yes"}},
+                ]
+            )
+            sampled = await agent._mcp_sampling_handler(
+                ({"role": "user", "content": {"type": "text", "text": "hello"}},),
+                system_prompt="system",
+                max_tokens=64,
+            )
+            elicited = await agent._mcp_elicitation_handler(
+                "Choose one",
+                {"type": "object"},
+                url="https://example.invalid/form",
+            )
+
+        self.assertEqual(sampled["content"]["text"], "sampled")
+        self.assertEqual(elicited["action"], "accept")
+        self.assertEqual(client.ext_method.await_args_list[0].args[0], "neuro-code/mcp/sampling")
+        self.assertEqual(client.ext_method.await_args_list[1].args[0], "neuro-code/mcp/elicitation")
+
+    async def test_websocket_writer_batches_and_rejects_writes_after_close(self) -> None:
+        class WebSocket:
+            def __init__(self) -> None:
+                self.messages: list[bytes] = []
+
+            async def send(self, value: bytes) -> None:
+                self.messages.append(value)
+
+        websocket = WebSocket()
+        writer = acp_module._WebSocketWriter(websocket)
+        writer.write(b"first")
+        writer.write(b" second")
+        await writer.drain()
+        self.assertEqual(websocket.messages, [b"first second"])
+        writer.close()
+        self.assertTrue(writer.is_closing())
+        with self.assertRaises(ConnectionError):
+            writer.write(b"closed")
+
+    async def test_websocket_server_runs_and_closes_a_connection(self) -> None:
+        class StopServer(Exception):
+            pass
+
+        class WebSocket:
+            def __aiter__(self) -> WebSocket:
+                return self
+
+            async def __anext__(self) -> str:
+                raise StopAsyncIteration
+
+            async def send(self, _value: bytes) -> None:
+                return
+
+        class ServerContext:
+            def __init__(self, handler: Any) -> None:
+                self._handler = handler
+
+            async def __aenter__(self) -> ServerContext:
+                await self._handler(WebSocket())
+                raise StopServer
+
+            async def __aexit__(self, *_args: Any) -> bool:
+                return False
+
+        calls: list[tuple[str, int, dict[str, Any]]] = []
+
+        def fake_serve(handler: Any, host: str, port: int, **kwargs: Any) -> ServerContext:
+            calls.append((host, port, kwargs))
+            return ServerContext(handler)
+
+        fake_server = ModuleType("websockets.asyncio.server")
+        fake_server.__dict__["serve"] = fake_serve
+        with (
+            patch.dict(sys.modules, {"websockets.asyncio.server": fake_server}),
+            self.assertRaises(StopServer),
+        ):
+            await acp_module.serve_acp_websocket(cast(Any, object()), port=8765)
+
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "127.0.0.1",
+                    8765,
+                    {"max_size": ACP_STDIO_BUFFER_LIMIT_BYTES, "max_queue": 16},
+                )
+            ],
+        )
+
     async def test_private_subagent_lifecycle_extension_maps_external_ids_and_actions(
         self,
     ) -> None:
@@ -2077,6 +2463,54 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.stop_reason, "end_turn")
         self.assertEqual(application.session_service.bound_runners, [runner])
 
+    async def test_acp_closes_production_binding_resource_scope_and_lsp(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            state.mkdir()
+            (state / "config.toml").write_text(
+                """
+[routing]
+default = "fixture"
+
+[providers.fixture]
+protocol = "openai-chat"
+model = "fixture-model"
+base_url = "https://provider.invalid/v1"
+api_key_env = "FIXTURE_KEY"
+context_window_tokens = 131072
+""",
+                encoding="utf-8",
+            )
+            with patch.dict(
+                "os.environ",
+                {
+                    "HOME": str(root),
+                    "NEURO_CODE_HOME": str(state),
+                    "FIXTURE_KEY": "fixture-key",
+                },
+                clear=True,
+            ):
+                application = await ApplicationComposition.open(
+                    ApplicationSettings(cwd=root),
+                    provider_factory=lambda config, failover: ProviderFixture(),
+                )
+                try:
+                    service = BootstrapCliServices().create_acp_service(application)
+                    agent = NeuroCodeAcpAgent(service)
+                    agent.on_connect(cast(Client, AcpClientFixture()))
+                    await agent.initialize(1)
+                    created = await agent.new_session(str(root))
+
+                    self.assertEqual(len(application._lsp_services), 1)
+                    manager = next(iter(application._lsp_services))
+                    await agent.close_session(created.session_id)
+
+                    self.assertTrue(manager._closed)
+                    self.assertEqual(application._lsp_services, set())
+                finally:
+                    await application.close()
+
     async def test_initialize_declares_session_lifecycle_and_saves_client_details(
         self,
     ) -> None:
@@ -2103,6 +2537,11 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
             ),
             {
                 "loadSession": True,
+                "promptCapabilities": {
+                    "image": True,
+                    "audio": True,
+                    "embeddedContext": True,
+                },
                 "mcpCapabilities": {"http": True, "sse": True},
                 "sessionCapabilities": {
                     "list": {},
@@ -2582,6 +3021,9 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
                 mcp_servers=[],
             )
             acp_id = created.session_id
+            active = agent._sessions[acp_id]
+            self.assertIs(type(active), acp_module._AcpSession)
+            self.assertEqual(type(active).__module__, "neuro_code.interfaces.acp.session")
             response = await agent.prompt(
                 acp_id,
                 [TextContentBlock(type="text", text="hello")],
@@ -2793,6 +3235,61 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(error.exception.data["reason"], "connection_closing")
         self.assertEqual(cleanup_events, ["binding", "mcp"])
+
+    async def test_session_cleanup_closes_binding_mcp_and_terminal_exactly_once(self) -> None:
+        class CountingTerminal:
+            def __init__(self) -> None:
+                self.shutdown_calls = 0
+
+            async def shutdown(self) -> None:
+                self.shutdown_calls += 1
+
+        cleanup_events: list[str] = []
+        collection = McpCollectionFixture(cleanup_events)
+        server = McpServerStdio(name="fixture", command="fixture-command", args=[], env=[])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent, application, _ = await initialized_agent(root, [RunnerFixture()])
+            application.cleanup_events = cleanup_events
+            terminal = CountingTerminal()
+            binding_close_calls = 0
+            original_create_binding = application.create_binding
+
+            async def create_binding_with_scope(**kwargs: Any) -> ConversationBinding:
+                nonlocal binding_close_calls
+                created_binding = await original_create_binding(**kwargs)
+                background = created_binding.background_tasks
+                assert background is not None
+
+                async def close_binding_resources() -> None:
+                    nonlocal binding_close_calls
+                    binding_close_calls += 1
+                    await background.shutdown()
+
+                return replace(
+                    created_binding,
+                    resource_scope=ConversationBindingResourceScope(close_binding_resources),
+                )
+
+            with (
+                patch(
+                    "neuro_code.bootstrap.entrypoints.McpStdioToolCollection.open",
+                    new=AsyncMock(return_value=collection),
+                ),
+                patch.object(agent, "_client_terminal", return_value=cast(Any, terminal)),
+                patch.object(application, "create_binding", new=create_binding_with_scope),
+            ):
+                created = await agent.new_session(str(root), mcp_servers=[server])
+                active = agent._sessions[created.session_id]
+
+                await agent._cleanup_session(active)
+                await agent._cleanup_session(active)
+
+        self.assertEqual(binding_close_calls, 1)
+        self.assertEqual(collection.close_calls, 1)
+        self.assertEqual(terminal.shutdown_calls, 1)
+        self.assertEqual(application.background_scopes[0].shutdown_calls, 1)
+        self.assertEqual(cleanup_events, ["mcp", "binding"])
 
     async def test_cancel_keeps_session_mcp_context_until_explicit_close(self) -> None:
         collection = McpCollectionFixture()
@@ -3318,6 +3815,136 @@ class AcpAgentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(mismatch.exception.data["reason"], "session_identity_mismatch")
             self.assertEqual(application.store.deleted_session_ids, ["forked-1"])
             self.assertEqual(application.background_scopes[0].shutdown_calls, 1)
+
+    def test_canonical_history_projection_preserves_order_and_pending_closure(self) -> None:
+        history = (
+            Message(Role.USER, "question"),
+            Message(
+                Role.ASSISTANT,
+                "answer",
+                tool_calls=(
+                    ToolCall("read-call", "read_file", {"path": "safe.txt"}),
+                    ToolCall("pending-call", "bash", {"command": "pwd"}),
+                ),
+            ),
+            Message(
+                Role.TOOL,
+                "token=secret-value",
+                name="read_file",
+                tool_call_id="read-call",
+            ),
+            Message(Role.TOOL, "orphan output", name="grep", tool_call_id="orphan-call"),
+        )
+
+        projected = updates_module._history_updates(
+            history,
+            explicit_redactions=("secret-value",),
+        )
+
+        self.assertEqual(
+            [update.session_update for update in projected],
+            [
+                "user_message_chunk",
+                "agent_message_chunk",
+                "tool_call",
+                "tool_call",
+                "tool_call_update",
+                "tool_call",
+                "tool_call_update",
+                "tool_call_update",
+            ],
+        )
+        self.assertEqual(
+            [
+                update.status
+                for update in projected
+                if isinstance(update, (ToolCallStart, ToolCallProgress))
+            ],
+            ["pending", "pending", "completed", "pending", "completed", "failed"],
+        )
+        self.assertEqual(projected[2].locations[0].path, "safe.txt")
+        self.assertNotIn("secret-value", repr(projected))
+        self.assertEqual(projected[3].tool_call_id, "pending-call")
+        self.assertEqual(projected[5].tool_call_id, "orphan-call")
+        self.assertEqual(projected[6].tool_call_id, "orphan-call")
+
+    async def test_canonical_event_mapper_preserves_projection_sequence(self) -> None:
+        client = AcpClientFixture()
+        started_session_ids: list[str] = []
+
+        async def on_session_started(session_id: str) -> None:
+            started_session_ids.append(session_id)
+
+        mapper = updates_module._AcpEventMapper(
+            client=cast(Client, client),
+            session_id="external-session",
+            context_window_tokens=100,
+            explicit_redactions=("secret-value",),
+            on_session_started=on_session_started,
+        )
+        events = (
+            AgentEvent.create(
+                1,
+                AgentEventKind.SESSION_STARTED,
+                {"session_id": "internal-session"},
+            ),
+            AgentEvent.create(2, AgentEventKind.TEXT_DELTA, {"text": "one"}),
+            AgentEvent.create(3, AgentEventKind.TOOL_STARTED, {"id": "implicit", "name": "grep"}),
+            AgentEvent.create(
+                4,
+                AgentEventKind.TOOL_COMPLETED,
+                {"id": "implicit", "name": "grep", "content": "token=secret-value"},
+            ),
+            AgentEvent.create(
+                5,
+                AgentEventKind.CONTEXT_USAGE_UPDATED,
+                {"used_tokens": 12},
+            ),
+            AgentEvent.create(6, AgentEventKind.TEXT_DELTA, {"text": "two"}),
+            AgentEvent.create(7, AgentEventKind.TURN_COMPLETED, {"stop_reason": "length"}),
+        )
+        for event in events:
+            await mapper(event)
+
+        projected = [update for _, update in client.updates]
+        self.assertEqual(started_session_ids, ["internal-session"])
+        self.assertEqual(
+            [update.session_update for update in projected],
+            [
+                "agent_message_chunk",
+                "tool_call",
+                "tool_call_update",
+                "tool_call_update",
+                "usage_update",
+                "agent_message_chunk",
+            ],
+        )
+        chunks = [update for update in projected if isinstance(update, AgentMessageChunk)]
+        self.assertEqual([chunk.content.text for chunk in chunks], ["one", "two"])
+        self.assertEqual(len({chunk.message_id for chunk in chunks}), 1)
+        self.assertEqual(
+            [
+                update.status
+                for update in projected
+                if isinstance(update, (ToolCallStart, ToolCallProgress))
+            ],
+            ["pending", "in_progress", "completed"],
+        )
+        self.assertNotIn("secret-value", repr(projected))
+        self.assertEqual(mapper.stop_reason, "max_tokens")
+
+        permission = mapper.permission_tool_call(
+            PermissionRequest(
+                "permission-call",
+                "bash",
+                "Run shell command",
+                "secret-value",
+                "scope",
+            )
+        )
+        self.assertEqual(permission.status, "pending")
+        self.assertEqual(permission.kind, "execute")
+        self.assertNotIn("secret-value", repr(permission))
 
     async def test_event_mapping_has_stable_message_id_and_bounded_tool_fields(self) -> None:
         events = (

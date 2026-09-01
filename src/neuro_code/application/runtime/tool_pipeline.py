@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import os
+import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -34,9 +35,20 @@ from neuro_code.application.permissions.policy import (
     PermissionEffect,
     PermissionManager,
 )
+from neuro_code.application.permissions.scopes import PermissionScopeContext
 from neuro_code.application.ports.approval import PermissionApprover
+from neuro_code.application.ports.result_adoption import (
+    WorkspaceMutationRequest,
+    WorkspaceMutationResult,
+)
 from neuro_code.application.ports.storage import SessionStore
-from neuro_code.application.ports.tools import Tool, ToolCollection, ToolContext
+from neuro_code.application.ports.tool_pipeline import ToolPipelineHook
+from neuro_code.application.ports.tools import (
+    FilesystemTargetProvider,
+    Tool,
+    ToolCollection,
+    ToolContext,
+)
 from neuro_code.application.ports.web_search import HostedWebSearchEvent
 from neuro_code.application.ports.workspace_changes import (
     WorkspaceChangeCheckpoint,
@@ -55,7 +67,7 @@ from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
 from neuro_code.domain.conversation.messages import Message, Role, SessionItem, ToolCall
 from neuro_code.domain.execution import ProgressKind
 from neuro_code.domain.plans import SessionPlan
-from neuro_code.domain.tools import ToolResult
+from neuro_code.domain.tools import ToolExecutionResult, ToolResult
 from neuro_code.shared.async_utils import run_blocking
 from neuro_code.shared.errors import ToolError
 from neuro_code.shared.redaction import redact_sensitive_arguments, redact_sensitive_text
@@ -233,13 +245,16 @@ class ToolExecutor:
 
     __slots__ = (
         "_approver",
+        "_binding_scope_identity",
         "_context_builder",
+        "_hooks",
         "_observation_builder",
         "_permissions",
         "_session_store",
         "_tool_context",
         "_tools",
         "_workspace_change_observer",
+        "_workspace_mutation_tool",
     )
 
     def __init__(
@@ -252,15 +267,105 @@ class ToolExecutor:
         session_store: SessionStore | None,
         workspace_change_observer: WorkspaceChangeObserver,
         context_builder: ContextBuilder,
+        hooks: Sequence[ToolPipelineHook] = (),
+        workspace_mutation_tool: Tool | None = None,
     ) -> None:
         self._tools = tools
         self._permissions = permissions
         self._approver = approver
+        self._binding_scope_identity = uuid.uuid4().hex
         self._tool_context = tool_context
         self._session_store = session_store
+        self._hooks = tuple(hooks)
         self._workspace_change_observer = workspace_change_observer
+        self._workspace_mutation_tool = workspace_mutation_tool
         self._context_builder = context_builder
         self._observation_builder = ToolObservationBuilder(tool_context.redaction_values)
+
+    async def apply(
+        self,
+        request: WorkspaceMutationRequest,
+        *,
+        session_id: str,
+    ) -> WorkspaceMutationResult:
+        """Apply one internal exact mutation through the normal write boundary.
+
+        This is an application port, not a model tool call: it deliberately
+        emits no conversation events and never exposes the hidden request to a
+        provider.  Canonical path resolution, target permission evaluation,
+        interactive approval, instruction checks, sandbox checks, and the
+        injected filesystem executor remain the same effective layers used by
+        ordinary workspace edits.
+        """
+
+        if not isinstance(request, WorkspaceMutationRequest):
+            raise TypeError("workspace mutation request must be canonical")
+        if not isinstance(session_id, str) or not session_id or "\x00" in session_id:
+            raise ValueError("workspace mutation session identity is invalid")
+        tool = self._workspace_mutation_tool
+        if tool is None:
+            raise ToolError("internal workspace mutation is unavailable")
+        arguments: dict[str, Any] = {
+            "path": request.path,
+            "operation": request.operation.value,
+            "_workspace_mutation_request": request,
+        }
+        if not isinstance(tool, FilesystemTargetProvider):
+            raise ToolError("internal workspace mutation has no canonical target provider")
+        try:
+            filesystem_access_plan = tool.prepare_filesystem_targets(
+                arguments,
+                self._tool_context,
+            )
+        except Exception as error:
+            raise ToolError("internal workspace mutation target preflight failed") from error
+        if (
+            filesystem_access_plan is None
+            or filesystem_access_plan.tool_name != tool.definition.name
+        ):
+            raise ToolError("internal workspace mutation target plan is invalid")
+        decision = self._permissions.decide_targets(
+            tool.definition.name,
+            filesystem_access_plan.targets,
+            side_effecting=tool.side_effecting,
+        )
+        if decision.effect is PermissionEffect.ASK:
+            scope_context = self._permission_scope_context(session_id)
+            scope_candidates = self._permissions.scope_candidates(
+                tool.definition.name,
+                arguments,
+                decision=decision,
+                targets=filesystem_access_plan.targets,
+                workspace_root=Path(scope_context.workspace_root),
+            )
+            public_arguments = {
+                "path": request.path,
+                "operation": request.operation.value,
+            }
+            approval_request = build_permission_request(
+                f"result-adoption-{uuid.uuid4().hex}",
+                tool.definition.name,
+                public_arguments,
+                decision.reason,
+                scope_candidates=scope_candidates,
+                scope_context=scope_context,
+            )
+            approval = (
+                await self._approver.request(approval_request)
+                if self._approver is not None
+                else PermissionApproval.deny("interactive approval interface is unavailable")
+            )
+            if not approval.allowed:
+                raise ToolError(f"permission denied: {approval.reason}")
+        elif not decision.allowed:
+            raise ToolError(f"permission denied: {decision.reason}")
+        result = await tool.execute(
+            arguments,
+            replace(self._tool_context, filesystem_access_plan=filesystem_access_plan),
+        )
+        if result.is_error:
+            raise ToolError(result.content)
+        return WorkspaceMutationResult(request.path, request.operation)
 
     async def execute(
         self,
@@ -272,6 +377,7 @@ class ToolExecutor:
         *,
         interrupted_observation_sink: Callable[[ToolExecutionObservation], None] | None = None,
         workspace_change_sink: Callable[[WorkspaceChangeReport], None] | None = None,
+        recovery_started_sink: Callable[[str, str, bool], Awaitable[None]] | None = None,
     ) -> ToolExecutionObservation | None:
         resolved = False
         tool_requested_at = monotonic()
@@ -290,11 +396,21 @@ class ToolExecutor:
         )
 
         def terminal_event_data(result: ToolResult, **extra: object) -> dict[str, object]:
+            duration_seconds = monotonic() - tool_requested_at
+            canonical = ToolExecutionResult.from_tool_result(
+                call.id,
+                call.name,
+                result,
+                duration_seconds=duration_seconds,
+                not_started=extra.get("not_started") is True,
+                cancelled=extra.get("cancelled") is True,
+            )
             return {
                 "id": call.id,
                 "name": call.name,
                 **result.to_dict(),
-                "duration_seconds": monotonic() - tool_requested_at,
+                "duration_seconds": duration_seconds,
+                "execution_result": canonical.to_dict(),
                 **extra,
             }
 
@@ -370,11 +486,68 @@ class ToolExecutor:
                     plan_fingerprint_before=plan_fingerprint_before,
                 )
 
-            decision = self._permissions.decide(
-                call.name,
-                call.arguments,
-                side_effecting=tool.side_effecting,
-            )
+            filesystem_access_plan = None
+            try:
+                if isinstance(tool, FilesystemTargetProvider):
+                    filesystem_access_plan = tool.prepare_filesystem_targets(
+                        call.arguments,
+                        self._tool_context,
+                    )
+                    if (
+                        self._tool_context.client_file_system is None
+                        and filesystem_access_plan is None
+                    ):
+                        raise ToolError(
+                            "local structured filesystem tool did not prepare a canonical target plan"
+                        )
+                    if (
+                        filesystem_access_plan is not None
+                        and filesystem_access_plan.tool_name != call.name
+                    ):
+                        raise ToolError(
+                            "canonical filesystem target plan does not match the requested tool"
+                        )
+            except Exception as error:
+                decision = PermissionDecision(
+                    PermissionEffect.DENY,
+                    f"canonical filesystem target preflight failed: {type(error).__name__}: {error}",
+                )
+                await emit(
+                    AgentEventKind.TOOL_PERMISSION,
+                    {
+                        "id": call.id,
+                        "name": call.name,
+                        "effect": decision.effect.value,
+                        "reason": decision.reason,
+                        "policy_source": decision.source.value,
+                    },
+                )
+                result = ToolResult(f"permission denied: {decision.reason}", is_error=True)
+                record_result(result)
+                await emit(
+                    AgentEventKind.TOOL_FAILED,
+                    terminal_event_data(result),
+                )
+                return self._tool_execution_observation(
+                    call,
+                    result,
+                    tool=tool,
+                    change_report=None,
+                    plan_fingerprint_before=plan_fingerprint_before,
+                )
+
+            if filesystem_access_plan is not None:
+                decision = self._permissions.decide_targets(
+                    call.name,
+                    filesystem_access_plan.targets,
+                    side_effecting=tool.side_effecting,
+                )
+            else:
+                decision = self._permissions.decide(
+                    call.name,
+                    call.arguments,
+                    side_effecting=tool.side_effecting,
+                )
             await emit(
                 AgentEventKind.TOOL_PERMISSION,
                 {
@@ -382,14 +555,29 @@ class ToolExecutor:
                     "name": call.name,
                     "effect": decision.effect.value,
                     "reason": decision.reason,
+                    "policy_source": decision.source.value,
                 },
             )
             if decision.effect is PermissionEffect.ASK:
+                scope_context = self._permission_scope_context(session_id)
+                scope_candidates = self._permissions.scope_candidates(
+                    call.name,
+                    call.arguments,
+                    decision=decision,
+                    targets=(
+                        filesystem_access_plan.targets if filesystem_access_plan is not None else ()
+                    ),
+                    workspace_root=(
+                        Path(scope_context.workspace_root) if scope_context is not None else None
+                    ),
+                )
                 request = build_permission_request(
                     call.id,
                     call.name,
                     call.arguments,
                     decision.reason,
+                    scope_candidates=scope_candidates,
+                    scope_context=scope_context,
                 )
                 await emit(
                     AgentEventKind.TOOL_APPROVAL_REQUESTED,
@@ -398,6 +586,14 @@ class ToolExecutor:
                         "name": call.name,
                         "reason": request.reason,
                         "summary": request.summary,
+                        "scope_candidates": [
+                            candidate.audit_metadata() for candidate in request.scope_candidates
+                        ],
+                        "scope_workspace_root": (
+                            request.scope_context.workspace_root
+                            if request.scope_context is not None and request.scope_candidates
+                            else None
+                        ),
                     },
                 )
                 approval = (
@@ -415,6 +611,12 @@ class ToolExecutor:
                         "effect": effect.value,
                         "outcome": approval.kind.value,
                         "reason": approval.reason,
+                        "cache_hit": approval.cache_hit,
+                        "scope": (
+                            approval.scope_candidate.audit_metadata()
+                            if approval.scope_candidate is not None
+                            else None
+                        ),
                     },
                 )
             if not decision.allowed:
@@ -432,10 +634,24 @@ class ToolExecutor:
                     plan_fingerprint_before=plan_fingerprint_before,
                 )
 
-            await emit(AgentEventKind.TOOL_STARTED, {"id": call.id, "name": call.name})
+            for hook in self._hooks:
+                await hook.before_tool(
+                    call.id,
+                    call.name,
+                    safe_arguments,
+                    side_effecting=tool.side_effecting,
+                )
+            if recovery_started_sink is None:
+                await emit(AgentEventKind.TOOL_STARTED, {"id": call.id, "name": call.name})
+            else:
+                await recovery_started_sink(call.id, call.name, tool.side_effecting)
             if tool.side_effecting:
                 journal = self._tool_context.workspace_change_journal
-                target_paths = _workspace_target_paths(tool, call.arguments)
+                target_paths = (
+                    tuple(str(target.canonical_path) for target in filesystem_access_plan.targets)
+                    if filesystem_access_plan is not None
+                    else _workspace_target_paths(tool, call.arguments)
+                )
                 targeted_mutation = bool(target_paths and journal is not None)
                 if not targeted_mutation:
                     workspace_before = await self.capture_workspace_snapshot()
@@ -466,6 +682,7 @@ class ToolExecutor:
                     call.arguments,
                     replace(
                         self._tool_context,
+                        filesystem_access_plan=filesystem_access_plan,
                         interaction_event_sink=interaction_event_sink,
                         web_search_event_sink=web_search_event_sink,
                     ),
@@ -482,6 +699,21 @@ class ToolExecutor:
                     is_error=result.is_error,
                     metadata=result.metadata,
                 )
+            hook_result = ToolExecutionResult.from_tool_result(
+                call.id,
+                call.name,
+                result,
+                duration_seconds=monotonic() - tool_requested_at,
+            )
+            for hook in self._hooks:
+                try:
+                    await hook.after_tool(hook_result)
+                except Exception as error:
+                    LOGGER.warning(
+                        "tool post-hook failed hook=%s error_type=%s",
+                        type(hook).__name__,
+                        type(error).__name__,
+                    )
             kind = AgentEventKind.TOOL_FAILED if result.is_error else AgentEventKind.TOOL_COMPLETED
             plan = self._observation_builder.plan_from_tool_result(call.name, result)
             if plan is not None:
@@ -607,6 +839,23 @@ class ToolExecutor:
     def _workspace_roots(self) -> tuple[Path, ...]:
         return (self._tool_context.cwd, *self._tool_context.additional_workspace_roots)
 
+    def _permission_scope_context(self, session_id: str | None) -> PermissionScopeContext:
+        """Build trusted in-memory grant identity from runtime-owned values."""
+
+        identity = (
+            session_id
+            if isinstance(session_id, str)
+            and bool(session_id)
+            and "\x00" not in session_id
+            and len(session_id.encode("utf-8")) <= 512
+            else f"executor:{self._binding_scope_identity}"
+        )
+        try:
+            root = self._tool_context.cwd.expanduser().resolve(strict=False)
+        except (OSError, RuntimeError):
+            root = Path(os.path.abspath(os.fspath(self._tool_context.cwd)))
+        return PermissionScopeContext(identity, os.fspath(root))
+
     def _journal_redaction_values(self) -> tuple[str, ...]:
         protected_names = {
             name.casefold() for name in self._tool_context.protected_environment_variables
@@ -675,6 +924,13 @@ class ToolExecutor:
             messages.append(message)
             context_items.append(message)
         for call in calls:
+            canonical = ToolExecutionResult.from_tool_result(
+                call.id,
+                call.name,
+                result,
+                not_started=True,
+                cancelled=cancelled,
+            )
             await emit(
                 AgentEventKind.TOOL_FAILED,
                 {
@@ -683,6 +939,7 @@ class ToolExecutor:
                     **result.to_dict(),
                     "cancelled": cancelled,
                     "not_started": True,
+                    "execution_result": canonical.to_dict(),
                 },
             )
 
@@ -703,6 +960,12 @@ class ToolExecutor:
             messages.append(message)
             context_items.append(message)
         for call in calls:
+            canonical = ToolExecutionResult.from_tool_result(
+                call.id,
+                call.name,
+                result,
+                not_started=True,
+            )
             await emit(
                 AgentEventKind.TOOL_FAILED,
                 {
@@ -711,6 +974,7 @@ class ToolExecutor:
                     **result.to_dict(),
                     "not_started": True,
                     "control_batch_rejected": True,
+                    "execution_result": canonical.to_dict(),
                 },
             )
 

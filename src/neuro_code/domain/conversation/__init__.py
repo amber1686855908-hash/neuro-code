@@ -35,6 +35,8 @@ from neuro_code.domain.conversation.interaction_mode import (
     interaction_mode_guidance,
 )
 from neuro_code.domain.conversation.messages import (
+    AUDIO_MODEL_PLACEHOLDER,
+    BLOB_MODEL_PLACEHOLDER,
     IMAGE_MODEL_PLACEHOLDER,
     ContentPart,
     ContentPartKind,
@@ -47,12 +49,23 @@ from neuro_code.domain.conversation.messages import (
     ToolCall,
 )
 from neuro_code.domain.conversation.reasoning import ReasoningEffort, reasoning_guidance
+from neuro_code.domain.conversation.request import (
+    MAX_REQUEST_SNAPSHOT_ID_BYTES,
+    REQUEST_SNAPSHOT_SCHEMA_VERSION,
+    ModelRequestSnapshot,
+    RequestContextFingerprints,
+    context_fingerprints,
+)
 
 __all__ = [
+    "AUDIO_MODEL_PLACEHOLDER",
+    "BLOB_MODEL_PLACEHOLDER",
     "COMPACTION_SOURCE_FINGERPRINT_BYTES",
     "IMAGE_MODEL_PLACEHOLDER",
     "MAX_DURABLE_COMPACTION_ID_BYTES",
     "MAX_DURABLE_COMPACTION_SUMMARY_BYTES",
+    "MAX_REQUEST_SNAPSHOT_ID_BYTES",
+    "REQUEST_SNAPSHOT_SCHEMA_VERSION",
     "UPSTREAM_IMPORT_PROVIDER",
     "AgentEvent",
     "AgentEventKind",
@@ -71,16 +84,19 @@ __all__ = [
     "ModelProviderAttemptFailed",
     "ModelProviderSelected",
     "ModelReasoningDelta",
+    "ModelRequestSnapshot",
     "ModelTextDelta",
     "ModelToolCall",
     "ModelUsage",
     "PreservedContextItem",
     "ReasoningEffort",
+    "RequestContextFingerprints",
     "Role",
     "SessionItem",
     "SyntheticReason",
     "ToolCall",
     "compute_compaction_source_fingerprint",
+    "context_fingerprints",
     "estimate_context_tokens",
     "estimate_text_tokens",
     "interaction_mode_guidance",

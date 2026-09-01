@@ -68,6 +68,51 @@ class ConfigTests(unittest.TestCase):
         ):
             load_config(Path(directory), environ={})
 
+    def test_explicit_lsp_profiles_are_loaded_without_install_or_inference(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "home" / ".neuro-code"
+            state.mkdir(parents=True)
+            (root / ".neuro-code").mkdir()
+            (root / ".neuro-code" / "config.toml").write_text(
+                """
+[lsp.servers.python]
+language = "python"
+command = ["pyright-langserver", "--stdio"]
+extensions = [".py"]
+root_markers = ["pyproject.toml"]
+environment = { LSP_TOKEN = "secret-value" }
+enabled = true
+""",
+                encoding="utf-8",
+            )
+            config = load_config(root, home=root / "home", environ={})
+            profile = config.language_servers["python"]
+            self.assertEqual(profile.command, ("pyright-langserver", "--stdio"))
+            self.assertEqual(profile.extensions, (".py",))
+            self.assertEqual(profile.root_markers, ("pyproject.toml",))
+            self.assertIn("lsp_token", config.protected_environment_variables)
+            self.assertIn("secret-value", config.redaction_values())
+            redacted = config.redacted_dict()
+            self.assertNotIn("secret-value", str(redacted))
+            self.assertEqual(
+                redacted["lsp"]["servers"]["python"]["environment_names"], ["LSP_TOKEN"]
+            )
+
+    def test_invalid_lsp_profile_shapes_are_configuration_errors(self) -> None:
+        invalid_profiles = (
+            '[lsp.servers.bad]\ncommand = "not-an-array"\n',
+            '[lsp.servers.bad]\ncommand = ["server"]\nextensions = [1]\n',
+            '[lsp.servers.bad]\ncommand = ["server"]\nenabled = "yes"\n',
+        )
+        for content in invalid_profiles:
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / ".neuro-code").mkdir()
+                (root / ".neuro-code" / "config.toml").write_text(content, encoding="utf-8")
+                with self.assertRaises(ConfigurationError):
+                    load_config(root, home=root / "home", environ={})
+
     def test_sandbox_profile_precedence_is_environment_user_project_default(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

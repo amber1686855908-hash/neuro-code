@@ -71,8 +71,8 @@ WORKSPACE 与 READ_ONLY 只有在 W2 报告 `READY` 时才允许继续；STRICT 
 无法满足 STRONG read requirement 而 fail closed。runtime 永远不会执行 setup、repair、UAC、
 ACL 或 Firewall mutation。`SandboxProfile.OFF` 继续使用普通 Windows ConPTY 路由。
 
-W5 workload matrix 已作为有界兼容性证据接受。Run `32194952573` 记录 20 行
-HOST/W3/W4 PASS，包括 Python 与 child Python、Git repository 操作、Node/npm、curl、
+W5 workload matrix 已作为有界兼容性证据接受。Run `32374860136` 记录 20 行、60 个单元格
+全部 HOST/W3/W4 PASS，包括 Python 与 child Python、Git repository 操作、Node/npm、curl、
 NUL access mode 以及动态 BCrypt probe。该证据不新增第二套 PTY authority，也不放宽
 W4 token、ConPTY 或 Job contract；未来工具仍需各自的 fixture。
 

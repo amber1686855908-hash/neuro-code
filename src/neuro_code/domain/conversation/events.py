@@ -14,6 +14,9 @@ class AgentEventKind(StrEnum):
     SESSION_STARTED = "session_started"
     USER_MESSAGE = "user_message"
     MODEL_STEP_STARTED = "model_step_started"
+    MODEL_REQUEST_SNAPSHOT = "model_request_snapshot"
+    MODEL_REQUEST_STARTED = "model_request_started"
+    MODEL_OUTPUT_STARTED = "model_output_started"
     MODEL_THINKING_COMPLETED = "model_thinking_completed"
     CONTEXT_USAGE_UPDATED = "context_usage_updated"
     EXECUTION_BUDGET_UPDATED = "execution_budget_updated"
@@ -21,6 +24,7 @@ class AgentEventKind(StrEnum):
     CONTEXT_COMPACTION_COMPLETED = "context_compaction_completed"
     EXECUTION_SEGMENT_CHECKPOINTED = "execution_segment_checkpointed"
     FINALIZING_STARTED = "finalizing_started"
+    ULTRACODE_DELEGATION_PROGRESS = "ultracode_delegation_progress"
     BACKGROUND_TASK_COMPLETION_REMINDER = "background_task_completion_reminder"
     BACKGROUND_TASK_AUTO_WAKE_STARTED = "background_task_auto_wake_started"
     PROVIDER_ATTEMPT_FAILED = "provider_attempt_failed"
@@ -46,6 +50,7 @@ class AgentEventKind(StrEnum):
     SESSION_TASK_CANCELLED = "session_task_cancelled"
     TURN_COMPLETED = "turn_completed"
     TURN_FAILED = "turn_failed"
+    TURN_ABANDONED = "turn_abandoned"
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +116,8 @@ class ModelProviderAttemptFailed:
     model: str
     error_type: str
     message: str
+    failure_kind: str | None = None
+    status_code: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

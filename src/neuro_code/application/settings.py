@@ -28,6 +28,7 @@ class ApplicationSettings:
     failover: bool = True
     permission_mode: PermissionMode = PermissionMode.DEFAULT
     permission_rules: tuple[PermissionRule, ...] = ()
+    permission_rules_path: Path | None = None
     max_steps: int | None = None
     reasoning_effort: ReasoningEffort = ReasoningEffort.HIGH
     execution_control_mode: ExecutionControlMode = ExecutionControlMode.FINALIZE_TERMINAL

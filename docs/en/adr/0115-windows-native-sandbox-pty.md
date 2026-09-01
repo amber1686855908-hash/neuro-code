@@ -87,9 +87,9 @@ requirement. Runtime never performs setup, repair, UAC, ACL, or Firewall
 mutation. SandboxProfile.OFF remains on the ordinary Windows ConPTY route.
 
 The W5 workload matrix is now accepted as bounded compatibility evidence. Run
-`32194952573` records 20 HOST/W3/W4 rows passing, including Python and child
-Python, Git repository operations, Node/npm, curl, NUL access modes, and a
-dynamic BCrypt probe. This evidence does not add a second PTY authority or
+`32374860136` records 20 HOST/W3/W4 rows passing in all 60 cells, including
+Python and child Python, Git repository operations, Node/npm, curl, NUL access
+modes, and a dynamic BCrypt probe. This evidence does not add a second PTY authority or
 weaken the W4 token, ConPTY, or Job contracts; future tools still require their
 own fixtures.
 

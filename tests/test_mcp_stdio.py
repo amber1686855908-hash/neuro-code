@@ -91,6 +91,30 @@ class McpStdioToolCollectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.is_error)
         self.assertEqual(result.content, "hello from MCP")
 
+    async def test_lists_reads_and_refreshes_resources_templates_and_prompts(self) -> None:
+        self.assertEqual(self.collection.resources[0].uri, "fixture://resource")
+        self.assertEqual(
+            self.collection.resource_templates[0].uri_template,
+            "fixture://resource/{name}",
+        )
+        self.assertEqual(self.collection.prompts[0].name, "fixture-prompt")
+
+        contents = await self.collection.read_resource("fixture://resource")
+        self.assertEqual(contents[0].text, "fixture resource text")
+        self.assertEqual(contents[1].blob, "AQI=")
+        messages = await self.collection.get_prompt("fixture-prompt", {"topic": "testing"})
+        self.assertEqual(messages[0].role, "user")
+        self.assertEqual(messages[0].content["text"], "fixture prompt text")
+
+        await self.collection.refresh()
+        self.assertEqual(len(self.collection.resources), 1)
+
+    async def test_missing_resource_and_prompt_fail_closed(self) -> None:
+        with self.assertRaisesRegex(McpStdioError, "mcp_resource_not_found"):
+            await self.collection.read_resource("fixture://missing")
+        with self.assertRaisesRegex(McpStdioError, "mcp_prompt_not_found"):
+            await self.collection.get_prompt("missing")
+
     async def test_explicit_environment_values_are_redacted_from_results(self) -> None:
         tools = {tool.definition.name: tool for tool in self.collection.tools}
 
@@ -358,6 +382,84 @@ class McpStdioValidationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class McpStdioProjectionTests(unittest.TestCase):
+    def test_resource_prompt_and_blob_projections_are_bounded(self) -> None:
+        resource = mcp_types.Resource(
+            name="resource",
+            uri="fixture://resource",
+            title="title",
+            description="description",
+            mimeType="text/plain",
+            size=3,
+        )
+        template = mcp_types.ResourceTemplate(
+            name="template",
+            uriTemplate="fixture://resource/{name}",
+            mimeType="text/plain",
+        )
+        prompt = mcp_types.Prompt(
+            name="prompt",
+            arguments=[mcp_types.PromptArgument(name="topic", required=True)],
+        )
+        self.assertEqual(
+            mcp_stdio._resource_descriptors("fixture", (resource,))[0].uri,
+            "fixture://resource",
+        )
+        self.assertEqual(
+            mcp_stdio._resource_template_descriptors("fixture", (template,))[0].name,
+            "template",
+        )
+        self.assertEqual(
+            mcp_stdio._prompt_descriptors("fixture", (prompt,))[0].arguments[0]["name"],
+            "topic",
+        )
+        result = mcp_types.ReadResourceResult(
+            contents=[
+                mcp_types.TextResourceContents(
+                    uri="fixture://resource",
+                    mimeType="text/plain",
+                    text="text",
+                ),
+                mcp_types.BlobResourceContents(
+                    uri="fixture://blob",
+                    mimeType="application/octet-stream",
+                    blob="AQI=",
+                ),
+            ]
+        )
+        contents = mcp_stdio._resource_contents(result)
+        self.assertEqual(contents[0].text, "text")
+        self.assertEqual(contents[1].blob, "AQI=")
+        prompt_result = mcp_types.GetPromptResult(
+            messages=[
+                mcp_types.PromptMessage(
+                    role="user",
+                    content=mcp_types.TextContent(type="text", text="hello"),
+                )
+            ]
+        )
+        self.assertEqual(mcp_stdio._prompt_messages(prompt_result)[0].role, "user")
+
+    def test_invalid_resource_blob_and_serialization_fail_closed(self) -> None:
+        with self.assertRaisesRegex(McpStdioError, "mcp_resource_blob_invalid"):
+            mcp_stdio._resource_contents(
+                mcp_types.ReadResourceResult(
+                    contents=[
+                        mcp_types.BlobResourceContents(
+                            uri="fixture://blob",
+                            blob="not-base64",
+                        )
+                    ]
+                )
+            )
+        with self.assertRaisesRegex(McpStdioError, "mcp_json_invalid"):
+            mcp_stdio._serialized_size({"value": object()})
+        self.assertEqual(
+            mcp_stdio._annotations_payload(
+                mcp_types.Annotations(audience=["assistant"], priority=0.5)
+            ),
+            {"audience": ["assistant"], "priority": 0.5},
+        )
+
     def test_json_validation_strips_meta_and_rejects_unsafe_shapes(self) -> None:
         projected = mcp_stdio._bounded_json(
             {

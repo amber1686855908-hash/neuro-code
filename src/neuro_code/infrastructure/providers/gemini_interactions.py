@@ -42,6 +42,10 @@ from neuro_code.domain.conversation.messages import (
     ToolCall,
 )
 from neuro_code.domain.tools import ToolDefinition
+from neuro_code.infrastructure.providers.failure_conformance import (
+    ProviderFailureProtocol,
+    classify_provider_failure,
+)
 from neuro_code.infrastructure.providers.image_references import (
     GEMINI_IMAGE_MEDIA_TYPES,
     GEMINI_MAX_INLINE_IMAGE_BYTES,
@@ -50,7 +54,12 @@ from neuro_code.infrastructure.providers.image_references import (
     is_gemini_file_uri,
     parse_image_reference,
 )
-from neuro_code.shared.errors import ConfigurationError, ProviderError
+from neuro_code.shared.errors import (
+    ConfigurationError,
+    ProviderError,
+    ProviderFailureKind,
+    ProviderFailureOrigin,
+)
 
 GEMINI_INTERACTIONS_PROTOCOL = "gemini-interactions"
 GEMINI_INTERACTIONS_API_VERSION = "v1"
@@ -121,8 +130,8 @@ def _model_id(model: str) -> str:
 def _json_copy(value: object, *, error_message: str) -> Any:
     try:
         return json.loads(json.dumps(value, ensure_ascii=False))
-    except (TypeError, ValueError, json.JSONDecodeError) as error:
-        raise ProviderError(error_message) from error
+    except (TypeError, ValueError) as error:
+        raise ProviderError.protocol(error_message) from error
 
 
 def _string_status(value: object) -> str | None:
@@ -377,6 +386,9 @@ class GeminiInteractionsProvider:
                 assert part.text is not None
                 parts.append({"type": "text", "text": part.text})
                 continue
+            if part.kind is not ContentPartKind.IMAGE:
+                parts.append({"type": "text", "text": part.model_placeholder})
+                continue
             assert part.url is not None
             reference = parse_image_reference(
                 part.url,
@@ -421,7 +433,10 @@ class GeminiInteractionsProvider:
                 return {"type": "model_output", "content": content}
             return None
         if not message.name:
-            raise ProviderError("Gemini Interactions tool results require a tool name")
+            raise ProviderError.classified(
+                ProviderFailureKind.INVALID_REQUEST,
+                "Gemini Interactions tool results require a tool name",
+            )
         return {
             "type": "function_result",
             "name": message.name,
@@ -486,7 +501,10 @@ class GeminiInteractionsProvider:
             standard = self._standard_input_item(item)
             if standard is not None:
                 if standard.get("type") == "function_result" and not standard.get("call_id"):
-                    raise ProviderError("Gemini Interactions function result requires call_id")
+                    raise ProviderError.classified(
+                        ProviderFailureKind.INVALID_REQUEST,
+                        "Gemini Interactions function result requires call_id",
+                    )
                 if standard.get("type") == "function_result":
                     call_id = standard.get("call_id")
                     for previous in reversed(items):
@@ -608,7 +626,7 @@ class GeminiInteractionsProvider:
             return None
         content = step.setdefault("content", [])
         if not isinstance(content, list):
-            raise ProviderError("Gemini Interactions model output content is invalid")
+            raise ProviderError.protocol("Gemini Interactions model output content is invalid")
         if content and isinstance(content[-1], dict) and content[-1].get("type") == "text":
             content[-1]["text"] = f"{content[-1].get('text', '')}{text}"
         else:
@@ -629,7 +647,7 @@ class GeminiInteractionsProvider:
             return None
         summary = step.setdefault("summary", [])
         if not isinstance(summary, list):
-            raise ProviderError("Gemini Interactions thought summary is invalid")
+            raise ProviderError.protocol("Gemini Interactions thought summary is invalid")
         if summary and isinstance(summary[-1], dict) and summary[-1].get("type") == "text":
             summary[-1]["text"] = f"{summary[-1].get('text', '')}{text}"
         else:
@@ -649,17 +667,19 @@ class GeminiInteractionsProvider:
         else:
             initial_arguments = initial
         if not isinstance(initial_arguments, Mapping):
-            raise ProviderError("Gemini Interactions function call arguments must be a JSON object")
+            raise ProviderError.protocol(
+                "Gemini Interactions function call arguments must be a JSON object"
+            )
         arguments: dict[str, Any] = dict(initial_arguments)
         if argument_buffer:
             try:
                 parsed = json.loads(argument_buffer)
             except json.JSONDecodeError as error:
-                raise ProviderError(
+                raise ProviderError.protocol(
                     "Gemini Interactions function call contained invalid JSON arguments"
                 ) from error
             if not isinstance(parsed, Mapping):
-                raise ProviderError(
+                raise ProviderError.protocol(
                     "Gemini Interactions function call arguments must be a JSON object"
                 )
             arguments.update(parsed)
@@ -673,9 +693,9 @@ class GeminiInteractionsProvider:
         name = step.get("name")
         identifier = step.get("id")
         if not isinstance(name, str) or not name:
-            raise ProviderError("Gemini Interactions emitted an incomplete function call")
+            raise ProviderError.protocol("Gemini Interactions emitted an incomplete function call")
         if not isinstance(identifier, str) or not identifier:
-            raise ProviderError("Gemini Interactions function call omitted id")
+            raise ProviderError.protocol("Gemini Interactions function call omitted id")
         call_id = step.get("call_id")
         canonical_id = call_id if isinstance(call_id, str) and call_id else identifier
         metadata: dict[str, Any] = {"gemini.call_id": canonical_id}
@@ -757,9 +777,14 @@ class GeminiInteractionsProvider:
                 len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
                 > MAX_NATIVE_CONTEXT_BYTES
             ):
-                raise ProviderError("Gemini Interactions native context exceeds its size limit")
+                raise ProviderError.classified(
+                    ProviderFailureKind.CONTEXT_OVERFLOW,
+                    "Gemini Interactions native context exceeds its size limit",
+                )
         except (TypeError, ValueError) as error:
-            raise ProviderError("Gemini Interactions native context is not JSON-safe") from error
+            raise ProviderError.protocol(
+                "Gemini Interactions native context is not JSON-safe"
+            ) from error
         return PreservedContextItem(ContextItemKind.BACKEND_TOOL_CALL, payload)
 
     async def stream(
@@ -772,7 +797,7 @@ class GeminiInteractionsProvider:
         try:
             import httpx
         except ImportError as error:
-            raise ProviderError(
+            raise ProviderError.local(
                 "httpx is required for live model requests; install the project"
             ) from error
 
@@ -802,8 +827,17 @@ class GeminiInteractionsProvider:
                 return []
             if event_type == "error":
                 detail = json.dumps(event.get("error", event), ensure_ascii=False)
-                raise ProviderError(
-                    f"Gemini Interactions stream error: {self._safe_detail(detail)}"
+                raise ProviderError.classified(
+                    classify_provider_failure(
+                        ProviderFailureProtocol.GEMINI_INTERACTIONS,
+                        json.dumps(event, ensure_ascii=False),
+                    )
+                    or ProviderFailureKind.UNKNOWN,
+                    f"Gemini Interactions stream error: {self._safe_detail(detail)}",
+                    provider=self._provider_name,
+                    model=self._model,
+                    origin=ProviderFailureOrigin.PROVIDER,
+                    redaction_values=(self._api_key, *self._http_policy.redaction_values),
                 )
             if event_type in {
                 "interaction.created",
@@ -825,12 +859,24 @@ class GeminiInteractionsProvider:
                 if status:
                     terminal_status = status
                 if status in _FAILURE_STATUSES:
-                    raise ProviderError(f"Gemini Interactions failed with status {status}")
+                    raise ProviderError.classified(
+                        classify_provider_failure(
+                            ProviderFailureProtocol.GEMINI_INTERACTIONS,
+                            json.dumps(event, ensure_ascii=False),
+                        )
+                        or ProviderFailureKind.UNKNOWN,
+                        f"Gemini Interactions failed with status {status}",
+                        provider=self._provider_name,
+                        model=self._model,
+                        origin=ProviderFailureOrigin.PROVIDER,
+                    )
                 return []
             if event_type in {"interaction.requires_action", "interaction.completed"}:
                 interaction = event.get("interaction")
                 if not isinstance(interaction, Mapping):
-                    raise ProviderError("Gemini Interactions terminal event omitted interaction")
+                    raise ProviderError.protocol(
+                        "Gemini Interactions terminal event omitted interaction"
+                    )
                 terminal_interaction = dict(interaction)
                 raw_id = interaction.get("id")
                 if isinstance(raw_id, str):
@@ -840,21 +886,37 @@ class GeminiInteractionsProvider:
                     "requires_action" if event_type.endswith("requires_action") else "completed"
                 )
                 if terminal_status in _FAILURE_STATUSES:
-                    raise ProviderError(f"Gemini Interactions failed with status {terminal_status}")
+                    raise ProviderError.classified(
+                        classify_provider_failure(
+                            ProviderFailureProtocol.GEMINI_INTERACTIONS,
+                            json.dumps(event, ensure_ascii=False),
+                        )
+                        or ProviderFailureKind.UNKNOWN,
+                        f"Gemini Interactions failed with status {terminal_status}",
+                        provider=self._provider_name,
+                        model=self._model,
+                        origin=ProviderFailureOrigin.PROVIDER,
+                    )
                 return []
             if event_type == "step.start":
                 index = event.get("index")
                 step = event.get("step")
                 if not isinstance(index, int) or isinstance(index, bool) or index < 0:
-                    raise ProviderError("Gemini Interactions emitted an invalid step index")
+                    raise ProviderError.protocol(
+                        "Gemini Interactions emitted an invalid step index"
+                    )
                 if not isinstance(step, Mapping):
-                    raise ProviderError("Gemini Interactions emitted an invalid step.start")
+                    raise ProviderError.protocol(
+                        "Gemini Interactions emitted an invalid step.start"
+                    )
                 normalized_step = dict(
                     _json_copy(step, error_message="Gemini Interactions step is not JSON-safe")
                 )
                 if index in steps_by_index:
                     if steps_by_index[index] != normalized_step:
-                        raise ProviderError("Gemini Interactions emitted conflicting step.start")
+                        raise ProviderError.protocol(
+                            "Gemini Interactions emitted conflicting step.start"
+                        )
                     return []
                 steps_by_index[index] = normalized_step
                 return list(
@@ -870,7 +932,9 @@ class GeminiInteractionsProvider:
                     or index not in steps_by_index
                     or not isinstance(delta, Mapping)
                 ):
-                    raise ProviderError("Gemini Interactions emitted an invalid step.delta")
+                    raise ProviderError.protocol(
+                        "Gemini Interactions emitted an invalid step.delta"
+                    )
                 step = steps_by_index[index]
                 delta_type = delta.get("type")
                 events: list[ModelEvent] = []
@@ -891,7 +955,7 @@ class GeminiInteractionsProvider:
                 elif delta_type in {"arguments", "arguments_delta"}:
                     partial = delta.get("partial_arguments", delta.get("arguments"))
                     if not isinstance(partial, str):
-                        raise ProviderError(
+                        raise ProviderError.protocol(
                             "Gemini Interactions function arguments delta is invalid"
                         )
                     argument_buffers[index] = f"{argument_buffers.get(index, '')}{partial}"
@@ -903,7 +967,7 @@ class GeminiInteractionsProvider:
             if event_type == "step.stop":
                 index = event.get("index")
                 if not isinstance(index, int) or index not in steps_by_index:
-                    raise ProviderError("Gemini Interactions emitted an invalid step.stop")
+                    raise ProviderError.protocol("Gemini Interactions emitted an invalid step.stop")
                 if index in stopped:
                     return []
                 stopped.add(index)
@@ -941,8 +1005,17 @@ class GeminiInteractionsProvider:
             ):
                 if response.status_code >= 400:
                     detail = self._safe_detail((await response.aread()).decode("utf-8", "replace"))
-                    raise ProviderError(
-                        f"Gemini Interactions request failed with HTTP {response.status_code}: {detail}"
+                    raise ProviderError.from_http(
+                        response.status_code,
+                        detail,
+                        headers=response.headers,
+                        failure_kind=classify_provider_failure(
+                            ProviderFailureProtocol.GEMINI_INTERACTIONS,
+                            detail,
+                        ),
+                        provider=self._provider_name,
+                        model=self._model,
+                        redaction_values=(self._api_key, *self._http_policy.redaction_values),
                     )
                 async for line in response.aiter_lines():
                     if not line.startswith("data:"):
@@ -953,25 +1026,36 @@ class GeminiInteractionsProvider:
                     try:
                         event = json.loads(payload)
                     except json.JSONDecodeError as error:
-                        raise ProviderError(
-                            "Gemini Interactions returned malformed streaming JSON"
+                        raise ProviderError.protocol(
+                            "Gemini Interactions returned malformed streaming JSON",
+                            provider=self._provider_name,
+                            model=self._model,
                         ) from error
                     if not isinstance(event, Mapping):
-                        raise ProviderError(
-                            "Gemini Interactions emitted a non-object streaming event"
+                        raise ProviderError.protocol(
+                            "Gemini Interactions emitted a non-object streaming event",
+                            provider=self._provider_name,
+                            model=self._model,
                         )
                     for model_event in process_event(event):
                         yield model_event
         except ProviderError:
             raise
         except Exception as error:
-            detail = self._safe_detail(str(error))
-            raise ProviderError(
-                f"Gemini Interactions stream failed: {type(error).__name__}: {detail}"
+            raise ProviderError.from_runtime(
+                error,
+                provider=self._provider_name,
+                model=self._model,
+                redaction_values=(self._api_key, *self._http_policy.redaction_values),
+                prefix="Gemini Interactions stream failed",
             ) from error
 
         if terminal_interaction is None:
-            raise ProviderError("Gemini Interactions stream ended without a terminal interaction")
+            raise ProviderError.protocol(
+                "Gemini Interactions stream ended without a terminal interaction",
+                provider=self._provider_name,
+                model=self._model,
+            )
         terminal_steps = terminal_interaction.get("steps")
         if isinstance(terminal_steps, list) and all(
             isinstance(step, Mapping) for step in terminal_steps
@@ -987,7 +1071,11 @@ class GeminiInteractionsProvider:
         else:
             steps = [steps_by_index[index] for index in sorted(steps_by_index)]
         if not steps:
-            raise ProviderError("Gemini Interactions terminal interaction omitted steps")
+            raise ProviderError.protocol(
+                "Gemini Interactions terminal interaction omitted steps",
+                provider=self._provider_name,
+                model=self._model,
+            )
         if self._response_observer is not None:
             observed: dict[str, Any] = {
                 "type": "interaction",
@@ -1002,7 +1090,7 @@ class GeminiInteractionsProvider:
             try:
                 self._response_observer(observed)
             except Exception as error:
-                raise ProviderError(
+                raise ProviderError.local(
                     f"Gemini Interactions response observer failed: {type(error).__name__}"
                 ) from error
         final_text = _model_output_text(steps)

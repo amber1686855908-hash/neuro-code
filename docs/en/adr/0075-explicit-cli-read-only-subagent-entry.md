@@ -42,6 +42,8 @@ state from becoming a wire contract.
 ## Consequences
 
 Provider selection and execution-control options remain explicit CLI settings,
-while read-only capabilities and child isolation remain composition-owned.
-TUI/ACP invocation, automatic scheduling, retry, recursive spawn,
-write-capable tools, and parallel children remain future work.
+while read-only capabilities and child isolation remain composition-owned. Later
+bounded slices add explicit TUI/ACP read-only entrypoints and bounded automatic
+Ultracode delegation. Generic or unbounded scheduling, retry, recursive or
+parallel children, and write-capable tools remain outside the supported
+boundary.

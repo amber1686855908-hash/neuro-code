@@ -22,7 +22,11 @@ from neuro_code.domain.conversation.events import (
 from neuro_code.domain.conversation.messages import Message, Role
 from neuro_code.domain.tools import ToolDefinition
 from neuro_code.infrastructure.providers.failover import FailoverModelProvider, ProviderCandidate
-from neuro_code.shared.errors import ConfigurationError, ProviderError
+from neuro_code.shared.errors import ConfigurationError, ProviderError, ProviderFailureKind
+
+
+def _network_failure(detail: str = "offline") -> ProviderError:
+    return ProviderError.classified(ProviderFailureKind.NETWORK, detail)
 
 
 class ScriptedModelProvider:
@@ -146,7 +150,7 @@ class FailoverModelProviderTests(unittest.IsolatedAsyncioTestCase):
     async def test_all_candidates_support_capability_before_active_selection(self) -> None:
         primary = ScriptedModelProvider(
             "primary",
-            ((ProviderError("offline"),),),
+            ((_network_failure(),),),
         )
         fallback = ScriptedModelProvider(
             "fallback",
@@ -171,7 +175,7 @@ class FailoverModelProviderTests(unittest.IsolatedAsyncioTestCase):
     async def test_failure_before_output_selects_the_next_provider(self) -> None:
         primary = ScriptedModelProvider(
             "primary",
-            ((ProviderError("temporary upstream failure"),),),
+            ((_network_failure("temporary upstream failure"),),),
         )
         fallback = ScriptedModelProvider(
             "fallback",
@@ -205,6 +209,36 @@ class FailoverModelProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(primary.tool_policies, [ModelToolPolicy.ALLOWED])
         self.assertEqual(fallback.tool_policies, [ModelToolPolicy.ALLOWED])
 
+    async def test_failure_event_redacts_api_bearer_and_url_credentials(self) -> None:
+        secret = "provider-secret-value"
+        bearer = "bearer-fixture-token"
+        detail = (
+            f"api_key={secret}; Authorization: Bearer {bearer}; "
+            "https://user:password@example.invalid/v1"
+        )
+        primary = ScriptedModelProvider(
+            "primary",
+            ((ProviderError.from_http(401, detail, redaction_values=(secret,)),),),
+        )
+        fallback = ScriptedModelProvider(
+            "fallback",
+            ((ModelTextDelta("ok"), ModelCompleted("stop")),),
+        )
+        router = FailoverModelProvider((_candidate(primary), _candidate(fallback)))
+
+        events = [
+            event
+            async for event in router.stream(
+                ModelContext((Message(Role.USER, "hello"),)),
+                (),
+            )
+        ]
+        failed = events[0]
+        assert isinstance(failed, ModelProviderAttemptFailed)
+        self.assertNotIn(secret, failed.message)
+        self.assertNotIn(bearer, failed.message)
+        self.assertNotIn("password@example.invalid", failed.message)
+
     async def test_cross_platform_failover_keeps_native_affinity_on_the_selected_route(
         self,
     ) -> None:
@@ -234,7 +268,7 @@ class FailoverModelProviderTests(unittest.IsolatedAsyncioTestCase):
                     api_key_env="FAILOVER_TEST_KEY",
                     native_context="profile",
                 )
-                primary = ScriptedModelProvider(primary_service, ((ProviderError("offline"),),))
+                primary = ScriptedModelProvider(primary_service, ((_network_failure(),),))
                 primary.model_name = primary_profile.model
                 primary.context_affinity = primary_profile.context_affinity
                 fallback = ScriptedModelProvider(
@@ -269,7 +303,7 @@ class FailoverModelProviderTests(unittest.IsolatedAsyncioTestCase):
     async def test_disabled_policy_is_forwarded_to_every_failover_candidate(self) -> None:
         primary = ScriptedModelProvider(
             "primary",
-            ((ProviderError("temporary upstream failure"),),),
+            ((_network_failure("temporary upstream failure"),),),
         )
         fallback = ScriptedModelProvider(
             "fallback",
@@ -320,7 +354,7 @@ class FailoverModelProviderTests(unittest.IsolatedAsyncioTestCase):
     async def test_failure_after_first_model_event_never_fails_over(self) -> None:
         primary = ScriptedModelProvider(
             "primary",
-            ((ModelTextDelta("partial"), ProviderError("stream interrupted")),),
+            ((ModelTextDelta("partial"), _network_failure("stream interrupted")),),
         )
         fallback_created = False
 
@@ -359,7 +393,7 @@ class FailoverModelProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(fallback_created)
 
     async def test_successful_failover_is_monotonic_across_model_steps(self) -> None:
-        primary = ScriptedModelProvider("primary", ((ProviderError("offline"),),))
+        primary = ScriptedModelProvider("primary", ((_network_failure(),),))
         fallback = ScriptedModelProvider(
             "fallback",
             (
@@ -420,7 +454,7 @@ class FailoverModelProviderTests(unittest.IsolatedAsyncioTestCase):
         providers = tuple(
             ScriptedModelProvider(
                 f"provider-{index}",
-                ((ProviderError("x" * 1_000),),),
+                ((_network_failure("x" * 1_000),),),
             )
             for index in range(5)
         )

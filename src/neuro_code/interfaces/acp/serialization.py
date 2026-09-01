@@ -10,6 +10,7 @@ values. They do not inspect sessions, call providers, or execute tools.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Literal, cast
 
@@ -23,7 +24,10 @@ from neuro_code.domain.execution import (
 )
 from neuro_code.shared.redaction import redact_sensitive_text
 
+MAX_RESOURCE_FIELD_BYTES = 2 * 1024
+
 __all__ = [
+    "MAX_RESOURCE_FIELD_BYTES",
     "AcpStopReason",
     "execution_outcome_metadata",
     "execution_outcome_stop_reason",
@@ -102,6 +106,28 @@ def safe_output_text(
     text = sanitize_controls(text)
     text = redact_sensitive_text(text, explicit_values=explicit_redactions)
     return truncate_utf8(text, limit)
+
+
+def _bounded_identifier(value: object) -> str:
+    """Project an untrusted identifier into a bounded safe external value.
+
+    将不受信任的标识符投影为有界且安全的外部值.
+
+    This helper is shared by ACP session error metadata and update
+    projections. It intentionally remains private because it is a safety
+    primitive, not a public ACP protocol surface.
+    此 helper 同时服务于 ACP session 错误 metadata 和 update 投影,保持私有是因为
+    它是安全原语而不是公开 ACP 协议表面.
+    """
+
+    if not isinstance(value, str) or not value:
+        return "unknown"
+    if len(value.encode("utf-8")) <= 256 and all(
+        ord(character) >= 32 and ord(character) != 127 for character in value
+    ):
+        return value
+    digest = hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()
+    return f"id-{digest}"
 
 
 def serialized_size_bytes(value: object) -> int:

@@ -47,7 +47,8 @@ Adapter 不会把 unknown upstream capability 变成 supported。错误继续使
 
 Kimi 使用 current model family，不使用已停止的 `kimi-latest` alias。K3 始终 reasoning，
 并采用 application-owned effort mapping：`low → low`、`medium/high → high`、
-`xhigh/ultracode → max`。K2.7 与 K2.6 发送 thinking enabled 及 `keep = all`；K2.5
+`xhigh/ultracode → max`；这里是 provider wire compatibility projection，不实现 Ultracode
+branch selection。K2.7 与 K2.6 发送 thinking enabled 及 `keep = all`；K2.5
 发送 thinking enabled，但不把它标记为可保留 reasoning content。Adapter 在 model contract
 要求时保留完整 assistant `reasoning_content`。依据当前 K2.6 thinking contract，只有
 `tool_choice = auto` 或 `none` 被接受；`required` 与 specific function choice 在请求发送前

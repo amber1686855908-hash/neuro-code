@@ -6,7 +6,7 @@ import json
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from neuro_code import __version__
 from neuro_code.application.execution_policy import ExecutionProfile
@@ -22,15 +22,10 @@ from neuro_code.application.ports.user_interaction import (
     UserInputRequest,
     UserInputResponse,
 )
+from neuro_code.application.runtime.agent import AgentRunResult, EventSink
 from neuro_code.application.runtime.supervision import ExecutionControlMode
-from neuro_code.application.sessions.catalog import (
-    ListSessionsRequest,
-    SearchSessionsRequest,
-    SessionCatalogApplicationService,
-)
 from neuro_code.application.sessions.lifecycle import (
     ImportSessionRequest,
-    RenameSessionRequest,
     SessionLifecycleService,
 )
 from neuro_code.application.sessions.service import (
@@ -45,8 +40,6 @@ from neuro_code.application.sessions.subagent_lifecycle import (
 from neuro_code.application.sessions.turns import RunTurnRequest
 from neuro_code.application.settings import ApplicationSettings
 from neuro_code.application.tools.service import (
-    ListSessionToolOutputArtifactsRequest,
-    ReadSessionToolOutputArtifactRequest,
     SessionToolOutputArtifactApplicationService,
 )
 from neuro_code.application.workflows.subagent import (
@@ -62,13 +55,10 @@ from neuro_code.domain.workspace.skills import SkillDiscoveryResult
 from neuro_code.interfaces.cli.serialization import (
     render_session_markdown,
     serialize_execution_outcome,
-    serialize_execution_record,
-    serialize_session_search_page,
     serialize_subagent_relationship_action,
     serialize_subagent_result,
-    serialize_tool_output_artifact,
-    serialize_tool_output_artifact_read,
 )
+from neuro_code.interfaces.cli.sessions import run_sessions_command as _sessions_command
 from neuro_code.shared.errors import ConfigurationError, NeuroCodeError
 
 if TYPE_CHECKING:
@@ -208,6 +198,11 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--allow", action="append", default=[], metavar="PATTERN")
     parser.add_argument("--deny", action="append", default=[], metavar="PATTERN")
     parser.add_argument(
+        "--permissions-file",
+        type=Path,
+        help="load persistent permission rules from this JSON file",
+    )
+    parser.add_argument(
         "--execution-profile",
         choices=tuple(profile.value for profile in ExecutionProfile),
         default=ExecutionProfile.NORMAL.value,
@@ -234,6 +229,14 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_acp_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--transport",
+        choices=("stdio", "websocket"),
+        default="stdio",
+        help="ACP transport (default: stdio)",
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="WebSocket bind host")
+    parser.add_argument("--port", type=int, default=0, help="WebSocket bind port")
     parser.add_argument("--cwd", type=Path, help="connection workspace")
     parser.add_argument("-m", "--model", help="model identifier")
     parser.add_argument("--provider", help="named provider profile")
@@ -250,6 +253,11 @@ def _add_acp_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--allow", action="append", default=[], metavar="PATTERN")
     parser.add_argument("--deny", action="append", default=[], metavar="PATTERN")
+    parser.add_argument(
+        "--permissions-file",
+        type=Path,
+        help="load persistent permission rules from this JSON file",
+    )
     parser.add_argument(
         "--execution-profile",
         choices=tuple(profile.value for profile in ExecutionProfile),
@@ -385,7 +393,7 @@ def build_parser() -> argparse.ArgumentParser:
     sessions_parser.add_argument(
         "session_action",
         nargs="?",
-        choices=("list", "search", "rename", "artifacts"),
+        choices=("list", "search", "rename", "compact", "artifacts", "recover"),
         default="list",
         help="session operation (default: list)",
     )
@@ -402,6 +410,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="new title or artifact ID",
     )
     sessions_parser.add_argument("--json", action="store_true")
+    sessions_parser.add_argument(
+        "--action",
+        choices=("inspect", "abandon", "retry"),
+        default="inspect",
+        help="recovery action (only valid for sessions recover)",
+    )
+    sessions_parser.add_argument(
+        "--reason",
+        default="explicit_user_resolution",
+        help="bounded reason for an explicit recovery abandon",
+    )
     sessions_parser.add_argument("--limit", type=int, default=50)
     sessions_parser.add_argument("--offset", type=int, default=0)
     sessions_parser.add_argument("--include-content", action="store_true")
@@ -614,9 +633,25 @@ async def _run_agent(args: argparse.Namespace, services: CliServices) -> int:
                 if isinstance(text, str):
                     print(text, end="", flush=True)
             elif args.output_format == "jsonl":
-                print(json.dumps(event.to_dict(), ensure_ascii=False), flush=True)
+                if event.kind is not AgentEventKind.MODEL_REQUEST_SNAPSHOT:
+                    print(json.dumps(event.to_dict(), ensure_ascii=False), flush=True)
 
-        turn_service = application.session_service.bind_runner(binding.runner)
+        async def ultracode_delegate(
+            request: RunTurnRequest,
+            sink: EventSink | None,
+        ) -> AgentRunResult:
+            service = await application.create_ultracode_delegation_service(
+                parent_binding=binding,
+            )
+            return cast(AgentRunResult, await service.run_turn(request, sink=sink))
+
+        if getattr(binding.runner, "reasoning_effort", None) is ReasoningEffort.ULTRACODE:
+            turn_service = application.session_service.bind_runner(
+                binding.runner,
+                ultracode_delegate=ultracode_delegate,
+            )
+        else:
+            turn_service = application.session_service.bind_runner(binding.runner)
         result = await turn_service.run_turn(
             RunTurnRequest(
                 args.prompt,
@@ -633,7 +668,11 @@ async def _run_agent(args: argparse.Namespace, services: CliServices) -> int:
                         "session_id": result.session_id,
                         "response": result.response,
                         "steps": result.steps,
-                        "events": [event.to_dict() for event in result.events],
+                        "events": [
+                            event.to_dict()
+                            for event in result.events
+                            if event.kind is not AgentEventKind.MODEL_REQUEST_SNAPSHOT
+                        ],
                         "outcome": serialize_execution_outcome(result.outcome),
                     },
                     ensure_ascii=False,
@@ -655,8 +694,16 @@ async def _run_subagent(args: argparse.Namespace, services: CliServices) -> int:
     """
 
     application = await services.open_application(_application_settings(args))
+    parent_binding = None
     try:
-        await application.config_for_session_resume(args.parent_session)
+        parent_config = await application.config_for_session_resume(args.parent_session)
+        parent_binding = await application.create_binding(
+            config=parent_config,
+            resume_id=args.parent_session,
+        )
+        parent_capabilities = parent_binding.capabilities
+        if parent_capabilities is None:
+            raise ConfigurationError("parent binding capability metadata is missing")
         try:
             request = RunSubagentRequest(
                 args.parent_session,
@@ -666,13 +713,18 @@ async def _run_subagent(args: argparse.Namespace, services: CliServices) -> int:
         except ValueError as error:
             raise ConfigurationError(str(error)) from None
         service = application.create_read_only_subagent_application_service()
-        projection = await service.run_subagent(request)
+        projection = await service.run_subagent(
+            request,
+            parent_capabilities=parent_capabilities,
+        )
         if args.json:
             print(json.dumps(serialize_subagent_result(projection), ensure_ascii=False))
         else:
             print(projection.response)
         return 0
     finally:
+        if parent_binding is not None and parent_binding.background_tasks is not None:
+            await asyncio.shield(parent_binding.background_tasks.shutdown())
         await asyncio.shield(application.close())
 
 
@@ -739,6 +791,7 @@ def _application_settings(
             else PermissionMode.DEFAULT
         ),
         permission_rules=_rules(args),
+        permission_rules_path=getattr(args, "permissions_file", None),
         max_steps=args.max_steps,
         execution_profile=ExecutionProfile(
             getattr(args, "execution_profile", ExecutionProfile.NORMAL.value)
@@ -817,180 +870,6 @@ def _providers_command(args: argparse.Namespace, services: CliServices) -> int:
             else:
                 rendered = str(value)
             print(f"{key}: {rendered}")
-    return 0
-
-
-async def _sessions_command(args: argparse.Namespace, services: CliServices) -> int:
-    config = services.load_config(args.cwd)
-    store = await services.create_session_store(config)
-    session_lifecycle = SessionLifecycleService(store)
-    session_catalog = SessionCatalogApplicationService(store)
-    if args.session_action == "artifacts":
-        artifact_service = services.create_tool_output_artifact_service(config, store)
-        if args.prune:
-            if args.query is not None or args.title is not None:
-                raise ConfigurationError("--prune cannot be combined with a session or artifact ID")
-            if (
-                args.limit != 50
-                or args.offset != 0
-                or args.include_content
-                or args.max_bytes != MAX_TOOL_OUTPUT_ARTIFACT_READ_BYTES
-            ):
-                raise ConfigurationError(
-                    "--limit, --offset, --include-content and --max-bytes are not valid with --prune"
-                )
-            prune_result = await artifact_service.prune_unreferenced()
-            payload = {
-                "deleted": prune_result.deleted_count,
-                "preserved": prune_result.preserved_count,
-            }
-            if args.json:
-                print(json.dumps(payload, ensure_ascii=False))
-            else:
-                print(
-                    f"Pruned {prune_result.deleted_count} artifact(s); "
-                    f"preserved {prune_result.preserved_count}."
-                )
-            return 0
-        if args.query is None or not args.query.strip():
-            raise ConfigurationError("sessions artifacts requires a session ID")
-        if args.offset != 0 or args.include_content:
-            raise ConfigurationError(
-                "--offset and --include-content are not valid for sessions artifacts"
-            )
-        if args.title is None:
-            references = await artifact_service.list(
-                ListSessionToolOutputArtifactsRequest(args.query, limit=args.limit)
-            )
-            if args.max_bytes != MAX_TOOL_OUTPUT_ARTIFACT_READ_BYTES:
-                raise ConfigurationError(
-                    "--max-bytes requires an artifact ID for sessions artifacts"
-                )
-            if args.json:
-                print(
-                    json.dumps(
-                        [serialize_tool_output_artifact(reference) for reference in references],
-                        ensure_ascii=False,
-                    )
-                )
-            elif not references:
-                print("No tool output artifacts found.")
-            else:
-                for reference in references:
-                    artifact = reference.artifact
-                    print(
-                        f"{artifact.artifact_id}\t{artifact.byte_count} bytes\t"
-                        f"truncated={str(artifact.truncated).lower()}\t"
-                        f"event={reference.event_sequence}"
-                    )
-            return 0
-
-        if args.limit != 50:
-            raise ConfigurationError("--limit is not valid when an artifact ID is provided")
-        result = await artifact_service.read(
-            ReadSessionToolOutputArtifactRequest(
-                args.query,
-                args.title,
-                max_bytes=args.max_bytes,
-            )
-        )
-        if args.json:
-            print(
-                json.dumps(
-                    serialize_tool_output_artifact_read(
-                        result.artifact.artifact_id,
-                        result.content,
-                        result.read_truncated,
-                    ),
-                    ensure_ascii=False,
-                )
-            )
-        else:
-            print(result.content, end="" if result.content.endswith("\n") else "\n")
-            if result.read_truncated:
-                print("[output truncated at the requested read limit]")
-        return 0
-    if args.prune:
-        raise ConfigurationError("--prune is only valid for sessions artifacts")
-    if args.session_action == "search":
-        if args.title is not None:
-            raise ConfigurationError("sessions search accepts exactly one query")
-        if args.query is None or not args.query.strip():
-            raise ConfigurationError("sessions search requires a non-empty query")
-        page = await session_catalog.search_sessions(
-            SearchSessionsRequest(
-                args.query,
-                limit=args.limit,
-                offset=args.offset,
-                include_content=args.include_content,
-            )
-        )
-        if args.json:
-            print(
-                json.dumps(
-                    await serialize_session_search_page(page),
-                    ensure_ascii=False,
-                )
-            )
-        elif not page.results:
-            print("No matching sessions found.")
-        else:
-            for inspection in page.results:
-                hit = inspection.hit
-                session = hit.summary
-                title = session.title or "New session"
-                fields = ",".join(hit.matched_fields)
-                print(
-                    f"{session.id}\t{session.updated_at.isoformat()}\t"
-                    f"{session.provider}/{session.model}\t{title}\tmatch={fields}"
-                )
-                if hit.snippet is not None:
-                    print(f"  {hit.snippet}")
-        return 0
-    if args.session_action == "rename":
-        if args.query is None or not args.query.strip():
-            raise ConfigurationError("sessions rename requires a session ID")
-        if args.title is None or not args.title.strip():
-            raise ConfigurationError("sessions rename requires a non-empty title")
-        if args.limit != 50 or args.offset != 0 or args.include_content:
-            raise ConfigurationError(
-                "--limit, --offset and --include-content are not valid for sessions rename"
-            )
-        summary = await session_lifecycle.rename_session(
-            RenameSessionRequest(args.query, args.title)
-        )
-        if args.json:
-            print(json.dumps(summary.to_dict(), ensure_ascii=False))
-        else:
-            print(f"Renamed session {summary.id} to {summary.title!r}.")
-        return 0
-    if args.query is not None:
-        raise ConfigurationError("sessions list does not accept a query")
-    if args.title is not None:
-        raise ConfigurationError("sessions list does not accept a title")
-    if args.offset != 0 or args.include_content:
-        raise ConfigurationError(
-            "--offset and --include-content are only valid for sessions search"
-        )
-    inspections = await session_catalog.list_sessions(ListSessionsRequest(args.limit))
-    if args.json:
-        rows: list[dict[str, object]] = []
-        for session_inspection in inspections:
-            row: dict[str, object] = dict(session_inspection.summary.to_dict())
-            row["last_execution"] = serialize_execution_record(session_inspection.execution_record)
-            rows.append(row)
-        print(json.dumps(rows, ensure_ascii=False))
-    elif not inspections:
-        print("No sessions found.")
-    else:
-        for session_inspection in inspections:
-            session = session_inspection.summary
-            print(
-                f"{session.id}\t{session.updated_at.isoformat()}\t"
-                f"{session.provider}/{session.model}\t"
-                f"sandbox={session.sandbox_profile.value if session.sandbox_profile else 'legacy'}"
-                f"\t{session.title or 'New session'}\t{session.cwd}"
-            )
     return 0
 
 

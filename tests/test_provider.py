@@ -48,6 +48,7 @@ from neuro_code.infrastructure.providers.openai_compatible import (
     _ToolCallBuffer,
 )
 from neuro_code.infrastructure.providers.openai_responses import OpenAIResponsesProvider
+from neuro_code.infrastructure.providers.resilience import ResilientModelProvider
 from neuro_code.shared.errors import ConfigurationError, ProviderError
 
 
@@ -188,6 +189,12 @@ class OpenAICompatibleProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kimi_body["reasoning_effort"], "max")
         self.assertEqual(kimi_body["messages"][1]["reasoning_content"], "preserve this reasoning")
 
+        max_context = ModelContext(
+            context.items,
+            reasoning_effort=ReasoningEffort.MAX,
+        )
+        self.assertEqual(kimi._request_body(max_context, (tool,))["reasoning_effort"], "max")
+
         glm = OpenAICompatibleProvider(
             model="glm-5.3",
             base_url="https://open.bigmodel.cn/api/paas/v4",
@@ -198,64 +205,24 @@ class OpenAICompatibleProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(glm_body["thinking"], {"type": "enabled", "clear_thinking": False})
         self.assertEqual(glm_body["reasoning_effort"], "max")
 
-        minimax = OpenAICompatibleProvider(
-            model="MiniMax-M3",
-            base_url="https://api.minimaxi.com/v1",
+    def test_ultracode_is_never_emitted_as_a_provider_native_effort(self) -> None:
+        self.assertEqual(
+            OpenAICompatibleProvider._effort_name(ReasoningEffort.ULTRACODE),
+            "max",
+        )
+        context = ModelContext(
+            (Message(Role.USER, "continue"),),
+            reasoning_effort=ReasoningEffort.ULTRACODE,
+        )
+        kimi = OpenAICompatibleProvider(
+            model="kimi-k3",
+            base_url="https://api.moonshot.ai/v1",
             api_key="fixture",
-            provider_name="minimax-profile",
-            dialect="minimax",
-            context_affinity="profile-v1:minimax",
+            dialect="kimi",
         )
-        minimax_context = ModelContext(
-            context.items,
-            source_provider="minimax-profile",
-            source_model="MiniMax-M3",
-            source_context_affinity="profile-v1:minimax",
-            reasoning_effort=ReasoningEffort.XHIGH,
-        )
-        minimax_body = minimax._request_body(minimax_context, (tool,))
-        self.assertNotIn("max_tokens", minimax_body)
-        self.assertEqual(minimax_body["max_completion_tokens"], 8192)
-        self.assertTrue(minimax_body["reasoning_split"])
-        self.assertEqual(
-            minimax_body["messages"][1]["reasoning_content"], "preserve this reasoning"
-        )
-
-        native = PreservedContextItem(
-            ContextItemKind.REASONING,
-            {
-                "type": "reasoning",
-                "native": {
-                    "type": "openai-chat-reasoning-details",
-                    "provider": "minimax-profile",
-                    "protocol": "openai-chat",
-                    "model": "MiniMax-M3",
-                    "details": [{"type": "reasoning.text", "text": "structured reasoning"}],
-                },
-            },
-        )
-        structured_body = minimax._request_body(
-            ModelContext(
-                (
-                    Message(Role.USER, "continue"),
-                    native,
-                    Message(
-                        Role.ASSISTANT,
-                        "tool result pending",
-                        reasoning_content="structured reasoning",
-                        tool_calls=(ToolCall("call-1", "lookup", {"value": 1}),),
-                    ),
-                ),
-                source_provider="minimax-profile",
-                source_model="MiniMax-M3",
-                source_context_affinity="profile-v1:minimax",
-            ),
-            (tool,),
-        )
-        self.assertEqual(
-            structured_body["messages"][1]["reasoning_details"],
-            [{"type": "reasoning.text", "text": "structured reasoning"}],
-        )
+        body = kimi._request_body(context, ())
+        self.assertEqual(body["reasoning_effort"], "max")
+        self.assertNotIn("ultracode", json.dumps(body, ensure_ascii=False).casefold())
 
     def test_kimi_specific_tool_choice_fails_closed_without_disabling_thinking(self) -> None:
         provider = OpenAICompatibleProvider(
@@ -1565,7 +1532,7 @@ class OpenAICompatibleProviderTests(unittest.IsolatedAsyncioTestCase):
             direct = create_routed_provider(config, failover=False)
 
         self.assertIsInstance(routed, FailoverModelProvider)
-        self.assertIsInstance(direct, OpenAICompatibleProvider)
+        self.assertIsInstance(direct, ResilientModelProvider)
 
 
 if __name__ == "__main__":

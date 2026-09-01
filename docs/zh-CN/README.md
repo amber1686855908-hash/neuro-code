@@ -46,6 +46,7 @@ uv run neuro-code -p "Explain this repository"
 - **Tools** — 内置仓库和 shell 工具；在受支持配置下，还可使用可选的 web search、公开网页获取和只读 LSP 集成。
 - **Sessions** — 基于 SQLite 的会话支持恢复、工作区范围内的搜索、标题、分叉、导出/导入以及持久化的计划/任务元数据。
 - **TUI** — Textual 界面提供流式对话、provider 和 session 选择器、审批提示、斜杠命令、Markdown 渲染以及持久化的 UI 偏好设置。
+- **Bounded orchestration** — 有界、持久化的 Task DAG、Leader、Agent Swarm 和自动 Ultracode 委派可以协调受约束的并行工作；结果采纳和可写 worker 仍受显式能力、工作区和 sandbox 边界控制。
 
 ## 安全与控制
 
@@ -59,7 +60,7 @@ uv run neuro-code -p "Explain this repository"
 
 - **Provider integrations** — 当前 service catalog 包含 OpenAI、xAI、Anthropic、Gemini、DeepSeek、Kimi、GLM、MiniMax、Volcengine Ark、Baidu Qianfan、Alibaba Model Studio、Tencent TokenHub，以及通用 OpenAI-compatible endpoint。实际能力取决于 provider 和 model；请参阅[兼容性矩阵](compatibility-matrix.md)。
 - **MCP** — 由 session 持有的 MCP server 连接支持 stdio、Streamable HTTP 和 legacy SSE transport，并提供有边界的工具发现与执行。
-- **ACP** — 提供 partial ACP v1 适配器，支持换行分隔的 stdio，并提供有边界的 WebSocket bridge，以及部分工作区绑定的 session、permission、filesystem 和 terminal 能力。ACP 兼容性明确是 partial；请参阅[兼容性矩阵](compatibility-matrix.md)。
+- **ACP** — 提供 partial ACP v1 适配器，支持换行分隔的 stdio，并提供有边界的 WebSocket bridge，以及部分工作区绑定的 session、permission、filesystem 和 terminal 能力。ACP 兼容性明确是 partial；ACP-transport MCP server declaration、二进制多媒体历史回放、客户端交互式终端输入/resize/PTY 方法以及任意自定义扩展仍不支持；请参阅[兼容性矩阵](compatibility-matrix.md)。
 
 ## 项目状态
 

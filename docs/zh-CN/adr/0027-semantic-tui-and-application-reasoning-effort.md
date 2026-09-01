@@ -35,9 +35,10 @@ Markdown 层级。本地生命周期通知的正文起始位置也不统一，�
 - 输入 `/` 时显示纯文字提示栏，并与行内建议共用同一确定性目录。语法包含参数、强度
   选项、可选择的 profile 名和自由文本参数占位符。`Tab` 只在主提示框的斜杠命令中应用
   第一项候选，不会替代模态框的焦点切换。
-- `ReasoningEffort` 定义五项供应商中立选择：`low`（`○`）、`medium`（`◐`）、
-  `high`（`●`）、`xhigh`（`⬤`）与 `ultracode`（`⚡`），默认值为 `high`。这些等级
-  描述逐步加深的应用层审查策略，不代表能够保证模型的隐藏推理 token 预算。
+- `ReasoningEffort` 定义六项供应商中立选择：`low`（`○`）、`medium`（`◐`）、
+  `high`（`●`）、`xhigh`（`⬤`）、`max`（`◆`）与 `ultracode`（`⚡`），默认值为
+  `high`。`max` 是普通单智能体的最深策略；`ultracode` 是有界编排的显式应用层入口。
+  这些值描述逐步加深的应用层审查策略，不代表能够保证模型的隐藏推理 token 预算。
 - `Ctrl+E`、不带参数的 `/effort` 和 `/reasoning` 打开 TUI 选择器；`/effort LEVEL` 与
   `/reasoning LEVEL` 可以直接选择。交互和无头组合都支持 `--effort LEVEL`。活动轮次中
   禁止切换，新值从下一次模型步骤开始生效。
@@ -48,10 +49,13 @@ Markdown 层级。本地生命周期通知的正文起始位置也不统一，�
   会话绑定安装后重新应用。强度不属于会话身份，也不会写入规范对话历史。
 - 每个模型步骤都会由 `AgentRuntime` 把实际审查指引加入仅用于本次请求的系统消息，并在
   `ModelContext` 上携带有类型的请求值。注入的指引不会进入持久化 `SessionItem`。
-- 供应商适配器不会把 `ModelContext.reasoning_effort` 盲目转换成私有请求字段。只有供应商/
-  模型能力经过显式声明和测试后，才能增加原生映射；当前切片尚未实现任何这类映射。
-- `ultracode` 的请求值是 `ultracode`，实际策略是 `xhigh`。选择器、运行栏和状态消息都会
-  明示这项回退；由于工作流编排尚未实现，它不会启动子代理。
+- 供应商适配器不会把 `ModelContext.reasoning_effort` 盲目转换成私有请求字段。显式的 Kimi K3
+  与 GLM 5.3/5.2 dialect 会把 `max` 映射到已配置的原生 `max` 字段；其他 dialect 会省略
+  原生强度字段，但仍收到应用层指引。每项映射都必须按供应商/模型显式声明并测试。
+- `ultracode` 的请求值是 `ultracode`，供应商兼容投影为 `max`。选择器和运行栏可以显示
+  该投影，但显式用户回合会进入 durable application delegation service，并准确选择
+  `MAIN_MAX` 或 `BOUNDED_SWARM` 中的一条路径。供应商永远不会收到编造的原生 `ultracode`
+  值。详见 [ADR 0141](adr/0141-automatic-ultracode-delegation.md)。
 
 ## 后果
 
@@ -66,7 +70,7 @@ Markdown 层级。本地生命周期通知的正文起始位置也不统一，�
 少量请求上下文，因此每次按需重新生成，而不是写入会话。
 
 ADR 0029 随后加入有界的原地工具卡片，ADR 0030 再加入有界的交互详情切换。Mermaid、
-内嵌媒体、供应商原生强度映射，以及工作流/子代理编排仍属于后续纵向切片。
+内嵌媒体，以及工作流/子代理编排仍属于后续纵向切片。
 
 ## 兼容性说明
 

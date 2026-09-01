@@ -223,6 +223,7 @@ EFFORT_STYLES = {
     "medium": TEXT_EMPHASIS,
     "high": TEXT_EMPHASIS,
     "xhigh": TEXT_EMPHASIS,
+    "max": TEXT_EMPHASIS,
     "ultracode": TEXT_EMPHASIS,
 }
 

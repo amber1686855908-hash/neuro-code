@@ -2,6 +2,14 @@
 
 定义由基础设施适配器实现的规范应用端口."""
 
+from neuro_code.application.ports.agent_swarm import (
+    AgentSwarmRunClaim,
+    AgentSwarmStore,
+    AgentSwarmStoreError,
+    ProcessLivenessProbe,
+    SwarmRunStore,
+    SwarmRunStoreError,
+)
 from neuro_code.application.ports.approval import PermissionApprover
 from neuro_code.application.ports.background_tasks import (
     BackgroundTaskManager,
@@ -10,6 +18,32 @@ from neuro_code.application.ports.background_tasks import (
 from neuro_code.application.ports.client_filesystem import ClientFileSystem
 from neuro_code.application.ports.client_terminal import ClientTerminal, ClientTerminalResult
 from neuro_code.application.ports.http import HttpClientPolicy
+from neuro_code.application.ports.leader import (
+    LeaderAttemptClaim,
+    LeaderStore,
+    LeaderStoreError,
+)
+from neuro_code.application.ports.lsp import (
+    LanguageServerProfile,
+    LanguageServerService,
+    LspError,
+    LspFailureKind,
+    LspFailurePhase,
+    LspOperation,
+    LspOperationResult,
+    LspRequest,
+    LspResultVisibilityPolicy,
+    LspStatus,
+)
+from neuro_code.application.ports.mcp import (
+    McpElicitationHandler,
+    McpPrompt,
+    McpPromptMessage,
+    McpResource,
+    McpResourceContent,
+    McpResourceTemplate,
+    McpSamplingHandler,
+)
 from neuro_code.application.ports.model import (
     CapabilityResolution,
     CapabilityStatus,
@@ -18,6 +52,10 @@ from neuro_code.application.ports.model import (
     ModelProvider,
     ModelToolPolicy,
     resolve_capabilities,
+)
+from neuro_code.application.ports.parent_context_relay import (
+    ParentContextRelayError,
+    ParentContextRelayStore,
 )
 from neuro_code.application.ports.provider_catalog import (
     ProviderCatalog,
@@ -42,6 +80,18 @@ from neuro_code.application.ports.provider_settings import (
     ManagedProxyPolicy,
     ProviderSettingsStore,
 )
+from neuro_code.application.ports.result_adoption import (
+    ParentWorkspaceProjectionReader,
+    ParentWorkspaceSnapshot,
+    ResultAdoptionError,
+    ResultAdoptionRecord,
+    ResultAdoptionStore,
+    ResultAdoptionTargetRecord,
+    ResultAdoptionWorktreePort,
+    WorkspaceMutationPort,
+    WorkspaceMutationRequest,
+    WorkspaceMutationResult,
+)
 from neuro_code.application.ports.routing import ModelRoute, RuntimeRole
 from neuro_code.application.ports.sandbox import (
     LocalProcessCancellationPolicy,
@@ -64,10 +114,26 @@ from neuro_code.application.ports.sandbox import (
     security_capability_satisfies,
 )
 from neuro_code.application.ports.storage import SessionStore
+from neuro_code.application.ports.task_dag import TaskDagError, TaskDagStore
+from neuro_code.application.ports.task_dag_recovery import (
+    TaskDagRecoveryClaimError,
+    TaskDagRecoveryClaimResult,
+    TaskDagRecoveryClaimStore,
+)
+from neuro_code.application.ports.task_dag_replan import (
+    DagReplanAttemptClaim,
+    TaskDagReplanStore,
+    TaskDagReplanStoreError,
+)
+from neuro_code.application.ports.task_dag_result_relay import (
+    TaskDagDependencyResultRelayError,
+    TaskDagDependencyResultRelayStore,
+)
 from neuro_code.application.ports.terminal import (
     InteractiveTerminalManager,
     InteractiveTerminalSession,
 )
+from neuro_code.application.ports.tool_pipeline import ToolPipelineHook
 from neuro_code.application.ports.tools import (
     MAX_TOOL_OUTPUT_ARTIFACT_BYTES,
     MAX_TOOL_OUTPUT_ARTIFACT_READ_BYTES,
@@ -84,6 +150,13 @@ from neuro_code.application.ports.tools import (
     ToolOutputArtifactStore,
 )
 from neuro_code.application.ports.ui_preferences import UiPreferencesStore
+from neuro_code.application.ports.ultracode import (
+    ResultAdoptionFactory,
+    UltracodeExecutionClaim,
+    UltracodeResultAdoption,
+    UltracodeStore,
+    UltracodeStoreError,
+)
 from neuro_code.application.ports.user_interaction import (
     InteractionEventSink,
     InteractionUnavailable,
@@ -151,7 +224,15 @@ from neuro_code.application.ports.windows_sandbox import (
     WindowsSandboxSetupSnapshot,
     WindowsSandboxSetupState,
 )
-from neuro_code.application.ports.workspace import WorkspaceIdentity, WorkspacePathResolver
+from neuro_code.application.ports.workspace import (
+    FilesystemAccessOperation,
+    FilesystemAccessPlan,
+    FilesystemAccessTarget,
+    FilesystemTargetProvider,
+    FilesystemTargetRequest,
+    WorkspaceIdentity,
+    WorkspacePathResolver,
+)
 from neuro_code.application.ports.workspace_changes import (
     WorkspaceChangeCheckpoint,
     WorkspaceChangeEventPayload,
@@ -169,6 +250,18 @@ from neuro_code.application.ports.workspace_changes import (
     WorkspaceFileChange,
     WorkspaceMutationJournalProjection,
     WorkspaceMutationTargetProvider,
+)
+from neuro_code.application.ports.worktree import (
+    GitWorktreePort,
+    GitWorktreeRecord,
+    ManagedWorktreeStore,
+    WorktreeApplication,
+    WorktreeError,
+    WorktreeFailureKind,
+)
+from neuro_code.application.ports.writable_subagent import (
+    WritableSubagentLeaseError,
+    WritableSubagentLeaseStore,
 )
 
 __all__ = [
@@ -196,6 +289,9 @@ __all__ = [
     "MAX_TOTAL_RESULT_BYTES",
     "TOOL_OUTPUT_ARTIFACT_PRUNE_GRACE_SECONDS",
     "WINDOWS_SANDBOX_SETUP_SCHEMA_VERSION",
+    "AgentSwarmRunClaim",
+    "AgentSwarmStore",
+    "AgentSwarmStoreError",
     "BackgroundTaskManager",
     "BackgroundTaskSupervisor",
     "CapabilityResolution",
@@ -204,6 +300,14 @@ __all__ = [
     "ClientTerminal",
     "ClientTerminalResult",
     "CredentialStyle",
+    "DagReplanAttemptClaim",
+    "FilesystemAccessOperation",
+    "FilesystemAccessPlan",
+    "FilesystemAccessTarget",
+    "FilesystemTargetProvider",
+    "FilesystemTargetRequest",
+    "GitWorktreePort",
+    "GitWorktreeRecord",
     "HostedWebSearch",
     "HostedWebSearchEvent",
     "HostedWebSearchEventSink",
@@ -213,6 +317,11 @@ __all__ = [
     "InteractionUnavailable",
     "InteractiveTerminalManager",
     "InteractiveTerminalSession",
+    "LanguageServerProfile",
+    "LanguageServerService",
+    "LeaderAttemptClaim",
+    "LeaderStore",
+    "LeaderStoreError",
     "LocalProcessCancellationPolicy",
     "LocalProcessEnvironmentPolicy",
     "LocalProcessFilesystemPolicy",
@@ -227,9 +336,25 @@ __all__ = [
     "LocalProcessStdioMode",
     "LocalWorkspaceAccess",
     "LocalWorkspaceAccessMode",
+    "LspError",
+    "LspFailureKind",
+    "LspFailurePhase",
+    "LspOperation",
+    "LspOperationResult",
+    "LspRequest",
+    "LspResultVisibilityPolicy",
+    "LspStatus",
     "ManagedProviderProfile",
     "ManagedProviderSettings",
     "ManagedProxyPolicy",
+    "ManagedWorktreeStore",
+    "McpElicitationHandler",
+    "McpPrompt",
+    "McpPromptMessage",
+    "McpResource",
+    "McpResourceContent",
+    "McpResourceTemplate",
+    "McpSamplingHandler",
     "ModelCapability",
     "ModelCapabilitySet",
     "ModelCatalogStrategy",
@@ -237,7 +362,12 @@ __all__ = [
     "ModelRoute",
     "ModelToolPolicy",
     "OwnedLocalProcess",
+    "ParentContextRelayError",
+    "ParentContextRelayStore",
+    "ParentWorkspaceProjectionReader",
+    "ParentWorkspaceSnapshot",
     "PermissionApprover",
+    "ProcessLivenessProbe",
     "ProtocolSupportStatus",
     "ProviderCatalog",
     "ProviderCatalogError",
@@ -249,9 +379,26 @@ __all__ = [
     "ProviderServiceCatalog",
     "ProviderServiceDescriptor",
     "ProviderSettingsStore",
+    "ResultAdoptionError",
+    "ResultAdoptionFactory",
+    "ResultAdoptionRecord",
+    "ResultAdoptionStore",
+    "ResultAdoptionTargetRecord",
+    "ResultAdoptionWorktreePort",
     "RuntimeRole",
     "SandboxedProcessRequest",
     "SessionStore",
+    "SwarmRunStore",
+    "SwarmRunStoreError",
+    "TaskDagDependencyResultRelayError",
+    "TaskDagDependencyResultRelayStore",
+    "TaskDagError",
+    "TaskDagRecoveryClaimError",
+    "TaskDagRecoveryClaimResult",
+    "TaskDagRecoveryClaimStore",
+    "TaskDagReplanStore",
+    "TaskDagReplanStoreError",
+    "TaskDagStore",
     "Tool",
     "ToolCollection",
     "ToolContext",
@@ -261,7 +408,12 @@ __all__ = [
     "ToolOutputArtifactRead",
     "ToolOutputArtifactReader",
     "ToolOutputArtifactStore",
+    "ToolPipelineHook",
     "UiPreferencesStore",
+    "UltracodeExecutionClaim",
+    "UltracodeResultAdoption",
+    "UltracodeStore",
+    "UltracodeStoreError",
     "UnavailableUserInteraction",
     "UserInputOption",
     "UserInputRequest",
@@ -309,8 +461,16 @@ __all__ = [
     "WorkspaceFileChange",
     "WorkspaceIdentity",
     "WorkspaceMutationJournalProjection",
+    "WorkspaceMutationPort",
+    "WorkspaceMutationRequest",
+    "WorkspaceMutationResult",
     "WorkspaceMutationTargetProvider",
     "WorkspacePathResolver",
+    "WorktreeApplication",
+    "WorktreeError",
+    "WorktreeFailureKind",
+    "WritableSubagentLeaseError",
+    "WritableSubagentLeaseStore",
     "lifecycle_capability_satisfies",
     "normalize_web_fetch_url",
     "resolve_capabilities",

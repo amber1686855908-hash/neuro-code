@@ -22,6 +22,7 @@ from neuro_code.application.acp.contracts import (
 from neuro_code.application.ports.approval import PermissionApprover
 from neuro_code.application.ports.client_filesystem import ClientFileSystem
 from neuro_code.application.ports.client_terminal import ClientTerminal
+from neuro_code.application.ports.mcp import McpElicitationHandler, McpSamplingHandler
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.tools import (
     MAX_TOOL_OUTPUT_ARTIFACT_READ_BYTES,
@@ -65,6 +66,7 @@ from neuro_code.application.workflows.subagent import (
     RunSubagentRequest,
     SubagentResultProjection,
 )
+from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.shared.errors import SessionError
 
@@ -158,11 +160,16 @@ class AcpApplicationService:
     async def open_mcp_tools(
         self,
         configurations: Sequence[AcpMcpServerConfig],
+        *,
+        sampling_handler: McpSamplingHandler | None = None,
+        elicitation_handler: McpElicitationHandler | None = None,
     ) -> AcpMcpTools:
         return await self._mcp_tools.open(
             configurations,
             cwd=self._metadata.workspace,
             explicit_redactions=self.explicit_redactions(),
+            sampling_handler=sampling_handler,
+            elicitation_handler=elicitation_handler,
         )
 
     async def create_binding(
@@ -190,6 +197,7 @@ class AcpApplicationService:
         parent_session_id: str,
         prompt: str,
         *,
+        parent_capabilities: SubagentCapabilitySet,
         max_steps: int = 8,
     ) -> SubagentResultProjection:
         """Run one explicit child after validating its parent workspace.
@@ -198,11 +206,14 @@ class AcpApplicationService:
         """
 
         await self._require_current_workspace_session(parent_session_id)
+        if not isinstance(parent_capabilities, SubagentCapabilitySet):
+            raise SessionError("parent binding capability metadata is unavailable")
         service = self._subagents
         if service is None:
             raise SessionError("read-only subagent service is unavailable")
         return await service.run_subagent(
-            RunSubagentRequest(parent_session_id, prompt, max_steps=max_steps)
+            RunSubagentRequest(parent_session_id, prompt, max_steps=max_steps),
+            parent_capabilities=parent_capabilities,
         )
 
     async def run_subagent_relationship_action(

@@ -46,7 +46,7 @@ from neuro_code.domain.session_tasks import (
     SubagentLink,
 )
 from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
-from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
+from neuro_code.infrastructure.persistence.sqlite_session import SCHEMA_VERSION, SqliteSessionStore
 from neuro_code.interfaces.cli.serialization import render_session_markdown
 from neuro_code.shared.errors import SessionError
 
@@ -293,7 +293,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 connection.execute(
                     "SELECT version FROM schema_meta WHERE singleton = 1"
                 ).fetchone(),
-                (13,),
+                (SCHEMA_VERSION,),
             )
             self.assertIn(
                 "session_compaction_items",
@@ -304,8 +304,48 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                     ).fetchall()
                 },
             )
+            self.assertIn(
+                "session_turn_attempts",
+                {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    ).fetchall()
+                },
+            )
             connection.close()
             self.assertEqual(await migrated.load_compaction_items(session_id), [])
+
+    async def test_turn_attempt_schema_migrates_from_v13(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "sessions.db"
+            store = SqliteSessionStore(database)
+            await store.initialize()
+            session_id = await store.create_session("/workspace", "provider", "model")
+            connection = sqlite3.connect(database)
+            connection.execute("DROP TABLE session_turn_attempts")
+            connection.execute("UPDATE schema_meta SET version = 13 WHERE singleton = 1")
+            connection.commit()
+            connection.close()
+
+            migrated = SqliteSessionStore(database)
+            await migrated.initialize()
+            connection = sqlite3.connect(database)
+            self.assertEqual(
+                connection.execute(
+                    "SELECT version FROM schema_meta WHERE singleton = 1"
+                ).fetchone(),
+                (SCHEMA_VERSION,),
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'session_turn_attempts'"
+                ).fetchone(),
+                (1,),
+            )
+            connection.close()
+            self.assertEqual(await migrated.load_turn_attempts(session_id), [])
 
     async def test_compaction_store_fails_closed_for_owner_conflicts_and_corrupt_rows(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1061,7 +1101,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 connection.execute(
                     "SELECT version FROM schema_meta WHERE singleton = 1"
                 ).fetchone(),
-                (13,),
+                (SCHEMA_VERSION,),
             )
             columns = {row[1] for row in connection.execute("PRAGMA table_info(session_tasks)")}
             tables = {
@@ -1792,13 +1832,14 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 row[1] for row in migrated.execute("PRAGMA table_info(session_tasks)").fetchall()
             }
             migrated.close()
-            self.assertEqual(version, (13,))
+            self.assertEqual(version, (SCHEMA_VERSION,))
             self.assertIn("context_affinity", columns)
             self.assertIn("sandbox_profile", columns)
             self.assertIn("plan_json", columns)
             self.assertIn("session_tasks", tables)
             self.assertIn("session_plan_comments", tables)
             self.assertIn("subagent_links", tables)
+            self.assertIn("writable_subagent_leases", tables)
             self.assertIn("plan_snapshot_json", task_columns)
 
     async def test_schema_v2_peek_is_read_only_then_migrates_as_legacy(self) -> None:
@@ -1857,7 +1898,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             migrated = sqlite3.connect(database)
             self.assertEqual(
                 migrated.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone(),
-                (13,),
+                (SCHEMA_VERSION,),
             )
             migrated.close()
 
@@ -1937,7 +1978,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             migrated = sqlite3.connect(database)
             self.assertEqual(
                 migrated.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone(),
-                (13,),
+                (SCHEMA_VERSION,),
             )
             tables = {
                 row[0]
@@ -1980,7 +2021,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 connection.execute(
                     "SELECT version FROM schema_meta WHERE singleton = 1"
                 ).fetchone(),
-                (13,),
+                (SCHEMA_VERSION,),
             )
             connection.close()
 
@@ -2049,7 +2090,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             recovered = sqlite3.connect(database)
             self.assertEqual(
                 recovered.execute("SELECT version FROM schema_meta WHERE singleton = 1").fetchone(),
-                (13,),
+                (SCHEMA_VERSION,),
             )
             recovered.close()
 
@@ -2073,7 +2114,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 connection.execute(
                     "SELECT version FROM schema_meta WHERE singleton = 1"
                 ).fetchone(),
-                (13,),
+                (SCHEMA_VERSION,),
             )
             self.assertEqual(
                 connection.execute("SELECT COUNT(*) FROM session_search_documents").fetchone(),

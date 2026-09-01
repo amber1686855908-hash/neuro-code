@@ -674,10 +674,11 @@ session formats, ACP behavior, permissions, sandboxing, or security semantics.
     guidance. The former `neuro_code.domain.reasoning` module remains a one-way
     compatibility facade, while model context, application settings/ports/
     runtime, bootstrap, CLI, ACP, TUI, persistence, and tests import the
-    canonical owner. Effort values, glyphs, effective `ultracode` fallback,
-    guidance text, preference persistence, and user-visible behavior remain
-    unchanged; no provider-private reasoning parameter or workflow orchestration
-    is introduced by this stage.
+    canonical owner. Effort values, glyphs, provider-compatible `ultracode`
+    projection, guidance text, preference persistence, and user-visible
+    behavior remain compatible; the later bounded application-level
+    orchestration entry is specified by ADR 0141, and no provider-private
+    reasoning parameter is introduced here.
 
 79. Stage 5V establishes `neuro_code.application.memory.instruction_tracker` as
     the canonical owner of the binding-scoped AGENTS.md discovery tracker. The

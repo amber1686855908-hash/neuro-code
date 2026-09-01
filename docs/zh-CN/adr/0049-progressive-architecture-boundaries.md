@@ -473,8 +473,9 @@ application 和 domain 模块不得导入具体 infrastructure 实现。所有�
 78. 阶段 5U 将供应商中立的 `ReasoningEffort` 值对象及审查指引实现确立为
     `neuro_code.domain.conversation.reasoning` 的 canonical owner。原
     `neuro_code.domain.reasoning` 保留为单向兼容 facade；ModelContext、application settings/ports/runtime、
-    bootstrap、CLI、ACP、TUI、偏好持久化和测试均改用 canonical owner。强度值、glyph、`ultracode` 的实际回退、
-    指引文本、偏好持久化和用户可见行为保持不变；本阶段不增加供应商私有 reasoning 参数，也不启动 workflow 编排。
+    bootstrap、CLI、ACP、TUI、偏好持久化和测试均改用 canonical owner。强度值、glyph、`ultracode` 的供应商兼容投影、
+    指引文本、偏好持久化和用户可见行为保持兼容；后续有界应用层编排入口由 ADR 0141 规定，
+    本阶段不增加供应商私有 reasoning 参数。
 
 79. 阶段 5V 将绑定级 AGENTS.md 指令发现 tracker 的实现确立为
     `neuro_code.application.memory.instruction_tracker` 的 canonical owner。原

@@ -24,6 +24,7 @@ from neuro_code.application.memory.compaction_runtime import (
 )
 from neuro_code.application.ports.model import ModelToolPolicy
 from neuro_code.application.ports.provider_settings import ManagedProviderProfile
+from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.providers import ChangeProviderRequest, ProviderChangeService
 from neuro_code.application.runtime.agent import AgentRunResult
 from neuro_code.application.runtime.supervision import ExecutionControlMode
@@ -48,7 +49,8 @@ from neuro_code.application.workflows import (
     SubagentResultProjection,
 )
 from neuro_code.application.workflows.subagent import MAX_SUBAGENT_STEPS
-from neuro_code.bootstrap.entrypoints import main
+from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
+from neuro_code.bootstrap.entrypoints import BootstrapCliServices, main
 from neuro_code.cli import (
     _application_settings,
     _execution_control_mode,
@@ -82,7 +84,7 @@ from neuro_code.domain.session_tasks import SessionTaskStatus
 from neuro_code.domain.tools import ToolDefinition
 from neuro_code.infrastructure.persistence.output_artifacts import FileToolOutputArtifactStore
 from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
-from neuro_code.infrastructure.providers.provider_catalog import HttpProviderCatalog
+from neuro_code.infrastructure.providers.catalog_cache import PersistentProviderCatalog
 from neuro_code.infrastructure.providers.provider_settings import JsonProviderSettingsStore
 from neuro_code.interfaces.cli.serialization import (
     serialize_context_compaction_result,
@@ -91,6 +93,7 @@ from neuro_code.interfaces.cli.serialization import (
     serialize_subagent_relationship_action,
     serialize_subagent_result,
 )
+from neuro_code.interfaces.cli.sessions import run_sessions_command
 from neuro_code.shared.errors import ConfigurationError, ProviderError
 from neuro_code.shared.ui_language import UiLanguage
 
@@ -244,7 +247,14 @@ class CliSubagentServiceFixture:
         self.projection = projection
         self.requests: list[RunSubagentRequest] = []
 
-    async def run_subagent(self, request: RunSubagentRequest) -> SubagentResultProjection:
+    async def run_subagent(
+        self,
+        request: RunSubagentRequest,
+        *,
+        parent_capabilities: SubagentCapabilitySet,
+    ) -> SubagentResultProjection:
+        if not isinstance(parent_capabilities, SubagentCapabilitySet):
+            raise AssertionError("fixture parent capability is missing")
         self.requests.append(request)
         return self.projection
 
@@ -253,10 +263,29 @@ class CliSubagentApplicationFixture:
     def __init__(self, projection: SubagentResultProjection) -> None:
         self.subagent_service = CliSubagentServiceFixture(projection)
         self.resume_checks: list[str] = []
+        self.config = cast(AppConfig, object())
+        self.parent_capabilities = SubagentCapabilitySet.from_runtime(
+            tool_names=("read_file",),
+            cwd=Path("/workspace"),
+            sandbox_profile=SandboxProfile.OFF,
+            enable_background_tasks=False,
+            max_steps=8,
+        )
+        self.binding_calls: list[tuple[AppConfig, str | None]] = []
         self.close_calls = 0
 
-    async def config_for_session_resume(self, session_id: str) -> None:
+    async def config_for_session_resume(self, session_id: str) -> AppConfig:
         self.resume_checks.append(session_id)
+        return self.config
+
+    async def create_binding(
+        self,
+        *,
+        config: AppConfig,
+        resume_id: str | None = None,
+    ) -> SimpleNamespace:
+        self.binding_calls.append((config, resume_id))
+        return SimpleNamespace(capabilities=self.parent_capabilities, background_tasks=None)
 
     def create_read_only_subagent_application_service(
         self,
@@ -333,6 +362,84 @@ class CliServicesFixture:
         self.application = application
 
     async def open_application(self, settings: ApplicationSettings) -> CliApplicationFixture:
+        del settings
+        return self.application
+
+
+class SessionCommandRunnerFixture:
+    def __init__(self) -> None:
+        self.compaction = ContextCompactionCommandResult(
+            status=ContextCompactionCommandStatus.COMPLETED,
+            triggered=True,
+            compaction_id="compaction-fixture",
+            source_item_count=2,
+            candidate_item_count=1,
+            summary_tokens=3,
+            summary_truncated=False,
+        )
+        self.retry_result = AgentRunResult(
+            "session-fixture",
+            "retried",
+            (),
+            (),
+            (),
+            1,
+        )
+        self.compact_calls = 0
+        self.retry_calls: list[str] = []
+
+    async def compact_now(self) -> ContextCompactionCommandResult:
+        self.compact_calls += 1
+        return self.compaction
+
+    async def retry_recovery(self, turn_id: str) -> AgentRunResult:
+        self.retry_calls.append(turn_id)
+        return self.retry_result
+
+
+class SessionCommandApplicationFixture:
+    def __init__(self) -> None:
+        self.runner = SessionCommandRunnerFixture()
+        self.configured_sessions: list[str] = []
+        self.binding_sessions: list[str | None] = []
+        self.close_calls = 0
+
+    async def config_for_session_resume(self, session_id: str) -> None:
+        self.configured_sessions.append(session_id)
+
+    async def create_binding(self, *, resume_id: str | None = None) -> SimpleNamespace:
+        self.binding_sessions.append(resume_id)
+        return SimpleNamespace(runner=self.runner)
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+class SessionCommandServicesFixture:
+    def __init__(self, application: SessionCommandApplicationFixture) -> None:
+        self.application = application
+        self.config = cast(AppConfig, object())
+        self.store = cast(SessionStore, object())
+
+    def load_config(self, cwd: Path | None) -> AppConfig:
+        del cwd
+        return self.config
+
+    async def create_session_store(self, config: AppConfig) -> SessionStore:
+        assert config is self.config
+        return self.store
+
+    def create_tool_output_artifact_service(
+        self,
+        config: AppConfig,
+        store: SessionStore,
+    ) -> SessionToolOutputArtifactApplicationService:
+        del config, store
+        raise AssertionError("artifact service is not expected for this fixture")
+
+    async def open_application(
+        self, settings: ApplicationSettings
+    ) -> SessionCommandApplicationFixture:
         del settings
         return self.application
 
@@ -441,6 +548,139 @@ api_key_env = "FIXTURE_KEY"
                 )
             )
         self.assertEqual(error.exception.code, 2)
+
+    def test_sessions_canonical_execution_matches_public_dispatch_for_json_and_plain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            self._write_provider_config(state)
+            environment = {
+                "HOME": str(root),
+                "NEURO_CODE_HOME": str(state),
+                "FIXTURE_KEY": "fixture-key",
+            }
+            services = BootstrapCliServices()
+
+            direct_json = io.StringIO()
+            with patch.dict("os.environ", environment, clear=True), redirect_stdout(direct_json):
+                direct_json_code = asyncio.run(
+                    run_sessions_command(
+                        build_parser().parse_args(("sessions", "--json", "--cwd", str(root))),
+                        services,
+                    )
+                )
+
+            dispatched_json = io.StringIO()
+            with (
+                patch.dict("os.environ", environment, clear=True),
+                redirect_stdout(dispatched_json),
+            ):
+                dispatched_json_code = run(
+                    ("sessions", "--json", "--cwd", str(root)),
+                    services=services,
+                )
+
+            direct_plain = io.StringIO()
+            with patch.dict("os.environ", environment, clear=True), redirect_stdout(direct_plain):
+                direct_plain_code = asyncio.run(
+                    run_sessions_command(
+                        build_parser().parse_args(("sessions", "--cwd", str(root))),
+                        services,
+                    )
+                )
+
+            dispatched_plain = io.StringIO()
+            with (
+                patch.dict("os.environ", environment, clear=True),
+                redirect_stdout(dispatched_plain),
+            ):
+                dispatched_plain_code = run(("sessions", "--cwd", str(root)), services=services)
+
+            self.assertEqual(direct_json_code, dispatched_json_code)
+            self.assertEqual(direct_json_code, 0)
+            self.assertEqual(direct_json.getvalue(), dispatched_json.getvalue())
+            self.assertEqual(json.loads(direct_json.getvalue()), [])
+            self.assertEqual(direct_plain_code, dispatched_plain_code)
+            self.assertEqual(direct_plain_code, 0)
+            self.assertEqual(direct_plain.getvalue(), "No sessions found.\n")
+            self.assertEqual(direct_plain.getvalue(), dispatched_plain.getvalue())
+
+    def test_sessions_canonical_failure_matches_public_error_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            self._write_provider_config(state)
+            environment = {
+                "HOME": str(root),
+                "NEURO_CODE_HOME": str(state),
+                "FIXTURE_KEY": "fixture-key",
+            }
+            args = build_parser().parse_args(("sessions", "search", "--json", "--cwd", str(root)))
+            with (
+                patch.dict("os.environ", environment, clear=True),
+                self.assertRaisesRegex(
+                    ConfigurationError,
+                    "sessions search requires a non-empty query",
+                ),
+            ):
+                asyncio.run(run_sessions_command(args, BootstrapCliServices()))
+
+            errors = io.StringIO()
+            with (
+                patch.dict("os.environ", environment, clear=True),
+                redirect_stderr(errors),
+            ):
+                exit_code = run(
+                    ("sessions", "search", "--json", "--cwd", str(root)),
+                    services=BootstrapCliServices(),
+                )
+            self.assertEqual(exit_code, 2)
+            self.assertEqual(
+                errors.getvalue(),
+                "configuration error: sessions search requires a non-empty query\n",
+            )
+
+    def test_sessions_compact_and_recovery_retry_close_open_application(self) -> None:
+        compact_application = SessionCommandApplicationFixture()
+        compact_args = build_parser().parse_args(("sessions", "compact", "session-1"))
+        with redirect_stdout(io.StringIO()):
+            compact_exit = asyncio.run(
+                run_sessions_command(
+                    compact_args,
+                    SessionCommandServicesFixture(compact_application),
+                )
+            )
+
+        retry_application = SessionCommandApplicationFixture()
+        retry_args = build_parser().parse_args(
+            (
+                "sessions",
+                "recover",
+                "session-1",
+                "turn-1",
+                "--action",
+                "retry",
+                "--json",
+            )
+        )
+        with redirect_stdout(io.StringIO()):
+            retry_exit = asyncio.run(
+                run_sessions_command(
+                    retry_args,
+                    SessionCommandServicesFixture(retry_application),
+                )
+            )
+
+        self.assertEqual(compact_exit, 0)
+        self.assertEqual(compact_application.configured_sessions, ["session-1"])
+        self.assertEqual(compact_application.binding_sessions, ["session-1"])
+        self.assertEqual(compact_application.runner.compact_calls, 1)
+        self.assertEqual(compact_application.close_calls, 1)
+        self.assertEqual(retry_exit, 0)
+        self.assertEqual(retry_application.configured_sessions, ["session-1"])
+        self.assertEqual(retry_application.binding_sessions, ["session-1"])
+        self.assertEqual(retry_application.runner.retry_calls, ["turn-1"])
+        self.assertEqual(retry_application.close_calls, 1)
 
     def test_subagents_lifecycle_parser_requires_parent_and_action(self) -> None:
         args = build_parser().parse_args(
@@ -1413,6 +1653,7 @@ api_key_env = "FIXTURE_KEY"
                     managed_provider_settings: object,
                     tool_output_artifact_service: object,
                     read_only_subagent_service: object,
+                    subagent_parent_capability_provider: object,
                     subagent_relationship_query: object,
                     subagent_relationship_lifecycle: object,
                     language: UiLanguage,
@@ -1443,6 +1684,7 @@ api_key_env = "FIXTURE_KEY"
                         managed_provider_settings=managed_provider_settings,
                         tool_output_artifact_service=tool_output_artifact_service,
                         read_only_subagent_service=read_only_subagent_service,
+                        subagent_parent_capability_provider=subagent_parent_capability_provider,
                         subagent_relationship_query=subagent_relationship_query,
                         subagent_relationship_lifecycle=subagent_relationship_lifecycle,
                         language=language,
@@ -1493,7 +1735,7 @@ api_key_env = "FIXTURE_KEY"
             self.assertIsInstance(captured["turn_service"], SessionTurnService)
             self.assertEqual(captured["initial_items"], ())
             self.assertEqual(captured["language"], UiLanguage.SIMPLIFIED_CHINESE)
-            self.assertIsInstance(captured["provider_catalog"], HttpProviderCatalog)
+            self.assertIsInstance(captured["provider_catalog"], PersistentProviderCatalog)
             self.assertIsInstance(
                 captured["tool_output_artifact_service"],
                 SessionToolOutputArtifactApplicationService,
@@ -1645,6 +1887,7 @@ api_key_env = "FIXTURE_KEY"
                     managed_provider_settings: object,
                     tool_output_artifact_service: object,
                     read_only_subagent_service: object,
+                    subagent_parent_capability_provider: object,
                     subagent_relationship_query: object,
                     subagent_relationship_lifecycle: object,
                     language: UiLanguage,
@@ -1674,6 +1917,7 @@ api_key_env = "FIXTURE_KEY"
                         managed_provider_settings,
                         tool_output_artifact_service,
                         read_only_subagent_service,
+                        subagent_parent_capability_provider,
                         subagent_relationship_query,
                         subagent_relationship_lifecycle,
                         language,
@@ -1770,6 +2014,7 @@ api_key_env = "SECOND_KEY"
                     managed_provider_settings: object,
                     tool_output_artifact_service: object,
                     read_only_subagent_service: object,
+                    subagent_parent_capability_provider: object,
                     subagent_relationship_query: object,
                     subagent_relationship_lifecycle: object,
                     language: UiLanguage,
@@ -1795,6 +2040,7 @@ api_key_env = "SECOND_KEY"
                         managed_provider_settings,
                         tool_output_artifact_service,
                         read_only_subagent_service,
+                        subagent_parent_capability_provider,
                         subagent_relationship_query,
                         subagent_relationship_lifecycle,
                         language,
@@ -1938,6 +2184,7 @@ api_key_env = "SECOND_KEY"
                     managed_provider_settings: object,
                     tool_output_artifact_service: object,
                     read_only_subagent_service: object,
+                    subagent_parent_capability_provider: object,
                     subagent_relationship_query: object,
                     subagent_relationship_lifecycle: object,
                     language: UiLanguage,
@@ -1959,6 +2206,7 @@ api_key_env = "SECOND_KEY"
                         managed_provider_settings,
                         tool_output_artifact_service,
                         read_only_subagent_service,
+                        subagent_parent_capability_provider,
                         subagent_relationship_query,
                         subagent_relationship_lifecycle,
                         plan_controller,

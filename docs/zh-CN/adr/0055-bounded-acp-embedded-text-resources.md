@@ -15,16 +15,17 @@ ACP 客户端可以在 `EmbeddedResourceContentBlock` 中携带已经提供文�
 
 ## 决策
 
-ACP 只接受内嵌资源块中的 `TextResourceContents`。它直接使用已提供文本，绝不打开、解析、下载或
-解引用关联 URI。URI 与可选 MIME 类型会在文本之前成为有界 JSON 来源标签。每个提示最多接受八个
-资源、单个资源最多 64 KiB 文本、所有内嵌资源文本合计最多 128 KiB。空 URI 或文本，以及所有格式
-错误或超限的值，都会失败关闭。
+在本 ADR 接受时定义的纯文本切片中，ACP 只接受内嵌资源块中的 `TextResourceContents`。它直接
+使用已提供文本，绝不打开、解析、下载或解引用关联 URI。URI 与可选 MIME 类型会在文本之前成为
+有界 JSON 来源标签。每个提示最多接受八个资源、单个资源最多 64 KiB 文本、所有内嵌资源文本合计
+最多 128 KiB。空 URI 或文本，以及所有格式错误或超限的值，都会失败关闭。
 
-结果是一个有序文本 `ContentPart`；普通会话存储、供应商适配、脱敏和可见历史投影都会继续适用。它
+该纯文本路径的结果是一个有序文本 `ContentPart`；普通会话存储、供应商适配、脱敏和可见历史投影都会继续适用。它
 是输入数据而不是可信指令。block、resource、annotation 的 `_meta` 以及 annotations 都不会被投影，
 也不会获取或解码资源字节。
 
-`BlobResourceContents`、音频及其他不支持的提示块仍会被拒绝。二进制多媒体历史回放不属于本决定。
+当前 prompt-content boundary 也接受有界的 `BlobResourceContents` 和内嵌音频块；其他不支持的
+提示块仍会被拒绝。二进制多媒体历史回放不属于本决定。
 
 ## 后果
 

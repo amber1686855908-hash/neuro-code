@@ -51,7 +51,7 @@ for raw_line in sys.stdin:
             request_id,
             {
                 "protocolVersion": "2025-11-25",
-                "capabilities": {"tools": {}},
+                "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
                 "serverInfo": {"name": "neuro-code-test-mcp", "version": "1"},
             },
         )
@@ -75,6 +75,77 @@ for raw_line in sys.stdin:
                     _tool("empty_error", "Return an empty error result.", {}),
                     _tool("disconnect", "Exit before returning a result.", {}),
                 ]
+            },
+        )
+    elif method == "resources/list":
+        _response(
+            request_id,
+            {
+                "resources": [
+                    {
+                        "uri": "fixture://resource",
+                        "name": "fixture-resource",
+                        "description": "Fixture resource",
+                        "mimeType": "text/plain",
+                    }
+                ]
+            },
+        )
+    elif method == "resources/templates/list":
+        _response(
+            request_id,
+            {
+                "resourceTemplates": [
+                    {
+                        "uriTemplate": "fixture://resource/{name}",
+                        "name": "fixture-template",
+                        "mimeType": "text/plain",
+                    }
+                ]
+            },
+        )
+    elif method == "prompts/list":
+        _response(
+            request_id,
+            {
+                "prompts": [
+                    {
+                        "name": "fixture-prompt",
+                        "description": "Fixture prompt",
+                        "arguments": [{"name": "topic", "required": True}],
+                    }
+                ]
+            },
+        )
+    elif method == "resources/read":
+        _response(
+            request_id,
+            {
+                "contents": [
+                    {
+                        "uri": "fixture://resource",
+                        "mimeType": "text/plain",
+                        "text": "fixture resource text",
+                    },
+                    {
+                        "uri": "fixture://blob",
+                        "mimeType": "application/octet-stream",
+                        "blob": "AQI=",
+                    },
+                ]
+            },
+        )
+    elif method == "prompts/get":
+        _response(
+            request_id,
+            {
+                "description": "Fixture prompt",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": {"type": "text", "text": "fixture prompt text"},
+                    }
+                ],
             },
         )
     elif method == "tools/call":

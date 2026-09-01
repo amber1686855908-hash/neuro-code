@@ -1,57 +1,34 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import contextlib
-import hashlib
-import json
 import math
 import re
 import uuid
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, cast
-from urllib.parse import urlsplit
+from typing import Any, cast
 
-from acp.agent.router import build_agent_router
-from acp.core import Connection
 from acp.exceptions import RequestError
-from acp.interfaces import Agent, Client
-from acp.meta import AGENT_METHODS, CLIENT_METHODS
-from acp.router import MessageRouter
+from acp.interfaces import Client
 from acp.schema import (
-    AcpMcpServer,
     AgentCapabilities,
-    AgentMessageChunk,
-    Annotations,
-    AudioContentBlock,
-    BlobResourceContents,
     ClientCapabilities,
     CloseSessionResponse,
-    ContentToolCallContent,
-    DeleteSessionRequest,
     DeleteSessionResponse,
-    EmbeddedResourceContentBlock,
-    FileEditToolCallContent,
     ForkSessionResponse,
-    HttpMcpServer,
-    ImageContentBlock,
     Implementation,
     InitializeResponse,
     ListSessionsResponse,
     LoadSessionResponse,
     McpCapabilities,
-    McpServerStdio,
     NewSessionResponse,
     PermissionOption,
+    PromptCapabilities,
     PromptResponse,
-    RequestPermissionRequest,
-    RequestPermissionResponse,
-    ResourceContentBlock,
     ResumeSessionResponse,
     SessionCapabilities,
     SessionCloseCapabilities,
@@ -59,37 +36,28 @@ from acp.schema import (
     SessionForkCapabilities,
     SessionInfo,
     SessionListCapabilities,
-    SessionNotification,
     SessionResumeCapabilities,
-    SseMcpServer,
-    TerminalToolCallContent,
-    TextContentBlock,
-    TextResourceContents,
-    ToolCallLocation,
-    ToolCallProgress,
-    ToolCallStart,
-    ToolCallUpdate,
-    UsageUpdate,
-    UserMessageChunk,
 )
-from acp.stdio import stdio_streams
-from acp.utils import normalize_result, notify_model, request_model
 
 from neuro_code import __version__
 from neuro_code.application.acp.contracts import (
-    MAX_MCP_SERVERS,
-    AcpMcpHttpServerConfig,
+    MAX_MCP_SERVERS,  # noqa: F401 - legacy module compatibility
+    AcpMcpHttpServerConfig,  # noqa: F401 - legacy module compatibility
+    AcpMcpQuery,
+    AcpMcpQueryError,
     AcpMcpServerConfig,
-    AcpMcpStdioServerConfig,
+    AcpMcpStdioServerConfig,  # noqa: F401 - legacy module compatibility
     AcpMcpToolError,
     AcpMcpTools,
     AcpReadOnlySubagentQuery,
     AcpReadOnlySubagentQueryError,
     AcpResumeUnavailableError,
+    AcpSessionCommandQuery,
     AcpSubagentLifecycleQuery,
     AcpSubagentLifecycleQueryError,
     AcpToolOutputArtifactQuery,
     AcpToolOutputArtifactQueryError,
+    AcpTurnRecoveryQuery,
     AcpWorkspaceValidationError,
 )
 from neuro_code.application.acp.service import AcpApplicationService
@@ -100,10 +68,11 @@ from neuro_code.application.permissions.contracts import (
 )
 from neuro_code.application.ports.client_filesystem import ClientFileSystem
 from neuro_code.application.ports.client_terminal import (
-    MAX_CLIENT_TERMINAL_OUTPUT_BYTES,
+    MAX_CLIENT_TERMINAL_OUTPUT_BYTES,  # noqa: F401 - legacy module compatibility
     ClientTerminal,
-    ClientTerminalResult,
+    ClientTerminalResult,  # noqa: F401 - legacy module compatibility
 )
+from neuro_code.application.ports.mcp import McpElicitationHandler, McpSamplingHandler
 from neuro_code.application.ports.tools import (
     MAX_TOOL_OUTPUT_ARTIFACT_READ_BYTES,
 )
@@ -111,165 +80,141 @@ from neuro_code.application.sessions.binding import ConversationBinding
 from neuro_code.application.sessions.subagent_queries import SubagentRelationshipAction
 from neuro_code.application.sessions.turns import RunTurnRequest
 from neuro_code.application.tools.service import SessionToolOutputArtifact
-from neuro_code.domain.background_tasks.models import (
-    MAX_BACKGROUND_TASK_WAIT_IDS,
-    BackgroundTaskKillOutcome,
-    BackgroundTaskKillResult,
-    BackgroundTaskSnapshot,
-    BackgroundTaskStatus,
-    BackgroundTaskWaitMode,
-    BackgroundTaskWaitResult,
-)
-from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
-from neuro_code.domain.conversation.messages import (
-    ContentPart,
-    Message,
-    Role,
-    SessionItem,
-    ToolCall,
-)
 from neuro_code.domain.sessions import SessionSummary
+from neuro_code.interfaces.acp.client_io import (  # noqa: F401 - private compatibility aliases
+    MAX_CLIENT_FILE_BYTES,
+    MAX_CLIENT_TERMINAL_ARGUMENT_BYTES,
+    MAX_CLIENT_TERMINAL_ARGUMENT_TOTAL_BYTES,
+    MAX_CLIENT_TERMINAL_ARGUMENTS,
+    MAX_CLIENT_TERMINAL_COMMAND_BYTES,
+    MAX_CLIENT_TERMINAL_ID_BYTES,
+    MAX_CLIENT_TERMINAL_RETAINED_TASKS,
+    MAX_CLIENT_TERMINAL_SIGNAL_BYTES,
+    MAX_CLIENT_TERMINAL_TASKS,
+    _AcpClientFileSystem,
+    _AcpClientTerminal,
+    _AcpClientTerminalTask,
+    _client_terminal_background_limits,
+    _client_terminal_command,
+    _client_terminal_cwd,
+    _client_terminal_exit_status,
+    _client_terminal_id,
+    _client_terminal_limits,
+    _client_terminal_task_id,
+    _client_terminal_wait_seconds,
+)
+from neuro_code.interfaces.acp.content import (
+    MAX_ANNOTATION_AUDIENCE,
+    MAX_ANNOTATION_AUDIENCE_BYTES,
+    MAX_ANNOTATIONS_BYTES,
+    MAX_AUDIO_BLOCK_BYTES,
+    MAX_AUDIO_BLOCKS,
+    MAX_AUDIO_TOTAL_BYTES,
+    MAX_EMBEDDED_BINARY_RESOURCE_BYTES,
+    MAX_EMBEDDED_BINARY_TOTAL_BYTES,
+    MAX_EMBEDDED_TEXT_RESOURCE_BYTES,
+    MAX_EMBEDDED_TEXT_RESOURCES,
+    MAX_EMBEDDED_TEXT_TOTAL_BYTES,
+    MAX_IMAGE_BLOCK_BYTES,
+    MAX_IMAGE_BLOCKS,
+    MAX_IMAGE_TOTAL_BYTES,
+    MAX_PROMPT_BLOCKS,
+    MAX_PROMPT_BYTES,
+    MAX_RESOURCE_LINK_BYTES,
+    MAX_RESOURCE_LINKS,
+    MAX_RESOURCE_NAME_BYTES,
+    MAX_RESOURCE_URI_BYTES,
+    MAX_TEXT_BLOCK_BYTES,
+    MAX_TEXT_BLOCKS,
+    ConvertedPrompt,
+    PromptBlock,
+    convert_prompt_content,
+)
+from neuro_code.interfaces.acp.mcp_config import (  # noqa: F401 - private compatibility aliases
+    MAX_MCP_ARGUMENT_BYTES,
+    MAX_MCP_ARGUMENT_TOTAL_BYTES,
+    MAX_MCP_ARGUMENTS,
+    MAX_MCP_COMMAND_BYTES,
+    MAX_MCP_CONFIGURATION_BYTES,
+    MAX_MCP_ENVIRONMENT_NAME_BYTES,
+    MAX_MCP_ENVIRONMENT_TOTAL_BYTES,
+    MAX_MCP_ENVIRONMENT_VALUE_BYTES,
+    MAX_MCP_ENVIRONMENT_VARIABLES,
+    MAX_MCP_HTTP_HEADER_NAME_BYTES,
+    MAX_MCP_HTTP_HEADER_TOTAL_BYTES,
+    MAX_MCP_HTTP_HEADER_VALUE_BYTES,
+    MAX_MCP_HTTP_HEADERS,
+    MAX_MCP_SERVER_NAME_BYTES,
+    MAX_MCP_URL_BYTES,
+    McpServer,
+    _mcp_http_headers,
+    _mcp_http_url,
+    _mcp_server_configurations,
+    _mcp_string,
+)
 from neuro_code.interfaces.acp.serialization import (
-    AcpStopReason,
+    MAX_RESOURCE_FIELD_BYTES,
+    _bounded_identifier,
     execution_outcome_metadata,
     execution_outcome_stop_reason,
-    map_stop_reason,
     safe_output_text,
-    sanitize_controls,
     serialize_subagent_lifecycle_action,
     serialize_subagent_result,
     serialized_size_bytes,
-    truncate_utf8,
 )
+from neuro_code.interfaces.acp.session import (
+    AcpSessionApprovalAlreadyPendingError,
+    AcpSessionIdentityConflictError,
+    AcpSessionIdentityUnavailableError,
+    AcpSessionInactiveError,
+    AcpSessionPromptAlreadyActiveError,
+    AcpSessionRuntime,
+)
+from neuro_code.interfaces.acp.transport import (  # noqa: F401 - private compatibility aliases
+    ACP_STDIO_BUFFER_LIMIT_BYTES,
+    _AcpSdkConnection,
+    _build_acp_router,
+    _WebSocketWriter,
+    stdio_streams,
+)
+from neuro_code.interfaces.acp.transport import (
+    serve_stdio as _serve_stdio,
+)
+from neuro_code.interfaces.acp.transport import (
+    serve_websocket as _serve_websocket,
+)
+from neuro_code.interfaces.acp.updates import _AcpEventMapper, _history_updates
 from neuro_code.shared.errors import ConfigurationError, ProviderError, SessionError, ToolError
 
 ACP_PROTOCOL_VERSION = 1
-ACP_STDIO_BUFFER_LIMIT_BYTES = 1024 * 1024
 
-MAX_PROMPT_BLOCKS = 96
-MAX_TEXT_BLOCKS = 64
-MAX_TEXT_BLOCK_BYTES = 64 * 1024
-MAX_PROMPT_BYTES = 256 * 1024
-MAX_IMAGE_BLOCKS = 8
-MAX_IMAGE_BLOCK_BYTES = 5 * 1024 * 1024
-MAX_IMAGE_TOTAL_BYTES = 10 * 1024 * 1024
-MAX_EMBEDDED_TEXT_RESOURCES = 8
-MAX_EMBEDDED_TEXT_RESOURCE_BYTES = 64 * 1024
-MAX_EMBEDDED_TEXT_TOTAL_BYTES = 128 * 1024
-MAX_RESOURCE_LINKS = 32
-MAX_RESOURCE_LINK_BYTES = 64 * 1024
-MAX_RESOURCE_URI_BYTES = 4 * 1024
-MAX_RESOURCE_NAME_BYTES = 512
-MAX_RESOURCE_FIELD_BYTES = 2 * 1024
-MAX_ANNOTATIONS_BYTES = 4 * 1024
-MAX_ANNOTATION_AUDIENCE = 16
-MAX_ANNOTATION_AUDIENCE_BYTES = 128
-MAX_UPDATE_TEXT_BYTES = 64 * 1024
-MAX_TURN_UPDATE_BYTES = 1024 * 1024
-MAX_TOOL_CONTENT_BYTES = 32 * 1024
 MAX_SESSION_ID_BYTES = 512
-MAX_LOAD_SESSION_ITEMS = 2_000
-MAX_LOAD_SESSION_UPDATES = 4_096
-MAX_LOAD_SESSION_BYTES = 2 * 1024 * 1024
 ACP_SESSION_LIST_PAGE_SIZE = 50
 MAX_SESSION_LIST_SCAN_ITEMS = 5_000
 SESSION_LIST_SCAN_BATCH_SIZE = 250
 MAX_SESSION_LIST_CURSORS = 256
 MAX_SESSION_LIST_CURSOR_BYTES = 128
-MAX_MCP_SERVER_NAME_BYTES = 128
-MAX_MCP_COMMAND_BYTES = 4 * 1024
-MAX_MCP_ARGUMENTS = 64
-MAX_MCP_ARGUMENT_BYTES = 4 * 1024
-MAX_MCP_ARGUMENT_TOTAL_BYTES = 32 * 1024
-MAX_MCP_ENVIRONMENT_VARIABLES = 64
-MAX_MCP_ENVIRONMENT_NAME_BYTES = 256
-MAX_MCP_ENVIRONMENT_VALUE_BYTES = 16 * 1024
-MAX_MCP_ENVIRONMENT_TOTAL_BYTES = 64 * 1024
-MAX_MCP_URL_BYTES = 8 * 1024
-MAX_MCP_HTTP_HEADERS = 64
-MAX_MCP_HTTP_HEADER_NAME_BYTES = 256
-MAX_MCP_HTTP_HEADER_VALUE_BYTES = 16 * 1024
-MAX_MCP_HTTP_HEADER_TOTAL_BYTES = 64 * 1024
-MAX_MCP_CONFIGURATION_BYTES = 256 * 1024
-MAX_CLIENT_FILE_BYTES = 1024 * 1024
-MAX_CLIENT_TERMINAL_COMMAND_BYTES = 4 * 1024
-MAX_CLIENT_TERMINAL_ARGUMENTS = 64
-MAX_CLIENT_TERMINAL_ARGUMENT_BYTES = 4 * 1024
-MAX_CLIENT_TERMINAL_ARGUMENT_TOTAL_BYTES = 32 * 1024
-MAX_CLIENT_TERMINAL_ID_BYTES = 512
-MAX_CLIENT_TERMINAL_SIGNAL_BYTES = 128
-MAX_CLIENT_TERMINAL_TASKS = 8
-MAX_CLIENT_TERMINAL_RETAINED_TASKS = 32
+MAX_MCP_RESOURCE_BYTES = 512 * 1024
+MAX_MCP_SAMPLING_MESSAGES = 128
+MAX_MCP_SAMPLING_TOKENS = 1_000_000
+MAX_MCP_ELICITATION_MESSAGE_BYTES = 64 * 1024
+MAX_MCP_CALLBACK_BYTES = 256 * 1024
 ACP_TOOL_OUTPUT_ARTIFACT_EXTENSION = "neuro-code/session/artifacts"
 ACP_READ_ONLY_SUBAGENT_EXTENSION = "neuro-code/session/subagent"
 ACP_SUBAGENT_LIFECYCLE_EXTENSION = "neuro-code/session/subagents"
+ACP_MCP_EXTENSION = "neuro-code/session/mcp"
+ACP_CONTEXT_COMPACTION_EXTENSION = "neuro-code/session/compact"
+ACP_TURN_RECOVERY_EXTENSION = "neuro-code/session/recovery"
 
 _SESSION_NOT_ACTIVE = -32001
 _SESSION_NOT_FOUND = -32002
 _SESSION_BUSY = -32003
 _ACP_SESSION_ALIAS_NAMESPACE = "acp-v1"
 _ACP_SUBAGENT_LIFECYCLE_ALIAS_ATTEMPTS = 4
-_ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
-_HTTP_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
-_ACP_IMAGE_MEDIA_TYPES = frozenset(
-    {
-        "image/avif",
-        "image/gif",
-        "image/heic",
-        "image/heif",
-        "image/jpeg",
-        "image/png",
-        "image/webp",
-    }
-)
-_ACP_IMAGE_MEDIA_TYPE_ALIASES = {"image/jpg": "image/jpeg"}
-_RESERVED_MCP_HTTP_HEADERS = frozenset(
-    {
-        "accept",
-        "connection",
-        "content-length",
-        "content-type",
-        "host",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-    }
-)
-_TOOL_KINDS: dict[str, Literal["read", "edit", "search", "execute", "other"]] = {
-    "read_file": "read",
-    "list_dir": "read",
-    "grep": "search",
-    "search_replace": "edit",
-    "bash": "execute",
-    "terminal_exec": "execute",
-    "task_output": "execute",
-    "wait_tasks": "execute",
-    "kill_task": "execute",
-}
 
-PromptBlock = (
-    TextContentBlock
-    | ImageContentBlock
-    | AudioContentBlock
-    | ResourceContentBlock
-    | EmbeddedResourceContentBlock
-)
-McpServer = HttpMcpServer | SseMcpServer | AcpMcpServer | McpServerStdio
-HistoryUpdate = UserMessageChunk | AgentMessageChunk | ToolCallStart | ToolCallProgress
-
-
-@dataclass(frozen=True, slots=True)
-class ConvertedPrompt:
-    """Bounded model input preserving ACP text, image, and link ordering.
-
-    保持 ACP 文本,图像和链接顺序的有界模型输入."""
-
-    content: str
-    content_parts: tuple[ContentPart, ...]
+# Private compatibility alias retained for behavior-focused repository tests.
+# The canonical implementation lives in interfaces.acp.session.
+_AcpSession = AcpSessionRuntime
 
 
 def _invalid_params(reason: str, details: str | None = None) -> RequestError:
@@ -303,17 +248,6 @@ def _session_busy(session_id: str, reason: str) -> RequestError:
     )
 
 
-def _bounded_identifier(value: object) -> str:
-    if not isinstance(value, str) or not value:
-        return "unknown"
-    if len(value.encode("utf-8")) <= 256 and all(
-        ord(character) >= 32 and ord(character) != 127 for character in value
-    ):
-        return value
-    digest = hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()
-    return f"id-{digest}"
-
-
 def _validated_session_id(value: object) -> str:
     if not isinstance(value, str) or not value:
         raise _invalid_params("session_id_invalid")
@@ -324,426 +258,49 @@ def _validated_session_id(value: object) -> str:
     return value
 
 
-def _bounded_input_text(value: str, *, limit: int, field_name: str) -> str:
-    sanitized = sanitize_controls(value)
-    if len(sanitized.encode("utf-8")) > limit:
-        raise _invalid_params(f"{field_name}_too_large")
-    return sanitized
-
-
-def _mcp_string(
+def _safe_mcp_extension_value(
     value: object,
     *,
-    limit: int,
-    reason: str,
-    allow_empty: bool = False,
-    allow_controls: bool = False,
-) -> str:
-    if not isinstance(value, str) or (not value and not allow_empty):
-        raise _invalid_params(reason)
-    if (
-        "\x00" in value
-        or (
-            not allow_controls
-            and any(ord(character) < 32 or ord(character) == 127 for character in value)
-        )
-        or len(value.encode("utf-8")) > limit
-    ):
-        raise _invalid_params(reason)
-    return value
+    explicit_redactions: tuple[str, ...],
+    depth: int = 0,
+) -> object:
+    """Project untrusted MCP metadata into bounded, redacted JSON values."""
 
-
-def _mcp_server_configurations(
-    servers: list[McpServer] | None,
-    *,
-    protected_environment_variables: frozenset[str],
-) -> tuple[AcpMcpServerConfig, ...]:
-    if not servers:
-        return ()
-    if len(servers) > MAX_MCP_SERVERS:
-        raise _invalid_params("too_many_mcp_servers")
-
-    protected = {name.casefold() for name in protected_environment_variables}
-    configurations: list[AcpMcpServerConfig] = []
-    server_names: set[str] = set()
-    serialized: list[dict[str, object]] = []
-    for server in servers:
-        if not isinstance(server, HttpMcpServer | SseMcpServer | AcpMcpServer | McpServerStdio):
-            raise _invalid_params("mcp_transport_unsupported")
-        name = _mcp_string(
-            server.name,
-            limit=MAX_MCP_SERVER_NAME_BYTES,
-            reason="mcp_server_name_invalid",
-        )
-        folded_name = name.casefold()
-        if folded_name in server_names:
-            raise _invalid_params("mcp_server_name_duplicate")
-        server_names.add(folded_name)
-        if isinstance(server, HttpMcpServer | SseMcpServer):
-            url = _mcp_http_url(server.url)
-            headers = _mcp_http_headers(server.headers)
-            serialized.append(
-                {
-                    "name": name,
-                    "transport": server.type,
-                    "url": url,
-                    "headers": dict(headers),
-                }
+    if depth >= 5:
+        return "<nested-value-omitted>"
+    if isinstance(value, str):
+        return safe_output_text(value, 16 * 1024, explicit_redactions=explicit_redactions)
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, Mapping):
+        result: dict[str, object] = {}
+        for index, (key, nested) in enumerate(value.items()):
+            if index >= 64:
+                result["<fields-omitted>"] = True
+                break
+            rendered_key = safe_output_text(
+                str(key),
+                512,
+                explicit_redactions=explicit_redactions,
             )
-            configurations.append(
-                AcpMcpHttpServerConfig(
-                    name=name,
-                    url=url,
-                    headers=tuple(headers),
-                    transport=server.type,
-                )
+            result[rendered_key] = _safe_mcp_extension_value(
+                nested,
+                explicit_redactions=explicit_redactions,
+                depth=depth + 1,
             )
-            continue
-        if not isinstance(server, McpServerStdio):
-            raise _invalid_params("mcp_transport_unsupported")
-        command = _mcp_string(
-            server.command,
-            limit=MAX_MCP_COMMAND_BYTES,
-            reason="mcp_server_command_invalid",
-        )
-        if len(server.args) > MAX_MCP_ARGUMENTS:
-            raise _invalid_params("too_many_mcp_server_arguments")
-        arguments: list[str] = []
-        argument_bytes = 0
-        for argument in server.args:
-            rendered = _mcp_string(
-                argument,
-                limit=MAX_MCP_ARGUMENT_BYTES,
-                reason="mcp_server_argument_invalid",
-                allow_empty=True,
+        return result
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray, str)):
+        return [
+            _safe_mcp_extension_value(
+                nested,
+                explicit_redactions=explicit_redactions,
+                depth=depth + 1,
             )
-            argument_bytes += len(rendered.encode("utf-8"))
-            if argument_bytes > MAX_MCP_ARGUMENT_TOTAL_BYTES:
-                raise _invalid_params("mcp_server_arguments_too_large")
-            arguments.append(rendered)
-
-        if len(server.env) > MAX_MCP_ENVIRONMENT_VARIABLES:
-            raise _invalid_params("too_many_mcp_environment_variables")
-        environment: list[tuple[str, str]] = []
-        environment_names: set[str] = set()
-        environment_bytes = 0
-        for variable in server.env:
-            variable_name = _mcp_string(
-                variable.name,
-                limit=MAX_MCP_ENVIRONMENT_NAME_BYTES,
-                reason="mcp_environment_name_invalid",
-            )
-            folded_variable_name = variable_name.casefold()
-            if (
-                not _ENVIRONMENT_NAME.fullmatch(variable_name)
-                or folded_variable_name in environment_names
-            ):
-                raise _invalid_params("mcp_environment_name_invalid")
-            if folded_variable_name in protected:
-                raise _invalid_params("mcp_environment_protected")
-            environment_names.add(folded_variable_name)
-            variable_value = _mcp_string(
-                variable.value,
-                limit=MAX_MCP_ENVIRONMENT_VALUE_BYTES,
-                reason="mcp_environment_value_invalid",
-                allow_empty=True,
-                allow_controls=True,
-            )
-            environment_bytes += len(variable_name.encode("utf-8")) + len(
-                variable_value.encode("utf-8")
-            )
-            if environment_bytes > MAX_MCP_ENVIRONMENT_TOTAL_BYTES:
-                raise _invalid_params("mcp_environment_too_large")
-            environment.append((variable_name, variable_value))
-        serialized.append(
-            {
-                "name": name,
-                "command": command,
-                "args": arguments,
-                "env": dict(environment),
-            }
-        )
-        configurations.append(
-            AcpMcpStdioServerConfig(
-                name=name,
-                command=command,
-                args=tuple(arguments),
-                env=tuple(environment),
-            )
-        )
-    if serialized_size_bytes(serialized) > MAX_MCP_CONFIGURATION_BYTES:
-        raise _invalid_params("mcp_configuration_too_large")
-    return tuple(configurations)
-
-
-def _mcp_http_url(value: object) -> str:
-    url = _mcp_string(
-        value,
-        limit=MAX_MCP_URL_BYTES,
-        reason="mcp_http_url_invalid",
-    )
-    try:
-        parsed = urlsplit(url)
-        port = parsed.port
-    except ValueError:
-        raise _invalid_params("mcp_http_url_invalid") from None
-    if (
-        parsed.scheme not in {"http", "https"}
-        or not parsed.netloc
-        or parsed.hostname is None
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.fragment
-        or (port is not None and not 0 < port <= 65_535)
-    ):
-        raise _invalid_params("mcp_http_url_invalid")
-    return url
-
-
-def _mcp_http_headers(headers: Sequence[Any]) -> list[tuple[str, str]]:
-    if len(headers) > MAX_MCP_HTTP_HEADERS:
-        raise _invalid_params("too_many_mcp_http_headers")
-    values: list[tuple[str, str]] = []
-    names: set[str] = set()
-    total_bytes = 0
-    for header in headers:
-        name = _mcp_string(
-            header.name,
-            limit=MAX_MCP_HTTP_HEADER_NAME_BYTES,
-            reason="mcp_http_header_name_invalid",
-        )
-        folded_name = name.casefold()
-        if not _HTTP_HEADER_NAME.fullmatch(name) or folded_name in names:
-            raise _invalid_params("mcp_http_header_name_invalid")
-        if folded_name in _RESERVED_MCP_HTTP_HEADERS:
-            raise _invalid_params("mcp_http_header_reserved")
-        value = _mcp_string(
-            header.value,
-            limit=MAX_MCP_HTTP_HEADER_VALUE_BYTES,
-            reason="mcp_http_header_value_invalid",
-            allow_empty=True,
-        )
-        total_bytes += len(name.encode("utf-8")) + len(value.encode("utf-8"))
-        if total_bytes > MAX_MCP_HTTP_HEADER_TOTAL_BYTES:
-            raise _invalid_params("mcp_http_headers_too_large")
-        names.add(folded_name)
-        values.append((name, value))
-    return values
-
-
-def _annotations_payload(annotations: Annotations | None) -> dict[str, object] | None:
-    if annotations is None:
-        return None
-    payload: dict[str, object] = {}
-    if annotations.audience is not None:
-        if len(annotations.audience) > MAX_ANNOTATION_AUDIENCE:
-            raise _invalid_params("resource_annotations_too_large")
-        payload["audience"] = [
-            _bounded_input_text(
-                audience,
-                limit=MAX_ANNOTATION_AUDIENCE_BYTES,
-                field_name="resource_annotation_audience",
-            )
-            for audience in annotations.audience
+            for nested in value[:64]
         ]
-    if annotations.last_modified is not None:
-        payload["lastModified"] = _bounded_input_text(
-            annotations.last_modified,
-            limit=MAX_RESOURCE_FIELD_BYTES,
-            field_name="resource_annotation_last_modified",
-        )
-    if annotations.priority is not None:
-        if not math.isfinite(annotations.priority):
-            raise _invalid_params("resource_annotation_priority_invalid")
-        payload["priority"] = annotations.priority
-    if serialized_size_bytes(payload) > MAX_ANNOTATIONS_BYTES:
-        raise _invalid_params("resource_annotations_too_large")
-    return payload or None
-
-
-def _resource_payload(resource: ResourceContentBlock) -> dict[str, object]:
-    payload: dict[str, object] = {
-        "uri": _bounded_input_text(
-            resource.uri,
-            limit=MAX_RESOURCE_URI_BYTES,
-            field_name="resource_uri",
-        ),
-        "name": _bounded_input_text(
-            resource.name,
-            limit=MAX_RESOURCE_NAME_BYTES,
-            field_name="resource_name",
-        ),
-    }
-    for source_name, wire_name in (
-        ("title", "title"),
-        ("description", "description"),
-        ("mime_type", "mimeType"),
-    ):
-        value = getattr(resource, source_name)
-        if value is not None:
-            payload[wire_name] = _bounded_input_text(
-                value,
-                limit=MAX_RESOURCE_FIELD_BYTES,
-                field_name=f"resource_{source_name}",
-            )
-    if resource.size is not None:
-        if resource.size < 0:
-            raise _invalid_params("resource_size_invalid")
-        payload["size"] = resource.size
-    annotations = _annotations_payload(resource.annotations)
-    if annotations is not None:
-        payload["annotations"] = annotations
-    return payload
-
-
-def _image_content_part(block: ImageContentBlock) -> tuple[ContentPart, int]:
-    """Validate one inline ACP image without reading or dereferencing its URI.
-
-    验证一个 ACP 内联图像,但不读取或解引用其 URI."""
-
-    media_type = _ACP_IMAGE_MEDIA_TYPE_ALIASES.get(
-        block.mime_type.casefold(), block.mime_type.casefold()
-    )
-    if media_type not in _ACP_IMAGE_MEDIA_TYPES:
-        raise _invalid_params("image_mime_type_unsupported")
-    max_encoded_bytes = 4 * ((MAX_IMAGE_BLOCK_BYTES + 2) // 3)
-    if not block.data or len(block.data) > max_encoded_bytes:
-        raise _invalid_params("image_block_too_large")
-    try:
-        decoded = base64.b64decode(block.data, validate=True)
-    except (binascii.Error, ValueError):
-        raise _invalid_params("image_data_invalid") from None
-    if not decoded or len(decoded) > MAX_IMAGE_BLOCK_BYTES:
-        raise _invalid_params("image_block_too_large")
-    return ContentPart.from_image(f"data:{media_type};base64,{block.data}"), len(decoded)
-
-
-def _embedded_text_resource_part(
-    block: EmbeddedResourceContentBlock,
-) -> tuple[ContentPart, int]:
-    """Render an already-provided ACP text resource without resource I/O.
-
-    渲染已提供的 ACP 文本资源,不进行资源 I/O."""
-
-    resource = block.resource
-    if isinstance(resource, BlobResourceContents):
-        raise _invalid_params("embedded_resource_blob_unsupported")
-    if not isinstance(resource, TextResourceContents):
-        raise _invalid_params("embedded_resource_unsupported")
-
-    uri = _bounded_input_text(
-        resource.uri,
-        limit=MAX_RESOURCE_URI_BYTES,
-        field_name="embedded_resource_uri",
-    )
-    if not uri.strip():
-        raise _invalid_params("embedded_resource_uri_empty")
-    text = _bounded_input_text(
-        resource.text,
-        limit=MAX_EMBEDDED_TEXT_RESOURCE_BYTES,
-        field_name="embedded_resource_text",
-    )
-    if not text.strip():
-        raise _invalid_params("embedded_resource_text_empty")
-
-    metadata: dict[str, str] = {"uri": uri}
-    if resource.mime_type is not None:
-        metadata["mimeType"] = _bounded_input_text(
-            resource.mime_type,
-            limit=MAX_RESOURCE_FIELD_BYTES,
-            field_name="embedded_resource_mime_type",
-        )
-    rendered_metadata = json.dumps(
-        metadata,
-        allow_nan=False,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-    rendered = f"<embedded_resource>{rendered_metadata}</embedded_resource>\n{text}"
-    return ContentPart.from_text(rendered), len(text.encode("utf-8"))
-
-
-def convert_prompt_content(prompt: list[PromptBlock]) -> ConvertedPrompt:
-    """Convert supported ACP blocks to bounded, ordered structured model input.
-
-    将支持的 ACP 块转换为有界,有序的结构化模型输入."""
-
-    if not prompt:
-        raise _invalid_params("prompt_empty")
-    if len(prompt) > MAX_PROMPT_BLOCKS:
-        raise _invalid_params("too_many_prompt_blocks")
-
-    content_parts: list[ContentPart] = []
-    text_count = 0
-    image_count = 0
-    image_bytes = 0
-    embedded_text_resource_count = 0
-    embedded_text_resource_bytes = 0
-    resource_count = 0
-    resource_bytes = 0
-    for block in prompt:
-        if isinstance(block, TextContentBlock):
-            text_count += 1
-            if text_count > MAX_TEXT_BLOCKS:
-                raise _invalid_params("too_many_text_blocks")
-            content_parts.append(
-                ContentPart.from_text(
-                    _bounded_input_text(
-                        block.text,
-                        limit=MAX_TEXT_BLOCK_BYTES,
-                        field_name="text_block",
-                    )
-                )
-            )
-            continue
-        if isinstance(block, ImageContentBlock):
-            image_count += 1
-            if image_count > MAX_IMAGE_BLOCKS:
-                raise _invalid_params("too_many_image_blocks")
-            image, decoded_bytes = _image_content_part(block)
-            image_bytes += decoded_bytes
-            if image_bytes > MAX_IMAGE_TOTAL_BYTES:
-                raise _invalid_params("images_too_large")
-            content_parts.append(image)
-            continue
-        if isinstance(block, EmbeddedResourceContentBlock):
-            embedded_text_resource_count += 1
-            if embedded_text_resource_count > MAX_EMBEDDED_TEXT_RESOURCES:
-                raise _invalid_params("too_many_embedded_text_resources")
-            embedded_resource, embedded_resource_bytes = _embedded_text_resource_part(block)
-            embedded_text_resource_bytes += embedded_resource_bytes
-            if embedded_text_resource_bytes > MAX_EMBEDDED_TEXT_TOTAL_BYTES:
-                raise _invalid_params("embedded_text_resources_too_large")
-            content_parts.append(embedded_resource)
-            continue
-        if isinstance(block, ResourceContentBlock):
-            resource_count += 1
-            if resource_count > MAX_RESOURCE_LINKS:
-                raise _invalid_params("too_many_resource_links")
-            payload = _resource_payload(block)
-            serialized = json.dumps(
-                payload,
-                allow_nan=False,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            )
-            resource_bytes += len(serialized.encode("utf-8"))
-            if resource_bytes > MAX_RESOURCE_LINK_BYTES:
-                raise _invalid_params("resource_links_too_large")
-            content_parts.append(
-                ContentPart.from_text(f"<resource_link>{serialized}</resource_link>")
-            )
-            continue
-        raise _invalid_params("unsupported_prompt_content")
-
-    converted = "\n".join(part.text for part in content_parts if part.text is not None)
-    if not converted.strip() and not image_count:
-        raise _invalid_params("prompt_empty")
-    if len(converted.encode("utf-8")) > MAX_PROMPT_BYTES:
-        raise _invalid_params("prompt_too_large")
-    return ConvertedPrompt(converted, tuple(content_parts))
+    return safe_output_text(str(value), 512, explicit_redactions=explicit_redactions)
 
 
 def _safe_output_text(
@@ -799,957 +356,6 @@ def _artifact_read_payload(
     }
 
 
-def _tool_location_from_call(
-    tool_call: ToolCall,
-    *,
-    explicit_redactions: tuple[str, ...],
-) -> list[ToolCallLocation] | None:
-    path = tool_call.arguments.get("path")
-    if not isinstance(path, str) or not path:
-        return None
-    return [
-        ToolCallLocation(
-            path=_safe_output_text(
-                path,
-                MAX_RESOURCE_FIELD_BYTES,
-                explicit_redactions=explicit_redactions,
-            )
-        )
-    ]
-
-
-def _history_updates(
-    items: Sequence[SessionItem],
-    *,
-    explicit_redactions: tuple[str, ...],
-) -> tuple[HistoryUpdate, ...]:
-    if len(items) > MAX_LOAD_SESSION_ITEMS:
-        raise _invalid_params("session_history_too_large")
-
-    updates: list[HistoryUpdate] = []
-    pending_tools: dict[str, str] = {}
-    for item in items:
-        if not isinstance(item, Message):
-            continue
-        if item.role is Role.USER:
-            content = _safe_output_text(
-                item.model_content(),
-                MAX_UPDATE_TEXT_BYTES,
-                explicit_redactions=explicit_redactions,
-            )
-            if content:
-                updates.append(
-                    UserMessageChunk(
-                        session_update="user_message_chunk",
-                        content=TextContentBlock(type="text", text=content),
-                        message_id=str(uuid.uuid4()),
-                    )
-                )
-            continue
-        if item.role is Role.ASSISTANT:
-            content = _safe_output_text(
-                item.content,
-                MAX_UPDATE_TEXT_BYTES,
-                explicit_redactions=explicit_redactions,
-            )
-            if content:
-                updates.append(
-                    AgentMessageChunk(
-                        session_update="agent_message_chunk",
-                        content=TextContentBlock(type="text", text=content),
-                        message_id=str(uuid.uuid4()),
-                    )
-                )
-            for tool_call in item.tool_calls:
-                call_id = _bounded_identifier(tool_call.id)
-                name = (
-                    _safe_output_text(
-                        tool_call.name,
-                        256,
-                        explicit_redactions=explicit_redactions,
-                    )
-                    or "tool"
-                )
-                pending_tools[call_id] = name
-                updates.append(
-                    ToolCallStart(
-                        session_update="tool_call",
-                        tool_call_id=call_id,
-                        title=name,
-                        kind=_TOOL_KINDS.get(name, "other"),
-                        status="pending",
-                        locations=_tool_location_from_call(
-                            tool_call,
-                            explicit_redactions=explicit_redactions,
-                        ),
-                    )
-                )
-            continue
-        if item.role is Role.TOOL:
-            call_id = _bounded_identifier(item.tool_call_id)
-            if call_id not in pending_tools:
-                name = (
-                    _safe_output_text(
-                        item.name,
-                        256,
-                        explicit_redactions=explicit_redactions,
-                    )
-                    or "tool"
-                )
-                pending_tools[call_id] = name
-                updates.append(
-                    ToolCallStart(
-                        session_update="tool_call",
-                        tool_call_id=call_id,
-                        title=name,
-                        kind=_TOOL_KINDS.get(name, "other"),
-                        status="pending",
-                    )
-                )
-            content = _safe_output_text(
-                item.content,
-                MAX_TOOL_CONTENT_BYTES,
-                explicit_redactions=explicit_redactions,
-            )
-            blocks: (
-                list[ContentToolCallContent | FileEditToolCallContent | TerminalToolCallContent]
-                | None
-            ) = (
-                [
-                    ContentToolCallContent(
-                        type="content",
-                        content=TextContentBlock(type="text", text=content),
-                    )
-                ]
-                if content
-                else None
-            )
-            updates.append(
-                ToolCallProgress(
-                    session_update="tool_call_update",
-                    tool_call_id=call_id,
-                    status="completed",
-                    content=blocks,
-                )
-            )
-            pending_tools.pop(call_id, None)
-
-    updates.extend(
-        ToolCallProgress(
-            session_update="tool_call_update",
-            tool_call_id=call_id,
-            status="failed",
-        )
-        for call_id in pending_tools
-    )
-    if len(updates) > MAX_LOAD_SESSION_UPDATES:
-        raise _invalid_params("session_history_too_large")
-    total_bytes = sum(
-        serialized_size_bytes(update.model_dump(by_alias=True, exclude_none=True))
-        for update in updates
-    )
-    if total_bytes > MAX_LOAD_SESSION_BYTES:
-        raise _invalid_params("session_history_too_large")
-    return tuple(updates)
-
-
-class _AcpEventMapper:
-    def __init__(
-        self,
-        *,
-        client: Client,
-        session_id: str,
-        context_window_tokens: int | None,
-        explicit_redactions: tuple[str, ...],
-        on_session_started: Callable[[str], Awaitable[None]] | None = None,
-    ) -> None:
-        self._client = client
-        self._session_id = session_id
-        self._context_window_tokens = context_window_tokens
-        self._explicit_redactions = explicit_redactions
-        self._on_session_started = on_session_started
-        self._message_id = str(uuid.uuid4())
-        self._tool_names: dict[str, str] = {}
-        self._started_tools: set[str] = set()
-        self._sent_text_bytes = 0
-        self.stop_reason: AcpStopReason = "end_turn"
-
-    def tool_call_id(self, value: object) -> str:
-        return _bounded_identifier(value)
-
-    def permission_tool_call(self, request: PermissionRequest) -> ToolCallUpdate:
-        return ToolCallUpdate(
-            tool_call_id=self.tool_call_id(request.call_id),
-            kind=_TOOL_KINDS.get(request.tool_name, "other"),
-            status="pending",
-            title=self._safe_text(request.summary, MAX_RESOURCE_FIELD_BYTES),
-        )
-
-    def _safe_text(self, value: object, limit: int) -> str:
-        return _safe_output_text(
-            value,
-            limit,
-            explicit_redactions=self._explicit_redactions,
-        )
-
-    def _tool_location(self, event: AgentEvent) -> list[ToolCallLocation] | None:
-        arguments = event.data.get("arguments")
-        if not isinstance(arguments, dict):
-            return None
-        path = arguments.get("path")
-        if not isinstance(path, str) or not path:
-            return None
-        return [ToolCallLocation(path=self._safe_text(path, MAX_RESOURCE_FIELD_BYTES))]
-
-    async def _send_tool_start(self, event: AgentEvent) -> None:
-        call_id = self.tool_call_id(event.data.get("id"))
-        name = self._safe_text(event.data.get("name"), 256) or "tool"
-        self._tool_names[call_id] = name
-        self._started_tools.add(call_id)
-        await self._client.session_update(
-            self._session_id,
-            ToolCallStart(
-                session_update="tool_call",
-                tool_call_id=call_id,
-                title=name,
-                kind=_TOOL_KINDS.get(name, "other"),
-                status="pending",
-                locations=self._tool_location(event),
-            ),
-        )
-
-    async def _ensure_tool_start(self, event: AgentEvent) -> str:
-        call_id = self.tool_call_id(event.data.get("id"))
-        if call_id not in self._started_tools:
-            await self._send_tool_start(event)
-        return call_id
-
-    async def __call__(self, event: AgentEvent) -> None:
-        if event.kind is AgentEventKind.SESSION_STARTED:
-            session_id = event.data.get("session_id")
-            if self._on_session_started is not None and isinstance(session_id, str) and session_id:
-                await self._on_session_started(session_id)
-            return
-        if event.kind is AgentEventKind.TEXT_DELTA:
-            text = self._safe_text(event.data.get("text"), MAX_UPDATE_TEXT_BYTES)
-            remaining = MAX_TURN_UPDATE_BYTES - self._sent_text_bytes
-            if remaining <= 0 or not text:
-                return
-            text = truncate_utf8(text, remaining)
-            self._sent_text_bytes += len(text.encode("utf-8"))
-            await self._client.session_update(
-                self._session_id,
-                AgentMessageChunk(
-                    session_update="agent_message_chunk",
-                    content=TextContentBlock(type="text", text=text),
-                    message_id=self._message_id,
-                ),
-            )
-            return
-        if event.kind is AgentEventKind.TOOL_REQUESTED:
-            await self._send_tool_start(event)
-            return
-        if event.kind is AgentEventKind.TOOL_STARTED:
-            call_id = await self._ensure_tool_start(event)
-            await self._client.session_update(
-                self._session_id,
-                ToolCallProgress(
-                    session_update="tool_call_update",
-                    tool_call_id=call_id,
-                    status="in_progress",
-                ),
-            )
-            return
-        if event.kind in {AgentEventKind.TOOL_COMPLETED, AgentEventKind.TOOL_FAILED}:
-            call_id = await self._ensure_tool_start(event)
-            content = self._safe_text(event.data.get("content"), MAX_TOOL_CONTENT_BYTES)
-            blocks: (
-                list[ContentToolCallContent | FileEditToolCallContent | TerminalToolCallContent]
-                | None
-            ) = (
-                [
-                    ContentToolCallContent(
-                        type="content",
-                        content=TextContentBlock(type="text", text=content),
-                    )
-                ]
-                if content
-                else None
-            )
-            await self._client.session_update(
-                self._session_id,
-                ToolCallProgress(
-                    session_update="tool_call_update",
-                    tool_call_id=call_id,
-                    status=(
-                        "completed" if event.kind is AgentEventKind.TOOL_COMPLETED else "failed"
-                    ),
-                    content=blocks,
-                ),
-            )
-            return
-        if event.kind is AgentEventKind.CONTEXT_USAGE_UPDATED:
-            used = event.data.get("used_tokens")
-            if isinstance(used, int) and used >= 0 and self._context_window_tokens is not None:
-                await self._client.session_update(
-                    self._session_id,
-                    UsageUpdate(
-                        session_update="usage_update",
-                        used=used,
-                        size=self._context_window_tokens,
-                    ),
-                )
-            return
-        if event.kind is AgentEventKind.TURN_COMPLETED:
-            self.stop_reason = map_stop_reason(event.data.get("stop_reason"))
-
-
-@dataclass(slots=True)
-class _AcpSession:
-    session_id: str
-    binding: ConversationBinding | None
-    approvals: SessionApprovalBroker
-    context_window_tokens: int | None
-    mcp_tools: AcpMcpTools | None
-    client_terminal: ClientTerminal | None = None
-    internal_session_id: str | None = None
-    prompt_task: asyncio.Task[Any] | None = None
-    mapper: _AcpEventMapper | None = None
-    pending_approval_id: str | None = None
-    cancel_requested: bool = False
-    closing: bool = False
-    closed: bool = False
-    state_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    cleanup_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-
-
-@dataclass(slots=True)
-class _AcpClientTerminalTask:
-    task_id: str
-    terminal_id: str
-    command: str
-    cwd: str
-    output_byte_limit: int
-    timeout_seconds: float | None
-    started_at: datetime
-    status: BackgroundTaskStatus = BackgroundTaskStatus.RUNNING
-    output: str = ""
-    total_output_bytes: int = 0
-    truncated: bool = False
-    exit_code: int | None = None
-    finished_at: datetime | None = None
-    kill_requested: bool = False
-    timed_out: bool = False
-    failed: bool = False
-    done: asyncio.Event = field(default_factory=asyncio.Event)
-    output_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    termination_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    watcher: asyncio.Task[None] | None = None
-
-
-class _AcpClientTerminal:
-    """Bounded standard-ACP terminal adapter for one active ACP session.
-
-    为一个活动 ACP 会话提供的有界标准 ACP 终端适配器."""
-
-    def __init__(self, client: Client, session_id: str) -> None:
-        self._client = client
-        self._session_id = session_id
-        self._tasks: dict[str, _AcpClientTerminalTask] = {}
-        self._tasks_lock = asyncio.Lock()
-        self._pending_starts = 0
-        self._closed = False
-
-    async def run(
-        self,
-        command: str,
-        arguments: Sequence[str],
-        /,
-        *,
-        cwd: Path,
-        output_byte_limit: int,
-        timeout_seconds: float,
-    ) -> ClientTerminalResult:
-        self._ensure_open()
-        validated_command, validated_arguments = _client_terminal_command(command, arguments)
-        validated_cwd = _client_terminal_cwd(cwd)
-        _client_terminal_limits(output_byte_limit, timeout_seconds)
-        terminal_id = await self._create_terminal(
-            validated_command,
-            validated_arguments,
-            cwd=validated_cwd,
-            output_byte_limit=output_byte_limit,
-        )
-        needs_kill = True
-        try:
-            try:
-                exit_status = await asyncio.wait_for(
-                    self._client.wait_for_terminal_exit(self._session_id, terminal_id),
-                    timeout_seconds,
-                )
-            except TimeoutError as error:
-                await self._best_effort_kill(terminal_id)
-                needs_kill = False
-                raise ToolError(f"command timed out after {timeout_seconds:g} seconds") from error
-            except asyncio.CancelledError:
-                await self._best_effort_kill(terminal_id)
-                needs_kill = False
-                raise
-            except Exception:
-                await self._best_effort_kill(terminal_id)
-                needs_kill = False
-                raise ToolError("ACP client terminal wait failed") from None
-
-            exit_code, signal = _client_terminal_exit_status(
-                exit_status.exit_code,
-                exit_status.signal,
-            )
-            needs_kill = False
-            try:
-                output = await self._client.terminal_output(self._session_id, terminal_id)
-                content = output.output
-                truncated = output.truncated
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                raise ToolError("ACP client terminal output failed") from None
-            if not isinstance(content, str) or not isinstance(truncated, bool):
-                raise ToolError("ACP client terminal returned an invalid response")
-            if len(content.encode("utf-8")) > output_byte_limit:
-                raise ToolError("ACP client terminal response exceeds the output limit")
-            return ClientTerminalResult(
-                output=content,
-                exit_code=exit_code,
-                signal=signal,
-                truncated=truncated,
-            )
-        finally:
-            if needs_kill:
-                await self._best_effort_kill(terminal_id)
-            await self._best_effort_release(terminal_id)
-
-    async def start_exec(
-        self,
-        command: str,
-        arguments: Sequence[str],
-        /,
-        *,
-        cwd: Path,
-        output_byte_limit: int,
-        timeout_seconds: float | None = None,
-    ) -> BackgroundTaskSnapshot:
-        """Start one direct executable and retain its standard ACP lifecycle.
-
-        启动一个直接可执行文件,并保留其标准 ACP 生命周期."""
-
-        self._ensure_open()
-        validated_command, validated_arguments = _client_terminal_command(command, arguments)
-        validated_cwd = _client_terminal_cwd(cwd)
-        _client_terminal_background_limits(output_byte_limit, timeout_seconds)
-        async with self._tasks_lock:
-            self._ensure_open()
-            self._prune_tasks()
-            running = sum(
-                task.status is BackgroundTaskStatus.RUNNING for task in self._tasks.values()
-            )
-            if running + self._pending_starts >= MAX_CLIENT_TERMINAL_TASKS:
-                raise ToolError(
-                    f"ACP client terminal task limit reached ({MAX_CLIENT_TERMINAL_TASKS} running tasks)"
-                )
-            self._pending_starts += 1
-        try:
-            terminal_id = await self._create_terminal(
-                validated_command,
-                validated_arguments,
-                cwd=validated_cwd,
-                output_byte_limit=output_byte_limit,
-            )
-        finally:
-            async with self._tasks_lock:
-                self._pending_starts -= 1
-        task = _AcpClientTerminalTask(
-            task_id=f"terminal-task-{uuid.uuid4().hex[:12]}",
-            terminal_id=terminal_id,
-            command=validated_command,
-            cwd=validated_cwd,
-            output_byte_limit=output_byte_limit,
-            timeout_seconds=timeout_seconds,
-            started_at=datetime.now(UTC),
-        )
-        async with self._tasks_lock:
-            if self._closed:
-                await self._best_effort_kill(terminal_id)
-                await self._best_effort_release(terminal_id)
-                raise ToolError("ACP client terminal is closed")
-            self._tasks[task.task_id] = task
-        task.watcher = asyncio.create_task(
-            self._watch_task(task),
-            name=f"neuro-code-acp-terminal-{task.task_id}",
-        )
-        return self._snapshot(task)
-
-    async def get(
-        self,
-        task_id: str,
-        *,
-        wait_seconds: float = 0.0,
-    ) -> BackgroundTaskSnapshot | None:
-        task = await self._task(task_id)
-        if task is None:
-            return None
-        _client_terminal_wait_seconds(wait_seconds)
-        if wait_seconds > 0 and not task.done.is_set():
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(task.done.wait(), timeout=wait_seconds)
-        if not task.done.is_set():
-            await self._refresh_output(task)
-        return self._snapshot(task)
-
-    async def wait(
-        self,
-        task_ids: tuple[str, ...],
-        *,
-        mode: BackgroundTaskWaitMode,
-        timeout_seconds: float,
-    ) -> BackgroundTaskWaitResult:
-        if not task_ids:
-            raise ToolError("ACP client terminal wait requires at least one task ID")
-        if len(task_ids) > MAX_BACKGROUND_TASK_WAIT_IDS:
-            raise ToolError(
-                f"ACP client terminal wait accepts at most {MAX_BACKGROUND_TASK_WAIT_IDS} task IDs"
-            )
-        if len(set(task_ids)) != len(task_ids):
-            raise ToolError("ACP client terminal wait IDs must be unique")
-        if not isinstance(mode, BackgroundTaskWaitMode):
-            raise ToolError("ACP client terminal wait mode is invalid")
-        _client_terminal_wait_seconds(timeout_seconds)
-
-        tasks: list[_AcpClientTerminalTask] = []
-        missing: list[str] = []
-        for task_id in task_ids:
-            task = await self._task(task_id)
-            if task is None:
-                missing.append(task_id)
-            else:
-                tasks.append(task)
-
-        def condition_met() -> bool:
-            if not tasks:
-                return True
-            if mode is BackgroundTaskWaitMode.WAIT_ANY:
-                return any(task.done.is_set() for task in tasks)
-            return all(task.done.is_set() for task in tasks)
-
-        if not condition_met() and timeout_seconds > 0:
-            waiters = [asyncio.create_task(task.done.wait()) for task in tasks]
-            try:
-                await asyncio.wait(
-                    waiters,
-                    timeout=timeout_seconds,
-                    return_when=(
-                        asyncio.FIRST_COMPLETED
-                        if mode is BackgroundTaskWaitMode.WAIT_ANY
-                        else asyncio.ALL_COMPLETED
-                    ),
-                )
-            finally:
-                for waiter in waiters:
-                    if not waiter.done():
-                        waiter.cancel()
-                await asyncio.gather(*waiters, return_exceptions=True)
-
-        snapshots: list[BackgroundTaskSnapshot] = []
-        for task in tasks:
-            if not task.done.is_set():
-                with contextlib.suppress(ToolError):
-                    await self._refresh_output(task)
-            snapshots.append(self._snapshot(task))
-        return BackgroundTaskWaitResult(
-            mode=mode,
-            snapshots=tuple(snapshots),
-            missing_task_ids=tuple(missing),
-            timed_out=not condition_met(),
-        )
-
-    async def kill(self, task_id: str) -> BackgroundTaskKillResult | None:
-        task = await self._task(task_id)
-        if task is None:
-            return None
-        if task.done.is_set():
-            return BackgroundTaskKillResult(
-                BackgroundTaskKillOutcome.ALREADY_EXITED, self._snapshot(task)
-            )
-        async with task.termination_lock:
-            if task.done.is_set():
-                return BackgroundTaskKillResult(
-                    BackgroundTaskKillOutcome.ALREADY_EXITED,
-                    self._snapshot(task),
-                )
-            task.kill_requested = True
-            await self._best_effort_kill(task.terminal_id)
-            watcher = task.watcher
-            if watcher is not None and watcher is not asyncio.current_task() and not watcher.done():
-                watcher.cancel()
-        await task.done.wait()
-        return BackgroundTaskKillResult(BackgroundTaskKillOutcome.KILLED, self._snapshot(task))
-
-    async def shutdown(self) -> None:
-        async with self._tasks_lock:
-            if self._closed:
-                return
-            self._closed = True
-            tasks = tuple(self._tasks.values())
-        await asyncio.gather(*(self.kill(task.task_id) for task in tasks), return_exceptions=True)
-        async with self._tasks_lock:
-            self._tasks.clear()
-
-    async def _watch_task(self, task: _AcpClientTerminalTask) -> None:
-        try:
-            wait = self._client.wait_for_terminal_exit(self._session_id, task.terminal_id)
-            if task.timeout_seconds is None:
-                response = await wait
-            else:
-                try:
-                    response = await asyncio.wait_for(wait, timeout=task.timeout_seconds)
-                except TimeoutError:
-                    task.timed_out = True
-                    await self._best_effort_kill(task.terminal_id)
-                    response = None
-            if response is not None:
-                task.exit_code, signal = _client_terminal_exit_status(
-                    response.exit_code,
-                    response.signal,
-                )
-                task.failed = task.failed or signal is not None
-        except asyncio.CancelledError:
-            task.kill_requested = True
-            await self._best_effort_kill(task.terminal_id)
-        except Exception:
-            task.failed = True
-            await self._best_effort_kill(task.terminal_id)
-        finally:
-            try:
-                await self._refresh_output(task)
-            except ToolError:
-                task.failed = True
-            if task.kill_requested:
-                task.status = BackgroundTaskStatus.CANCELLED
-            elif task.timed_out:
-                task.status = BackgroundTaskStatus.TIMED_OUT
-            elif task.failed or task.exit_code != 0:
-                task.status = BackgroundTaskStatus.FAILED
-            else:
-                task.status = BackgroundTaskStatus.COMPLETED
-            task.finished_at = datetime.now(UTC)
-            task.done.set()
-            await self._best_effort_release(task.terminal_id)
-
-    async def _refresh_output(self, task: _AcpClientTerminalTask) -> None:
-        async with task.output_lock:
-            if task.done.is_set():
-                return
-            try:
-                response = await self._client.terminal_output(self._session_id, task.terminal_id)
-                output = response.output
-                truncated = response.truncated
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                raise ToolError("ACP client terminal output failed") from None
-            if not isinstance(output, str) or not isinstance(truncated, bool):
-                raise ToolError("ACP client terminal returned an invalid response")
-            output_bytes = len(output.encode("utf-8"))
-            if output_bytes > task.output_byte_limit:
-                raise ToolError("ACP client terminal response exceeds the output limit")
-            task.output = output
-            task.total_output_bytes = max(task.total_output_bytes, output_bytes)
-            task.truncated = task.truncated or truncated
-
-    async def _task(self, task_id: object) -> _AcpClientTerminalTask | None:
-        validated_task_id = _client_terminal_task_id(task_id)
-        async with self._tasks_lock:
-            return self._tasks.get(validated_task_id)
-
-    def _prune_tasks(self) -> None:
-        overflow = len(self._tasks) - MAX_CLIENT_TERMINAL_RETAINED_TASKS + 1
-        if overflow <= 0:
-            return
-        completed = [task_id for task_id, task in self._tasks.items() if task.done.is_set()]
-        for task_id in completed[:overflow]:
-            del self._tasks[task_id]
-        if len(self._tasks) >= MAX_CLIENT_TERMINAL_RETAINED_TASKS:
-            raise ToolError(
-                "ACP client terminal task retention limit reached "
-                f"({MAX_CLIENT_TERMINAL_RETAINED_TASKS} tasks)"
-            )
-
-    @staticmethod
-    def _snapshot(task: _AcpClientTerminalTask) -> BackgroundTaskSnapshot:
-        return BackgroundTaskSnapshot(
-            task_id=task.task_id,
-            command=task.command,
-            cwd=task.cwd,
-            status=task.status,
-            output=task.output,
-            total_output_bytes=task.total_output_bytes,
-            truncated=task.truncated,
-            exit_code=task.exit_code,
-            started_at=task.started_at,
-            finished_at=task.finished_at,
-        )
-
-    def _ensure_open(self) -> None:
-        if self._closed:
-            raise ToolError("ACP client terminal is closed")
-
-    async def _create_terminal(
-        self,
-        command: str,
-        arguments: tuple[str, ...],
-        *,
-        cwd: str,
-        output_byte_limit: int,
-    ) -> str:
-        creation = asyncio.create_task(
-            self._client.create_terminal(
-                self._session_id,
-                command,
-                args=list(arguments),
-                cwd=cwd,
-                output_byte_limit=output_byte_limit,
-            )
-        )
-        try:
-            response = await asyncio.shield(creation)
-        except asyncio.CancelledError:
-            with contextlib.suppress(BaseException):
-                response = await creation
-                terminal_id = _client_terminal_id(response.terminal_id)
-                await self._best_effort_kill(terminal_id)
-                await self._best_effort_release(terminal_id)
-            raise
-        except Exception:
-            raise ToolError("ACP client terminal creation failed") from None
-        return _client_terminal_id(response.terminal_id)
-
-    async def _best_effort_kill(self, terminal_id: str) -> None:
-        await self._best_effort_terminal_request(
-            self._client.kill_terminal(self._session_id, terminal_id)
-        )
-
-    async def _best_effort_release(self, terminal_id: str) -> None:
-        await self._best_effort_terminal_request(
-            self._client.release_terminal(self._session_id, terminal_id)
-        )
-
-    @staticmethod
-    async def _best_effort_terminal_request(request: Awaitable[object]) -> None:
-        operation = asyncio.ensure_future(request)
-        try:
-            await asyncio.shield(operation)
-        except asyncio.CancelledError:
-            with contextlib.suppress(Exception):
-                await operation
-            raise
-        except Exception:
-            return
-
-
-def _client_terminal_command(command: object, arguments: object) -> tuple[str, tuple[str, ...]]:
-    if (
-        not isinstance(command, str)
-        or not command
-        or "\x00" in command
-        or len(command.encode("utf-8")) > MAX_CLIENT_TERMINAL_COMMAND_BYTES
-    ):
-        raise ToolError("ACP client terminal command is invalid")
-    if isinstance(arguments, str | bytes) or not isinstance(arguments, Sequence):
-        raise ToolError("ACP client terminal arguments are invalid")
-    if len(arguments) > MAX_CLIENT_TERMINAL_ARGUMENTS:
-        raise ToolError("ACP client terminal has too many arguments")
-    total_bytes = 0
-    validated: list[str] = []
-    for argument in arguments:
-        if not isinstance(argument, str) or "\x00" in argument:
-            raise ToolError("ACP client terminal arguments are invalid")
-        size = len(argument.encode("utf-8"))
-        if size > MAX_CLIENT_TERMINAL_ARGUMENT_BYTES:
-            raise ToolError("ACP client terminal argument exceeds the size limit")
-        total_bytes += size
-        if total_bytes > MAX_CLIENT_TERMINAL_ARGUMENT_TOTAL_BYTES:
-            raise ToolError("ACP client terminal arguments exceed the size limit")
-        validated.append(argument)
-    return command, tuple(validated)
-
-
-def _client_terminal_cwd(cwd: object) -> str:
-    if not isinstance(cwd, Path):
-        raise ToolError("ACP client terminal working directory is invalid")
-    rendered = str(cwd)
-    if not cwd.is_absolute() or "\x00" in rendered:
-        raise ToolError("ACP client terminal working directory is invalid")
-    return rendered
-
-
-def _client_terminal_limits(output_byte_limit: object, timeout_seconds: object) -> None:
-    if (
-        isinstance(output_byte_limit, bool)
-        or not isinstance(output_byte_limit, int)
-        or not 1 <= output_byte_limit <= MAX_CLIENT_TERMINAL_OUTPUT_BYTES
-    ):
-        raise ToolError("ACP client terminal output limit is invalid")
-    if (
-        isinstance(timeout_seconds, bool)
-        or not isinstance(timeout_seconds, int | float)
-        or not math.isfinite(timeout_seconds)
-        or timeout_seconds <= 0
-    ):
-        raise ToolError("ACP client terminal timeout is invalid")
-
-
-def _client_terminal_background_limits(
-    output_byte_limit: object,
-    timeout_seconds: object,
-) -> None:
-    if (
-        isinstance(output_byte_limit, bool)
-        or not isinstance(output_byte_limit, int)
-        or not 1 <= output_byte_limit <= MAX_CLIENT_TERMINAL_OUTPUT_BYTES
-    ):
-        raise ToolError("ACP client terminal output limit is invalid")
-    if timeout_seconds is not None and (
-        isinstance(timeout_seconds, bool)
-        or not isinstance(timeout_seconds, int | float)
-        or not math.isfinite(timeout_seconds)
-        or timeout_seconds <= 0
-    ):
-        raise ToolError("ACP client terminal timeout is invalid")
-
-
-def _client_terminal_wait_seconds(value: object) -> float:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int | float)
-        or not math.isfinite(value)
-        or value < 0
-    ):
-        raise ToolError("ACP client terminal wait timeout is invalid")
-    return float(value)
-
-
-def _client_terminal_id(value: object) -> str:
-    if (
-        not isinstance(value, str)
-        or not value
-        or "\x00" in value
-        or any(ord(character) < 32 or ord(character) == 127 for character in value)
-        or len(value.encode("utf-8")) > MAX_CLIENT_TERMINAL_ID_BYTES
-    ):
-        raise ToolError("ACP client terminal returned an invalid identifier")
-    return value
-
-
-def _client_terminal_task_id(value: object) -> str:
-    if (
-        not isinstance(value, str)
-        or not value
-        or "\x00" in value
-        or any(ord(character) < 32 or ord(character) == 127 for character in value)
-        or len(value.encode("utf-8")) > 128
-    ):
-        raise ToolError("ACP client terminal task identifier is invalid")
-    return value
-
-
-def _client_terminal_exit_status(
-    exit_code: object,
-    signal: object,
-) -> tuple[int | None, str | None]:
-    if exit_code is not None and (
-        isinstance(exit_code, bool) or not isinstance(exit_code, int) or exit_code < 0
-    ):
-        raise ToolError("ACP client terminal returned an invalid exit status")
-    if signal is not None and (
-        not isinstance(signal, str)
-        or not signal
-        or "\x00" in signal
-        or any(ord(character) < 32 or ord(character) == 127 for character in signal)
-        or len(signal.encode("utf-8")) > MAX_CLIENT_TERMINAL_SIGNAL_BYTES
-    ):
-        raise ToolError("ACP client terminal returned an invalid exit status")
-    if exit_code is None and signal is None:
-        raise ToolError("ACP client terminal returned no exit status")
-    return exit_code, signal
-
-
-class _AcpClientFileSystem:
-    """Bounded ACP client filesystem adapter for one active session.
-
-    为一个活动会话提供有界的 ACP 客户端文件系统适配器."""
-
-    def __init__(
-        self,
-        client: Client,
-        session_id: str,
-        *,
-        supports_read: bool,
-        supports_write: bool,
-    ) -> None:
-        self._client = client
-        self._session_id = session_id
-        self._supports_read = supports_read
-        self._supports_write = supports_write
-
-    @property
-    def supports_read(self) -> bool:
-        return self._supports_read
-
-    @property
-    def supports_write(self) -> bool:
-        return self._supports_write
-
-    async def read_text_file(
-        self,
-        path: Path,
-        /,
-        *,
-        line: int | None = None,
-        limit: int | None = None,
-    ) -> str:
-        if not self._supports_read:
-            raise ToolError("ACP client does not support text-file reads")
-        try:
-            response = await self._client.read_text_file(
-                self._session_id,
-                str(path),
-                line=line,
-                limit=limit,
-            )
-            content = response.content
-            byte_count = len(content.encode("utf-8"))
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            raise ToolError("ACP client text-file read failed") from None
-        if byte_count > MAX_CLIENT_FILE_BYTES:
-            raise ToolError("ACP client text-file response exceeds the size limit")
-        return content
-
-    async def write_text_file(self, path: Path, content: str, /) -> None:
-        if not self._supports_write:
-            raise ToolError("ACP client does not support text-file writes")
-        try:
-            if len(content.encode("utf-8")) > MAX_CLIENT_FILE_BYTES:
-                raise ToolError("ACP client text-file write exceeds the size limit")
-            await self._client.write_text_file(self._session_id, str(path), content)
-        except asyncio.CancelledError:
-            raise
-        except ToolError:
-            raise
-        except Exception:
-            raise ToolError("ACP client text-file write failed") from None
-
-
 @dataclass(frozen=True, slots=True)
 class _SessionListCursor:
     updated_at: datetime
@@ -1768,7 +374,7 @@ class NeuroCodeAcpAgent:
         self._client_info: Implementation | None = None
         self._initialized = False
         self._initialize_lock = asyncio.Lock()
-        self._sessions: dict[str, _AcpSession] = {}
+        self._sessions: dict[str, AcpSessionRuntime] = {}
         self._pending_session_tasks: dict[str, asyncio.Task[Any]] = {}
         self._registry_lock = asyncio.Lock()
         self._list_cursors: OrderedDict[str, _SessionListCursor] = OrderedDict()
@@ -1806,7 +412,11 @@ class NeuroCodeAcpAgent:
             protocol_version=negotiated,
             agent_capabilities=AgentCapabilities(
                 load_session=True,
-                prompt_capabilities=None,
+                prompt_capabilities=PromptCapabilities(
+                    image=True,
+                    audio=True,
+                    embedded_context=True,
+                ),
                 mcp_capabilities=McpCapabilities(http=True, sse=True),
                 auth=None,
                 session_capabilities=SessionCapabilities(
@@ -1853,6 +463,88 @@ class NeuroCodeAcpAgent:
             return None
         return _AcpClientTerminal(client, session_id)
 
+    def _safe_mcp_callback_payload(self, value: object) -> dict[str, Any]:
+        projected = _safe_mcp_extension_value(
+            value,
+            explicit_redactions=self._explicit_redactions(),
+        )
+        if not isinstance(projected, dict):
+            raise ConfigurationError("MCP callback payload is not an object")
+        if serialized_size_bytes(projected) > MAX_MCP_CALLBACK_BYTES:
+            raise ConfigurationError("MCP callback payload is too large")
+        return cast(dict[str, Any], projected)
+
+    async def _mcp_sampling_handler(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        model_preferences: Mapping[str, Any] | None = None,
+        system_prompt: str | None = None,
+        max_tokens: int | None = None,
+    ) -> Mapping[str, Any]:
+        client = self._client
+        if client is None:
+            raise ConfigurationError("ACP client is unavailable for MCP sampling")
+        if len(messages) > MAX_MCP_SAMPLING_MESSAGES:
+            raise ConfigurationError("MCP sampling message count exceeds the limit")
+        if system_prompt is not None and not isinstance(system_prompt, str):
+            raise ConfigurationError("MCP sampling system prompt is invalid")
+        if (
+            system_prompt is not None
+            and len(system_prompt.encode("utf-8")) > MAX_MCP_ELICITATION_MESSAGE_BYTES
+        ):
+            raise ConfigurationError("MCP sampling system prompt is too large")
+        if max_tokens is not None and (
+            isinstance(max_tokens, bool)
+            or not isinstance(max_tokens, int)
+            or not 1 <= max_tokens <= MAX_MCP_SAMPLING_TOKENS
+        ):
+            raise ConfigurationError("MCP sampling token limit is invalid")
+        payload: dict[str, object] = {
+            "messages": tuple(messages),
+        }
+        if model_preferences is not None:
+            payload["modelPreferences"] = model_preferences
+        if system_prompt is not None:
+            payload["systemPrompt"] = system_prompt
+        if max_tokens is not None:
+            payload["maxTokens"] = max_tokens
+        response = await client.ext_method(
+            "neuro-code/mcp/sampling",
+            self._safe_mcp_callback_payload(payload),
+        )
+        return self._safe_mcp_callback_payload(response)
+
+    async def _mcp_elicitation_handler(
+        self,
+        message: str,
+        schema: Mapping[str, Any] | None = None,
+        *,
+        url: str | None = None,
+    ) -> Mapping[str, Any]:
+        client = self._client
+        if client is None:
+            raise ConfigurationError("ACP client is unavailable for MCP elicitation")
+        if (
+            not isinstance(message, str)
+            or len(message.encode("utf-8")) > MAX_MCP_ELICITATION_MESSAGE_BYTES
+        ):
+            raise ConfigurationError("MCP elicitation message is invalid")
+        if url is not None and (
+            not isinstance(url, str) or len(url.encode("utf-8")) > MAX_MCP_URL_BYTES
+        ):
+            raise ConfigurationError("MCP elicitation URL is invalid")
+        payload: dict[str, object] = {"message": message}
+        if schema is not None:
+            payload["schema"] = schema
+        if url is not None:
+            payload["url"] = url
+        response = await client.ext_method(
+            "neuro-code/mcp/elicitation",
+            self._safe_mcp_callback_payload(payload),
+        )
+        return self._safe_mcp_callback_payload(response)
+
     async def _validate_session_workspace(
         self,
         cwd: str,
@@ -1875,7 +567,17 @@ class NeuroCodeAcpAgent:
     ) -> AcpMcpTools | None:
         if not configurations:
             return None
-        return await self._service.open_mcp_tools(configurations)
+        sampling_handler: McpSamplingHandler | None = (
+            self._mcp_sampling_handler if self._client is not None else None
+        )
+        elicitation_handler: McpElicitationHandler | None = (
+            self._mcp_elicitation_handler if self._client is not None else None
+        )
+        return await self._service.open_mcp_tools(
+            configurations,
+            sampling_handler=sampling_handler,
+            elicitation_handler=elicitation_handler,
+        )
 
     async def _validate_workspace(
         self,
@@ -1904,7 +606,7 @@ class NeuroCodeAcpAgent:
             if self._pending_session_tasks.get(session_id) is task:
                 del self._pending_session_tasks[session_id]
 
-    async def _publish_session(self, session: _AcpSession) -> bool:
+    async def _publish_session(self, session: AcpSessionRuntime) -> bool:
         task = asyncio.current_task()
         async with self._registry_lock:
             if self._pending_session_tasks.get(session.session_id) is not task:
@@ -1955,12 +657,17 @@ class NeuroCodeAcpAgent:
         except Exception:
             raise RequestError.internal_error({"reason": "session_creation_failed"}) from None
         else:
-            session = _AcpSession(
+            session = AcpSessionRuntime(
                 session_id,
                 binding,
                 approvals,
                 opened_binding.context_window_tokens,
                 mcp_tools,
+                mcp_tool_names=(
+                    tuple(tool.definition.name for tool in mcp_tools.tools)
+                    if mcp_tools is not None
+                    else ()
+                ),
                 client_terminal=client_terminal,
             )
             if await self._publish_session(session):
@@ -1971,8 +678,8 @@ class NeuroCodeAcpAgent:
             raise RequestError.internal_error({"reason": "connection_closing"})
         finally:
             await self._release_session_reservation(session_id)
-            if binding is not None and binding.background_tasks is not None:
-                await asyncio.shield(binding.background_tasks.shutdown())
+            if binding is not None:
+                await asyncio.shield(binding.close())
             if mcp_tools is not None:
                 await asyncio.shield(mcp_tools.close())
             if client_terminal is not None:
@@ -2106,12 +813,17 @@ class NeuroCodeAcpAgent:
                         {"reason": "session_history_replay_failed"}
                     ) from None
 
-            session = _AcpSession(
+            session = AcpSessionRuntime(
                 external_session_id,
                 binding,
                 approvals,
                 prepared_session.context_window_tokens,
                 mcp_tools,
+                mcp_tool_names=(
+                    tuple(tool.definition.name for tool in mcp_tools.tools)
+                    if mcp_tools is not None
+                    else ()
+                ),
                 client_terminal=client_terminal,
                 internal_session_id=internal_session_id,
             )
@@ -2123,8 +835,8 @@ class NeuroCodeAcpAgent:
             raise RequestError.internal_error({"reason": "connection_closing"})
         finally:
             await self._release_session_reservation(external_session_id)
-            if binding is not None and binding.background_tasks is not None:
-                await asyncio.shield(binding.background_tasks.shutdown())
+            if binding is not None:
+                await asyncio.shield(binding.close())
             if mcp_tools is not None:
                 await asyncio.shield(mcp_tools.close())
             if client_terminal is not None:
@@ -2272,12 +984,9 @@ class NeuroCodeAcpAgent:
 
         internal_session_id: str | None = None
         if active is not None:
-            async with active.state_lock:
-                if active.closed or active.closing:
-                    raise _session_not_active(external_session_id)
-                active.closing = True
-                active.cancel_requested = True
-                internal_session_id = active.internal_session_id
+            started, internal_session_id = await active.begin_close()
+            if not started:
+                raise _session_not_active(external_session_id)
             await self._cleanup_session(active)
             async with self._registry_lock:
                 if self._sessions.get(external_session_id) is active:
@@ -2376,12 +1085,17 @@ class NeuroCodeAcpAgent:
             except SessionError:
                 raise RequestError.internal_error({"reason": "session_alias_failed"}) from None
 
-            session = _AcpSession(
+            session = AcpSessionRuntime(
                 forked_external_session_id,
                 binding,
                 approvals,
                 prepared_session.context_window_tokens,
                 mcp_tools,
+                mcp_tool_names=(
+                    tuple(tool.definition.name for tool in mcp_tools.tools)
+                    if mcp_tools is not None
+                    else ()
+                ),
                 client_terminal=client_terminal,
                 internal_session_id=forked_internal_session_id,
             )
@@ -2394,8 +1108,8 @@ class NeuroCodeAcpAgent:
             raise RequestError.internal_error({"reason": "connection_closing"})
         finally:
             await self._release_session_reservation(forked_external_session_id)
-            if binding is not None and binding.background_tasks is not None:
-                await asyncio.shield(binding.background_tasks.shutdown())
+            if binding is not None:
+                await asyncio.shield(binding.close())
             if mcp_tools is not None:
                 await asyncio.shield(mcp_tools.close())
             if client_terminal is not None:
@@ -2410,13 +1124,14 @@ class NeuroCodeAcpAgent:
                 raise _session_busy(external_session_id, "session_creation_in_progress")
             active = self._sessions.get(external_session_id)
         if active is not None:
-            async with active.state_lock:
-                task = active.prompt_task
-                if task is not None and not task.done():
-                    raise _session_busy(external_session_id, "session_prompt_active")
-                if active.internal_session_id is None:
-                    raise _session_not_found(external_session_id)
-                return active.internal_session_id
+            try:
+                return await active.fork_source_identity()
+            except AcpSessionInactiveError:
+                raise _session_not_active(external_session_id) from None
+            except AcpSessionPromptAlreadyActiveError:
+                raise _session_busy(external_session_id, "session_prompt_active") from None
+            except AcpSessionIdentityUnavailableError:
+                raise _session_not_found(external_session_id) from None
         try:
             return await self._service.resolve_session_alias(
                 _ACP_SESSION_ALIAS_NAMESPACE,
@@ -2425,10 +1140,10 @@ class NeuroCodeAcpAgent:
         except SessionError:
             raise _session_not_found(external_session_id) from None
 
-    async def _active_session(self, session_id: str) -> _AcpSession:
+    async def _active_session(self, session_id: str) -> AcpSessionRuntime:
         async with self._registry_lock:
             session = self._sessions.get(session_id)
-        if session is None or session.closed or session.closing:
+        if session is None or not await session.is_active():
             raise _session_not_active(session_id)
         return session
 
@@ -2443,10 +1158,10 @@ class NeuroCodeAcpAgent:
                 raise _session_busy(external_session_id, "session_creation_in_progress")
             active = self._sessions.get(external_session_id)
         if active is not None:
-            async with active.state_lock:
-                if active.closed or active.closing:
-                    raise _session_not_active(external_session_id)
-                internal_session_id = active.internal_session_id
+            try:
+                internal_session_id = await active.active_internal_session_identity()
+            except AcpSessionInactiveError:
+                raise _session_not_active(external_session_id) from None
             if internal_session_id is None:
                 raise _session_not_found(external_session_id)
             return internal_session_id
@@ -2480,6 +1195,120 @@ class NeuroCodeAcpAgent:
                 continue
         raise RequestError.internal_error({"reason": "session_alias_allocation_failed"})
 
+    def _mcp_list_payload(self, mcp_tools: AcpMcpTools) -> dict[str, object]:
+        explicit_redactions = self._explicit_redactions()
+        payload = {
+            "resources": [
+                _safe_mcp_extension_value(
+                    resource.to_dict(),
+                    explicit_redactions=explicit_redactions,
+                )
+                for resource in tuple(mcp_tools.resources)[:256]
+            ],
+            "resourceTemplates": [
+                _safe_mcp_extension_value(
+                    template.to_dict(),
+                    explicit_redactions=explicit_redactions,
+                )
+                for template in tuple(mcp_tools.resource_templates)[:256]
+            ],
+            "prompts": [
+                _safe_mcp_extension_value(
+                    prompt.to_dict(),
+                    explicit_redactions=explicit_redactions,
+                )
+                for prompt in tuple(mcp_tools.prompts)[:128]
+            ],
+            "toolCount": len(tuple(mcp_tools.tools)),
+        }
+        if serialized_size_bytes(payload) > MAX_MCP_CONFIGURATION_BYTES:
+            raise RequestError.internal_error({"reason": "mcp_metadata_too_large"})
+        return payload
+
+    async def _mcp_extension(self, query: AcpMcpQuery) -> dict[str, object]:
+        external_session_id = _validated_session_id(query.session_id)
+        session = await self._active_session(external_session_id)
+        mcp_snapshot = await session.mcp_snapshot()
+        if mcp_snapshot is None:
+            raise RequestError.internal_error({"reason": "mcp_unavailable"})
+        mcp_tools, mcp_tool_names = mcp_snapshot
+        if query.operation == "list":
+            return self._mcp_list_payload(mcp_tools)
+        try:
+            if query.operation == "refresh":
+                await mcp_tools.refresh()
+                binding = await session.active_binding_snapshot()
+                if binding is None:
+                    raise ConfigurationError("MCP session binding is unavailable")
+                binding.runner.replace_external_tools(
+                    mcp_tools.tools,
+                    mcp_tool_names,
+                )
+                await session.update_mcp_tool_names(
+                    mcp_tools,
+                    tuple(tool.definition.name for tool in mcp_tools.tools),
+                )
+                payload = self._mcp_list_payload(mcp_tools)
+                payload["refreshed"] = True
+                return payload
+            if query.operation == "read_resource":
+                assert query.uri is not None
+                contents = await mcp_tools.read_resource(query.uri)
+                explicit_redactions = self._explicit_redactions()
+                projected: list[dict[str, object]] = []
+                for content in tuple(contents)[:32]:
+                    raw = content.to_dict()
+                    if "text" in raw:
+                        raw["text"] = safe_output_text(
+                            raw["text"],
+                            MAX_MCP_RESOURCE_BYTES,
+                            explicit_redactions=explicit_redactions,
+                        )
+                    if "blob" in raw:
+                        raw["blob"] = safe_output_text(
+                            raw["blob"],
+                            MAX_MCP_RESOURCE_BYTES,
+                            explicit_redactions=explicit_redactions,
+                        )
+                    projected.append(
+                        cast(
+                            dict[str, object],
+                            _safe_mcp_extension_value(
+                                raw,
+                                explicit_redactions=explicit_redactions,
+                            ),
+                        )
+                    )
+                payload = {"contents": projected}
+                if serialized_size_bytes(payload) > MAX_MCP_RESOURCE_BYTES:
+                    raise RequestError.internal_error({"reason": "mcp_resource_too_large"})
+                return payload
+            if query.operation == "get_prompt":
+                assert query.name is not None
+                messages = await mcp_tools.get_prompt(query.name, dict(query.arguments))
+                explicit_redactions = self._explicit_redactions()
+                projected_messages = [
+                    cast(
+                        dict[str, object],
+                        _safe_mcp_extension_value(
+                            message.to_dict(),
+                            explicit_redactions=explicit_redactions,
+                        ),
+                    )
+                    for message in tuple(messages)[:128]
+                ]
+                payload = {"messages": projected_messages}
+                if serialized_size_bytes(payload) > MAX_MCP_CONFIGURATION_BYTES:
+                    raise RequestError.internal_error({"reason": "mcp_prompt_too_large"})
+                return payload
+        except asyncio.CancelledError:
+            raise
+        except RequestError:
+            raise
+        except Exception:
+            raise RequestError.internal_error({"reason": "mcp_operation_failed"}) from None
+        raise RequestError.internal_error({"reason": "mcp_operation_unsupported"})
+
     async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         """Serve private, bounded session extensions.
 
@@ -2494,6 +1323,101 @@ class NeuroCodeAcpAgent:
         """
 
         self._require_initialized()
+        if method == ACP_MCP_EXTENSION:
+            try:
+                mcp_query = AcpMcpQuery.from_payload(params)
+            except AcpMcpQueryError as error:
+                raise _invalid_params(error.reason) from None
+            return await self._mcp_extension(mcp_query)
+
+        if method == ACP_CONTEXT_COMPACTION_EXTENSION:
+            try:
+                command_query = AcpSessionCommandQuery.from_payload(params)
+            except AcpMcpQueryError as error:
+                raise _invalid_params(error.reason) from None
+            session = await self._active_session(_validated_session_id(command_query.session_id))
+            binding = await session.active_binding_snapshot()
+            if binding is None:
+                raise RequestError.internal_error({"reason": "session_binding_unavailable"})
+            try:
+                compact_result = await binding.runner.compact_now()
+            except asyncio.CancelledError:
+                raise
+            except ProviderError:
+                raise RequestError.internal_error({"reason": "provider_failure"}) from None
+            except ConfigurationError:
+                raise RequestError.internal_error({"reason": "compaction_unavailable"}) from None
+            except Exception:
+                raise RequestError.internal_error({"reason": "compaction_failed"}) from None
+            payload: dict[str, object] = {
+                "status": compact_result.status.value,
+                "triggered": compact_result.triggered,
+            }
+            for name in (
+                "compaction_id",
+                "source_item_count",
+                "candidate_item_count",
+                "summary_tokens",
+                "summary_truncated",
+            ):
+                value = getattr(compact_result, name)
+                if value is not None:
+                    payload[name] = value
+            if compact_result.outcome is not None:
+                payload["outcome"] = {
+                    "status": compact_result.outcome.status.value,
+                    "reason_code": (
+                        compact_result.outcome.reason_code.value
+                        if compact_result.outcome.reason_code is not None
+                        else None
+                    ),
+                    "finalized": compact_result.outcome.finalized,
+                    "recoverable": compact_result.outcome.recoverable,
+                }
+            return payload
+
+        if method == ACP_TURN_RECOVERY_EXTENSION:
+            try:
+                recovery_query = AcpTurnRecoveryQuery.from_payload(params)
+            except AcpMcpQueryError as error:
+                raise _invalid_params(error.reason) from None
+            session = await self._active_session(_validated_session_id(recovery_query.session_id))
+            binding = await session.active_binding_snapshot()
+            if binding is None:
+                raise RequestError.internal_error({"reason": "session_binding_unavailable"})
+            try:
+                if recovery_query.operation == "inspect":
+                    inspections = await binding.runner.inspect_recovery()
+                    return {
+                        "attempts": [inspection.to_dict() for inspection in inspections],
+                    }
+                assert recovery_query.turn_id is not None
+                if recovery_query.operation == "abandon":
+                    inspection = await binding.runner.abandon_recovery(
+                        recovery_query.turn_id,
+                        reason=recovery_query.reason,
+                    )
+                    return inspection.to_dict()
+                result = await binding.runner.retry_recovery(recovery_query.turn_id)
+                return {
+                    "status": "retried",
+                    "sessionId": recovery_query.session_id,
+                    "steps": result.steps,
+                }
+            except ConfigurationError as error:
+                message = str(error)
+                if "retry" in message and "unavailable" in message:
+                    reason = "recovery_retry_unavailable"
+                elif "indeterminate" in message or "safely_retryable" not in message:
+                    reason = "recovery_not_safe"
+                else:
+                    reason = "recovery_retry_unavailable"
+                raise RequestError.internal_error({"reason": reason}) from None
+            except SessionError:
+                raise _session_not_found(recovery_query.session_id) from None
+            except Exception:
+                raise RequestError.internal_error({"reason": "recovery_operation_failed"}) from None
+
         if method == ACP_SUBAGENT_LIFECYCLE_EXTENSION:
             try:
                 lifecycle_query = AcpSubagentLifecycleQuery.from_payload(params)
@@ -2504,7 +1428,7 @@ class NeuroCodeAcpAgent:
                 raise RequestError.internal_error({"reason": "subagent_lifecycle_unavailable"})
             internal_session_id = await self._artifact_internal_session_id(external_session_id)
             try:
-                result = await self._service.run_subagent_relationship_action(
+                lifecycle_result = await self._service.run_subagent_relationship_action(
                     internal_session_id,
                     lifecycle_query.task_id,
                     lifecycle_query.action,
@@ -2519,26 +1443,28 @@ class NeuroCodeAcpAgent:
                 raise RequestError.internal_error({"reason": "subagent_lifecycle_failed"}) from None
 
             if (
-                result.parent_session_id != internal_session_id
-                or result.parent_task_id != lifecycle_query.task_id
-                or result.action is not lifecycle_query.action
+                lifecycle_result.parent_session_id != internal_session_id
+                or lifecycle_result.parent_task_id != lifecycle_query.task_id
+                or lifecycle_result.action is not lifecycle_query.action
             ):
                 raise RequestError.internal_error({"reason": "subagent_lifecycle_invalid_result"})
-            if result.action is SubagentRelationshipAction.DELETE:
-                return serialize_subagent_lifecycle_action(result.action, deleted=True)
-            if result.action is SubagentRelationshipAction.RESUME:
+            if lifecycle_result.action is SubagentRelationshipAction.DELETE:
+                return serialize_subagent_lifecycle_action(lifecycle_result.action, deleted=True)
+            if lifecycle_result.action is SubagentRelationshipAction.RESUME:
                 external_child_id = await self._lifecycle_external_session_id(
-                    result.child_session_id
+                    lifecycle_result.child_session_id
                 )
                 return serialize_subagent_lifecycle_action(
-                    result.action,
+                    lifecycle_result.action,
                     session_id=external_child_id,
                 )
-            if result.forked_session_id is None:
+            if lifecycle_result.forked_session_id is None:
                 raise RequestError.internal_error({"reason": "subagent_lifecycle_invalid_result"})
-            external_forked_id = await self._lifecycle_external_session_id(result.forked_session_id)
+            external_forked_id = await self._lifecycle_external_session_id(
+                lifecycle_result.forked_session_id
+            )
             return serialize_subagent_lifecycle_action(
-                result.action,
+                lifecycle_result.action,
                 session_id=external_forked_id,
             )
 
@@ -2550,11 +1476,20 @@ class NeuroCodeAcpAgent:
             external_session_id = _validated_session_id(subagent_query.session_id)
             if not self._service.read_only_subagent_available:
                 raise RequestError.internal_error({"reason": "subagent_unavailable"})
+            # A persisted session summary is not an authorization manifest.
+            # The explicit child may run only while its actual ACP parent
+            # binding is active and can supply immutable capability metadata.
+            parent_session = await self._active_session(external_session_id)
+            parent_binding = await parent_session.active_binding_snapshot()
+            if parent_binding is None or parent_binding.capabilities is None:
+                raise RequestError.internal_error({"reason": "parent_capability_unavailable"})
+            parent_capabilities = parent_binding.capabilities
             internal_session_id = await self._artifact_internal_session_id(external_session_id)
             try:
                 projection = await self._service.run_read_only_subagent(
                     internal_session_id,
                     subagent_query.prompt,
+                    parent_capabilities=parent_capabilities,
                     max_steps=subagent_query.max_steps,
                 )
             except SessionError:
@@ -2604,24 +1539,30 @@ class NeuroCodeAcpAgent:
 
     async def _bind_internal_session(
         self,
-        session: _AcpSession,
+        session: AcpSessionRuntime,
         internal_session_id: str,
     ) -> None:
-        if (
-            session.internal_session_id is not None
-            and session.internal_session_id != internal_session_id
-        ):
-            raise SessionError("ACP session changed its internal session identity")
-        await self._service.bind_session_alias(
-            _ACP_SESSION_ALIAS_NAMESPACE,
-            session.session_id,
-            internal_session_id,
-        )
-        session.internal_session_id = internal_session_id
+        try:
+            token = await session.begin_internal_session_identity(internal_session_id)
+        except (AcpSessionIdentityConflictError, AcpSessionInactiveError) as error:
+            raise SessionError(str(error)) from None
+        try:
+            await self._service.bind_session_alias(
+                _ACP_SESSION_ALIAS_NAMESPACE,
+                session.session_id,
+                internal_session_id,
+            )
+            try:
+                await session.commit_internal_session_identity(internal_session_id, token)
+            except (AcpSessionIdentityConflictError, AcpSessionInactiveError) as error:
+                raise SessionError(str(error)) from None
+        except BaseException:
+            await session.abort_internal_session_identity(token)
+            raise
 
     async def _capture_runner_session(
         self,
-        session: _AcpSession,
+        session: AcpSessionRuntime,
         binding: ConversationBinding,
         *,
         suppress_errors: bool,
@@ -2650,29 +1591,31 @@ class NeuroCodeAcpAgent:
         client = self._client
         if client is None:
             raise RequestError.internal_error({"reason": "client_unavailable"})
+        try:
+            context_window_tokens, _internal_session_id = await session.prompt_context()
+        except AcpSessionInactiveError:
+            raise _session_not_active(session_id) from None
         mapper = _AcpEventMapper(
             client=client,
             session_id=session_id,
-            context_window_tokens=session.context_window_tokens,
+            context_window_tokens=context_window_tokens,
             explicit_redactions=self._explicit_redactions(),
             on_session_started=lambda internal_id: self._bind_internal_session(
                 session,
                 internal_id,
             ),
         )
-        async with session.state_lock:
-            if session.closed or session.closing or session.binding is None:
-                raise _session_not_active(session_id)
-            if session.prompt_task is not None:
-                raise RequestError(
-                    _SESSION_BUSY,
-                    "Session already has an active prompt",
-                    {"reason": "prompt_already_active"},
-                )
-            session.prompt_task = current_task
-            session.mapper = mapper
-            session.cancel_requested = False
-            binding = session.binding
+        try:
+            prompt_start = await session.begin_prompt(current_task, mapper)
+        except AcpSessionInactiveError:
+            raise _session_not_active(session_id) from None
+        except AcpSessionPromptAlreadyActiveError:
+            raise RequestError(
+                _SESSION_BUSY,
+                "Session already has an active prompt",
+                {"reason": "prompt_already_active"},
+            ) from None
+        binding = prompt_start.binding
 
         try:
             turn_service = self._service.bind_runner(binding.runner)
@@ -2680,14 +1623,14 @@ class NeuroCodeAcpAgent:
                 RunTurnRequest(
                     converted.content,
                     content_parts=converted.content_parts,
-                    expected_session_id=session.internal_session_id,
+                    expected_session_id=prompt_start.internal_session_id,
                 ),
                 sink=mapper,
             )
             if result.session_id is None:
                 raise RequestError.internal_error({"reason": "session_identity_unavailable"})
             await self._bind_internal_session(session, result.session_id)
-            if session.cancel_requested or session.closing:
+            if await session.prompt_should_stop():
                 return PromptResponse(stop_reason="cancelled")
             return PromptResponse(
                 stop_reason=execution_outcome_stop_reason(result.outcome) or mapper.stop_reason,
@@ -2698,25 +1641,27 @@ class NeuroCodeAcpAgent:
             return PromptResponse(stop_reason="cancelled")
         except ProviderError as error:
             await self._capture_runner_session(session, binding, suppress_errors=True)
-            if session.cancel_requested or session.closing:
+            if await session.prompt_should_stop():
                 return PromptResponse(stop_reason="cancelled")
             if "exceeded the maximum" in str(error):
                 return PromptResponse(stop_reason="max_turn_requests")
             raise RequestError.internal_error({"reason": "provider_failure"}) from None
+        except ConfigurationError as error:
+            await self._capture_runner_session(session, binding, suppress_errors=True)
+            if await session.prompt_should_stop():
+                return PromptResponse(stop_reason="cancelled")
+            if "unresolved interrupted turn" in str(error):
+                raise RequestError.internal_error({"reason": "turn_recovery_required"}) from None
+            raise RequestError.internal_error({"reason": "prompt_configuration"}) from None
         except RequestError:
             raise
         except Exception:
             await self._capture_runner_session(session, binding, suppress_errors=True)
-            if session.cancel_requested or session.closing:
+            if await session.prompt_should_stop():
                 return PromptResponse(stop_reason="cancelled")
             raise RequestError.internal_error({"reason": "prompt_failure"}) from None
         finally:
-            async with session.state_lock:
-                if session.prompt_task is current_task:
-                    session.prompt_task = None
-                    session.mapper = None
-                    session.pending_approval_id = None
-                    session.cancel_requested = False
+            await session.finish_prompt_if_owner(current_task)
 
     async def _request_permission(
         self,
@@ -2725,13 +1670,14 @@ class NeuroCodeAcpAgent:
     ) -> PermissionApproval:
         session = await self._active_session(session_id)
         client = self._client
-        mapper = session.mapper
+        try:
+            mapper = await session.begin_approval(request.call_id)
+        except AcpSessionApprovalAlreadyPendingError:
+            return PermissionApproval.deny("another ACP approval is already pending")
         if client is None or mapper is None:
+            if mapper is not None:
+                await session.finish_approval_if_owner(request.call_id)
             return PermissionApproval.deny("ACP client approval interface is unavailable")
-        async with session.state_lock:
-            if session.pending_approval_id is not None:
-                return PermissionApproval.deny("another ACP approval is already pending")
-            session.pending_approval_id = request.call_id
         try:
             options = [
                 PermissionOption(
@@ -2772,19 +1718,14 @@ class NeuroCodeAcpAgent:
         except Exception:
             return PermissionApproval.deny("ACP client approval failed")
         finally:
-            async with session.state_lock:
-                if session.pending_approval_id == request.call_id:
-                    session.pending_approval_id = None
+            await session.finish_approval_if_owner(request.call_id)
 
     async def cancel(self, session_id: str, **_kwargs: Any) -> None:
         async with self._registry_lock:
             session = self._sessions.get(session_id)
-        if session is None or session.closed or session.closing:
+        if session is None:
             return
-        async with session.state_lock:
-            task = session.prompt_task
-            if task is not None and not task.done():
-                session.cancel_requested = True
+        task = await session.request_cancel()
         if task is not None and not task.done():
             task.cancel()
 
@@ -2798,43 +1739,17 @@ class NeuroCodeAcpAgent:
             session = self._sessions.get(session_id)
         if session is None:
             raise _session_not_active(session_id)
-        async with session.state_lock:
-            if session.closed or session.closing:
-                raise _session_not_active(session_id)
-            session.closing = True
-            session.cancel_requested = True
+        started, _internal_session_id = await session.begin_close()
+        if not started:
+            raise _session_not_active(session_id)
         await self._cleanup_session(session)
         async with self._registry_lock:
             if self._sessions.get(session_id) is session:
                 del self._sessions[session_id]
         return CloseSessionResponse()
 
-    async def _cleanup_session(self, session: _AcpSession) -> None:
-        async with session.cleanup_lock:
-            if session.closed:
-                return
-            async with session.state_lock:
-                task = session.prompt_task
-            current = asyncio.current_task()
-            if task is not None and task is not current and not task.done():
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
-            binding = session.binding
-            mcp_tools = session.mcp_tools
-            client_terminal = session.client_terminal
-            if mcp_tools is not None:
-                await asyncio.shield(mcp_tools.close())
-            if client_terminal is not None:
-                await asyncio.shield(client_terminal.shutdown())
-            if binding is not None and binding.background_tasks is not None:
-                await asyncio.shield(binding.background_tasks.shutdown())
-            session.binding = None
-            session.mcp_tools = None
-            session.client_terminal = None
-            session.mapper = None
-            session.pending_approval_id = None
-            session.closed = True
+    async def _cleanup_session(self, session: AcpSessionRuntime) -> None:
+        await session.cleanup()
 
     async def shutdown(self) -> None:
         async with self._registry_lock:
@@ -2850,9 +1765,7 @@ class NeuroCodeAcpAgent:
             if task is not current and not task.done():
                 task.cancel()
         for session in sessions:
-            async with session.state_lock:
-                session.closing = True
-                session.cancel_requested = True
+            await session.mark_closing()
         if sessions:
             await asyncio.gather(
                 *(self._cleanup_session(session) for session in sessions),
@@ -2865,81 +1778,21 @@ class NeuroCodeAcpAgent:
             )
 
 
-def _build_acp_router(agent: NeuroCodeAcpAgent) -> MessageRouter:
-    """Extend the SDK 0.11 router with its generated stable delete route.
+async def serve_acp_websocket(
+    service: AcpApplicationService,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 0,
+) -> None:
+    """Construct one Agent per connection and delegate to canonical transport."""
 
-    使用生成的稳定删除路由扩展 SDK 0.11 路由器."""
-
-    router = build_agent_router(cast(Agent, agent), use_unstable_protocol=True)
-    router.route_request(
-        AGENT_METHODS["session_delete"],
-        DeleteSessionRequest,
-        agent,
-        "delete_session",
-        adapt_result=normalize_result,
+    await _serve_websocket(
+        lambda: NeuroCodeAcpAgent(service),
+        host=host,
+        port=port,
+        connection_factory=_AcpSdkConnection,
+        writer_factory=_WebSocketWriter,
     )
-    return router
-
-
-class _AcpSdkConnection:
-    """Small SDK connection adapter until its agent router registers delete.
-
-    在 Agent 路由器注册删除操作前使用的小型 SDK 连接适配器."""
-
-    def __init__(
-        self,
-        agent: NeuroCodeAcpAgent,
-        writer: asyncio.StreamWriter,
-        reader: asyncio.StreamReader,
-    ) -> None:
-        self._connection = Connection(
-            _build_acp_router(agent),
-            writer,
-            reader,
-            listening=False,
-        )
-        agent.on_connect(cast(Client, self))
-
-    async def listen(self) -> None:
-        await self._connection.main_loop()
-
-    async def close(self) -> None:
-        await self._connection.close()
-
-    async def session_update(
-        self,
-        session_id: str,
-        update: Any,
-        **kwargs: Any,
-    ) -> None:
-        await notify_model(
-            self._connection,
-            CLIENT_METHODS["session_update"],
-            SessionNotification(
-                session_id=session_id,
-                update=update,
-                field_meta=kwargs or None,
-            ),
-        )
-
-    async def request_permission(
-        self,
-        session_id: str,
-        tool_call: ToolCallUpdate,
-        options: list[PermissionOption],
-        **kwargs: Any,
-    ) -> RequestPermissionResponse:
-        return await request_model(
-            self._connection,
-            CLIENT_METHODS["session_request_permission"],
-            RequestPermissionRequest(
-                session_id=session_id,
-                tool_call=tool_call,
-                options=options,
-                field_meta=kwargs or None,
-            ),
-            RequestPermissionResponse,
-        )
 
 
 async def serve_acp(service: AcpApplicationService) -> None:
@@ -2947,28 +1800,48 @@ async def serve_acp(service: AcpApplicationService) -> None:
 
     通过官方 SDK 帧协议和路由器在 stdio 上提供 ACP 服务."""
 
-    agent = NeuroCodeAcpAgent(service)
-    connection: _AcpSdkConnection | None = None
-    try:
-        reader, writer = await stdio_streams(limit=ACP_STDIO_BUFFER_LIMIT_BYTES)
-        connection = _AcpSdkConnection(
-            agent,
-            writer,
-            reader,
-        )
-        await connection.listen()
-    finally:
-        if connection is not None:
-            await asyncio.shield(connection.close())
-        await asyncio.shield(agent.shutdown())
+    await _serve_stdio(
+        NeuroCodeAcpAgent(service),
+        streams_factory=stdio_streams,
+        connection_factory=_AcpSdkConnection,
+    )
 
 
 __all__ = [
+    "ACP_CONTEXT_COMPACTION_EXTENSION",
+    "ACP_MCP_EXTENSION",
     "ACP_PROTOCOL_VERSION",
     "ACP_READ_ONLY_SUBAGENT_EXTENSION",
     "ACP_STDIO_BUFFER_LIMIT_BYTES",
     "ACP_SUBAGENT_LIFECYCLE_EXTENSION",
+    "ACP_TURN_RECOVERY_EXTENSION",
+    "MAX_ANNOTATIONS_BYTES",
+    "MAX_ANNOTATION_AUDIENCE",
+    "MAX_ANNOTATION_AUDIENCE_BYTES",
+    "MAX_AUDIO_BLOCKS",
+    "MAX_AUDIO_BLOCK_BYTES",
+    "MAX_AUDIO_TOTAL_BYTES",
+    "MAX_EMBEDDED_BINARY_RESOURCE_BYTES",
+    "MAX_EMBEDDED_BINARY_TOTAL_BYTES",
+    "MAX_EMBEDDED_TEXT_RESOURCES",
+    "MAX_EMBEDDED_TEXT_RESOURCE_BYTES",
+    "MAX_EMBEDDED_TEXT_TOTAL_BYTES",
+    "MAX_IMAGE_BLOCKS",
+    "MAX_IMAGE_BLOCK_BYTES",
+    "MAX_IMAGE_TOTAL_BYTES",
+    "MAX_PROMPT_BLOCKS",
+    "MAX_PROMPT_BYTES",
+    "MAX_RESOURCE_FIELD_BYTES",
+    "MAX_RESOURCE_LINKS",
+    "MAX_RESOURCE_LINK_BYTES",
+    "MAX_RESOURCE_NAME_BYTES",
+    "MAX_RESOURCE_URI_BYTES",
+    "MAX_TEXT_BLOCKS",
+    "MAX_TEXT_BLOCK_BYTES",
+    "ConvertedPrompt",
     "NeuroCodeAcpAgent",
+    "PromptBlock",
     "convert_prompt_content",
     "serve_acp",
+    "serve_acp_websocket",
 ]

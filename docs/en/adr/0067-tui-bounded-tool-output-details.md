@@ -46,7 +46,9 @@ service; session authorization is evaluated by the service for every read.
   opened. ADR 0108 moves disclosure to Summary → selected-call Peek → Inspector;
   the session-authorized application seam and streaming event flow remain
   unchanged.
-- CLI, ACP, and other inbound artifact views remain separate future slices.
+- At this ADR's acceptance, CLI and ACP artifact views remained separate. Later
+  bounded slices implement both read-only views; other inbound artifact views
+  remain separate capabilities.
 
 ## Rejected alternatives
 

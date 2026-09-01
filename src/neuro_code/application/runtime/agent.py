@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from datetime import datetime
+from pathlib import Path
 
 from neuro_code.application.execution_policy import ExecutionBudgetPolicy
 from neuro_code.application.memory.compaction import ProviderContextWindow
@@ -14,8 +15,10 @@ from neuro_code.application.memory.compaction_runtime import (
 from neuro_code.application.permissions.policy import PermissionManager, PermissionMode
 from neuro_code.application.ports.approval import PermissionApprover
 from neuro_code.application.ports.model import ModelProvider
+from neuro_code.application.ports.result_adoption import WorkspaceMutationPort
 from neuro_code.application.ports.storage import SessionStore
-from neuro_code.application.ports.tools import ToolCollection, ToolContext
+from neuro_code.application.ports.tool_pipeline import ToolPipelineHook
+from neuro_code.application.ports.tools import Tool, ToolCollection, ToolContext
 from neuro_code.application.ports.workspace_changes import WorkspaceChangeObserver
 from neuro_code.application.runtime.agent_loop import (
     AgentLoopRunner,
@@ -38,6 +41,7 @@ from neuro_code.domain.conversation.context import ModelContext, estimate_contex
 from neuro_code.domain.conversation.interaction_mode import InteractionMode
 from neuro_code.domain.conversation.messages import (
     ContentPart,
+    Message,
     SessionItem,
 )
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
@@ -103,6 +107,10 @@ class AgentRuntime:
         finalizer_max_attempts: int = 2,
         compaction_runtime_gate: ContextCompactionRuntimeGate | None = None,
         provider_context_window: ProviderContextWindow | None = None,
+        tool_hooks: Sequence[ToolPipelineHook] = (),
+        workspace_mutation_tool: Tool | None = None,
+        parent_relay_message: Message | None = None,
+        dag_result_relay_message: Message | None = None,
     ) -> None:
         if execution_budget is not None and not isinstance(execution_budget, ExecutionBudget):
             raise TypeError("execution_budget must be an ExecutionBudget or None")
@@ -170,6 +178,8 @@ class AgentRuntime:
             plan=plan,
             instruction_provider=instruction_provider,
             skill_provider=skill_provider,
+            parent_relay_message=parent_relay_message,
+            dag_result_relay_message=dag_result_relay_message,
         )
         self._context_builder.set_plan_comments(plan_comments)
         self._tool_executor = ToolExecutor(
@@ -180,6 +190,8 @@ class AgentRuntime:
             session_store=self._session_store,
             workspace_change_observer=self._workspace_change_observer,
             context_builder=self._context_builder,
+            hooks=tool_hooks,
+            workspace_mutation_tool=workspace_mutation_tool,
         )
         self._loop_runner = AgentLoopRunner(
             provider=self._provider,
@@ -205,8 +217,38 @@ class AgentRuntime:
         return self._tool_context.sandbox_profile
 
     @property
+    def provider_name(self) -> str:
+        return self._provider.provider_name
+
+    @property
+    def model_name(self) -> str:
+        return self._provider.model_name
+
+    @property
+    def context_affinity(self) -> str | None:
+        return getattr(self._provider, "context_affinity", None)
+
+    @property
+    def cwd(self) -> Path:
+        return self._tool_context.cwd
+
+    @property
+    def workspace_mutation(self) -> WorkspaceMutationPort:
+        """Return the internal mutation port bound to this runtime."""
+
+        return self._tool_executor
+
+    @property
+    def system_prompt(self) -> str:
+        return self._system_prompt
+
+    @property
     def reasoning_effort(self) -> ReasoningEffort:
         return self._context_builder.reasoning_effort
+
+    @property
+    def provider_context_window(self) -> ProviderContextWindow | None:
+        return self._loop_runner.provider_context_window
 
     def set_reasoning_effort(self, effort: ReasoningEffort) -> None:
         self._context_builder.set_reasoning_effort(effort)
@@ -236,6 +278,21 @@ class AgentRuntime:
     def set_interaction_mode(self, mode: InteractionMode) -> None:
         self._context_builder.set_interaction_mode(mode)
         self._apply_interaction_mode_permissions()
+
+    def replace_external_tools(
+        self,
+        tools: Sequence[Tool],
+        previous_names: Collection[str],
+    ) -> None:
+        """Replace a bounded extension set while preserving built-in tools.
+
+        替换有界扩展工具集合,同时保留内置工具.
+        """
+
+        replace_external = getattr(self._tools, "replace_external", None)
+        if not callable(replace_external):
+            raise ConfigurationError("runtime tool collection cannot refresh external tools")
+        replace_external(tools, previous_names)
 
     def _apply_interaction_mode_permissions(self) -> None:
         permission_mode = {
@@ -293,6 +350,8 @@ class AgentRuntime:
         source_model: str | None = None,
         source_context_affinity: str | None = None,
         session_id: str | None = None,
+        turn_id: str | None = None,
+        ultracode_execution_id: str | None = None,
         cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
         turn_source: TurnSource = TurnSource.USER,
     ) -> AgentRunResult:
@@ -311,6 +370,8 @@ class AgentRuntime:
             source_model=source_model,
             source_context_affinity=source_context_affinity,
             session_id=session_id,
+            turn_id=turn_id,
+            ultracode_execution_id=ultracode_execution_id,
             cancellation_policy=cancellation_policy,
             turn_source=turn_source,
         )

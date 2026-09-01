@@ -48,5 +48,8 @@ same isolation and redaction guarantees as the CLI entry.
 
 No schema or normal ACP session lifecycle changes are required. Clients must
 know the private method explicitly; standard ACP clients continue to see the
-existing method and capability set. TUI invocation, automatic delegation,
-and write-capable or recursive subagents remain future work.
+existing method and capability set. Later bounded slices add a TUI entrypoint
+and bounded automatic Ultracode delegation; this extension remains an explicit
+read-only operation. Generic or unbounded scheduling, retry, recursive or
+parallel children, and write-capable subagents remain outside the supported
+boundary.

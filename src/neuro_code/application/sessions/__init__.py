@@ -37,6 +37,11 @@ from neuro_code.application.sessions.lifecycle import (
     SessionLifecycleService,
     StartSessionRequest,
 )
+from neuro_code.application.sessions.recovery import (
+    TurnInputForRetry,
+    TurnRecoveryInspection,
+    TurnRecoveryService,
+)
 from neuro_code.application.sessions.selection import (
     SessionSelectionController,
     SessionSelectionService,
@@ -82,6 +87,7 @@ from neuro_code.application.sessions.turns import (
     RunTurnRequest,
     SessionTurnRunner,
     SessionTurnService,
+    UltracodeDelegate,
 )
 
 __all__ = [
@@ -142,4 +148,8 @@ __all__ = [
     "SubagentRelationshipProjection",
     "SubagentRelationshipQueryController",
     "SubagentRelationshipQueryService",
+    "TurnInputForRetry",
+    "TurnRecoveryInspection",
+    "TurnRecoveryService",
+    "UltracodeDelegate",
 ]

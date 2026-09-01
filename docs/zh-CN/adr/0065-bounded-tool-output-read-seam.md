@@ -7,8 +7,8 @@
 
 ## 背景
 
-Stage5BK 将本地 Bash artifact 写入会话和 SQLite 之外。未来界面可能需要查看某个
-artifact，但让 TUI、CLI 或 ACP 自己拼接状态目录路径会绕过应用边界，也会使授权语义不清晰。
+Stage5BK 将本地 Bash artifact 写入会话和 SQLite 之外。在本 ADR 接受时，未来界面可能需要查看
+某个 artifact，但让 TUI、CLI 或 ACP 自己拼接状态目录路径会绕过应用边界，也会使授权语义不清晰。
 
 ## 决策
 
@@ -21,8 +21,9 @@ artifact，但让 TUI、CLI 或 ACP 自己拼接状态目录路径会绕过应�
 限制在配置的 artifact 根目录下，在解码和截断前再次脱敏，并返回 frozen 文本投影。缺失或伪造
 句柄会安全失败。
 
-该服务暂不通过 CLI、TUI、ACP 或新工具暴露。Stage5BK 没有持久化 session 与 artifact 的关联，
-因此本切片有意不宣称具备会话级授权或跨进程恢复。面向用户的读取路径必须先定义这种关联和可见性策略。
+在本 ADR 接受时，该服务尚未通过 CLI、TUI、ACP 或新工具暴露。Stage5BK 没有持久化 session
+与 artifact 的关联，因此本切片有意不宣称具备会话级授权或跨进程恢复；面向用户的读取路径当时
+必须先定义这种关联和可见性策略。
 
 ## 非目标
 

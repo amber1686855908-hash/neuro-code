@@ -28,7 +28,8 @@ messages.
 ## Consequences
 
 CLI and ACP remain the other explicit entry points and all three share the
-same application isolation and redaction boundary. There is still no automatic
-delegation, retry, recursion, parallel execution, write-capable tool, or
-parent-context reuse. A future TUI command may add an explicit step option only
-after a stable user need is established.
+same application isolation and redaction boundary. This TUI subagent command
+still performs no automatic delegation, retry, recursion, parallel child
+execution, write-capable tool use, or parent-context reuse. A separate bounded
+Automatic Ultracode entry is implemented by ADR 0141. A future TUI command may
+add an explicit step option only after a stable user need is established.

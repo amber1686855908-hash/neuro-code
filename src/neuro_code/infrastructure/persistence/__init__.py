@@ -2,6 +2,7 @@
 
 定义规范的持久化基础设施适配器."""
 
+from neuro_code.infrastructure.persistence.managed_worktrees import SqliteManagedWorktreeStore
 from neuro_code.infrastructure.persistence.output_artifacts import FileToolOutputArtifactStore
 from neuro_code.infrastructure.persistence.rust_session import (
     UPSTREAM_IMPORT_PROVIDER,
@@ -16,6 +17,7 @@ __all__ = [
     "FileToolOutputArtifactStore",
     "JsonUiPreferencesStore",
     "RustSessionImport",
+    "SqliteManagedWorktreeStore",
     "SqliteSessionStore",
     "load_rust_session",
 ]
