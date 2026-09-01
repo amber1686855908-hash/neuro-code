@@ -4312,6 +4312,8 @@ api_key_env = "FIXTURE_KEY"
                 )
                 leader = None
                 parent_binding = None
+                running = None
+                fanout_wait = None
                 try:
                     parent_session_id = await application.store.create_session(
                         str(repository),
@@ -4361,7 +4363,27 @@ api_key_env = "FIXTURE_KEY"
                     running = asyncio.create_task(
                         leader.run(RunLeaderRequest(dag.dag_id, "coordinate bounded wave"))
                     )
-                    await asyncio.wait_for(state.fanout_started.wait(), timeout=90)
+                    fanout_wait = asyncio.create_task(
+                        state.fanout_started.wait(),
+                        name="wait-for-production-parallel-leader-fanout",
+                    )
+                    done, _pending = await asyncio.wait(
+                        (fanout_wait, running),
+                        timeout=90,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if running in done:
+                        completed = await running
+                        self.fail(
+                            "Leader completed before fanout was observed: "
+                            f"terminal={completed.terminal} "
+                            f"final_response={completed.final_response!r}"
+                        )
+                    if not done:
+                        raise TimeoutError(
+                            "parallel Leader neither reached fanout nor terminated within 90 seconds"
+                        )
+                    self.assertIn(fanout_wait, done)
                     during = await application.store.get_task_dag(dag.dag_id)
                     self.assertIsNotNone(during)
                     assert during is not None
@@ -4411,6 +4433,14 @@ api_key_env = "FIXTURE_KEY"
                     self.assertEqual(_run_git(repository, "rev-parse", "HEAD"), before_head)
                     self.assertEqual(dirty_file.read_bytes(), b"parent remains dirty\n")
                 finally:
+                    if fanout_wait is not None and not fanout_wait.done():
+                        fanout_wait.cancel()
+                    if fanout_wait is not None:
+                        await asyncio.gather(fanout_wait, return_exceptions=True)
+                    if running is not None and not running.done():
+                        running.cancel()
+                    if running is not None:
+                        await asyncio.gather(running, return_exceptions=True)
                     if leader is not None:
                         await leader.close()
                     if parent_binding is not None:
