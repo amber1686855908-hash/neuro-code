@@ -199,7 +199,7 @@ from neuro_code.infrastructure.persistence.workspace_checkpoints import (
 from neuro_code.infrastructure.providers.hosted_web_search import (
     RoutedWebSearchBackendResolver,
 )
-from neuro_code.infrastructure.tools.filesystem import ExactWorkspaceMutationTool
+from neuro_code.infrastructure.tools.filesystem_mutation import ExactWorkspaceMutationTool
 from neuro_code.infrastructure.tools.registry import ToolRegistry, default_tool_registry
 from neuro_code.infrastructure.tools.web_fetch import WebFetchTool
 from neuro_code.infrastructure.tools.web_search import WebSearchTool
