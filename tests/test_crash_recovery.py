@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-import neuro_code.infrastructure.persistence.sqlite_session as sqlite_session_module
+import neuro_code.infrastructure.persistence.sqlite_session_turns as sqlite_session_turns_module
 from neuro_code.application.sessions.recovery import (
     TurnRecoveryInspection,
     TurnRecoveryService,
@@ -301,7 +301,7 @@ class CrashRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                "neuro_code.infrastructure.persistence.sqlite_session._insert_session_task_row",
+                "neuro_code.infrastructure.persistence.sqlite_session_turns._insert_session_task_row",
                 side_effect=RuntimeError("injected task insert failure"),
             ),
             self.assertRaises(RuntimeError),
@@ -336,7 +336,7 @@ class CrashRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                "neuro_code.infrastructure.persistence.sqlite_session._start_session_task_row",
+                "neuro_code.infrastructure.persistence.sqlite_session_turns._start_session_task_row",
                 side_effect=RuntimeError("injected task activation failure"),
             ),
             self.assertRaises(RuntimeError),
@@ -391,7 +391,7 @@ class CrashRecoveryTests(unittest.IsolatedAsyncioTestCase):
         service = TurnRecoveryService(self.store)
         with (
             patch(
-                "neuro_code.infrastructure.persistence.sqlite_session._persist_task_terminal",
+                "neuro_code.infrastructure.persistence.sqlite_session_turns._persist_task_terminal",
                 side_effect=RuntimeError("injected task terminalization failure"),
             ),
             self.assertRaises(RuntimeError),
@@ -412,7 +412,7 @@ class CrashRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
         with (
             patch(
-                "neuro_code.infrastructure.persistence.sqlite_session._insert_event_row",
+                "neuro_code.infrastructure.persistence.sqlite_session_turns._insert_event_row",
                 side_effect=RuntimeError("injected task event failure"),
             ),
             self.assertRaises(RuntimeError),
@@ -431,7 +431,7 @@ class CrashRecoveryTests(unittest.IsolatedAsyncioTestCase):
             turn_id="turn-plan-turn-event-failure",
             task_id="task-plan-turn-event-failure",
         )
-        original_insert_event_row = sqlite_session_module._insert_event_row
+        original_insert_event_row = sqlite_session_turns_module._insert_event_row
 
         def fail_turn_event(
             connection: sqlite3.Connection,
@@ -451,7 +451,7 @@ class CrashRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                "neuro_code.infrastructure.persistence.sqlite_session._insert_event_row",
+                "neuro_code.infrastructure.persistence.sqlite_session_turns._insert_event_row",
                 side_effect=fail_turn_event,
             ),
             self.assertRaises(RuntimeError),
@@ -472,7 +472,7 @@ class CrashRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
         with (
             patch(
-                "neuro_code.infrastructure.persistence.sqlite_session._resolve_abandoned_turn_attempt",
+                "neuro_code.infrastructure.persistence.sqlite_session_turns._resolve_abandoned_turn_attempt",
                 side_effect=RuntimeError("injected attempt resolution failure"),
             ),
             self.assertRaises(RuntimeError),
@@ -1804,7 +1804,7 @@ class CrashRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
         with (
             patch(
-                "neuro_code.infrastructure.persistence.sqlite_session._upsert_search_document",
+                "neuro_code.infrastructure.persistence.sqlite_session_turns._upsert_search_document",
                 side_effect=RuntimeError("injected search failure"),
             ),
             self.assertRaises(RuntimeError),

@@ -261,7 +261,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             failed_event = AgentEvent.create(2, AgentEventKind.TURN_COMPLETED, {"step": 2})
             with (
                 patch(
-                    "neuro_code.infrastructure.persistence.sqlite_session._upsert_search_document",
+                    "neuro_code.infrastructure.persistence.sqlite_session_turns._upsert_search_document",
                     side_effect=RuntimeError("index failure"),
                 ),
                 self.assertRaisesRegex(RuntimeError, "index failure"),
@@ -541,10 +541,12 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
         retry_connection.execute.side_effect = execute_with_transient_lock
         with (
             patch(
-                "neuro_code.infrastructure.persistence.sqlite_session.sqlite3.connect",
+                "neuro_code.infrastructure.persistence.sqlite_session_connection.sqlite3.connect",
                 return_value=retry_connection,
             ),
-            patch("neuro_code.infrastructure.persistence.sqlite_session.time.sleep") as sleep,
+            patch(
+                "neuro_code.infrastructure.persistence.sqlite_session_connection.time.sleep"
+            ) as sleep,
         ):
             self.assertIs(store._connect(), retry_connection)
 
@@ -562,7 +564,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
         failed_connection.execute.side_effect = execute_with_permanent_failure
         with (
             patch(
-                "neuro_code.infrastructure.persistence.sqlite_session.sqlite3.connect",
+                "neuro_code.infrastructure.persistence.sqlite_session_connection.sqlite3.connect",
                 return_value=failed_connection,
             ),
             self.assertRaisesRegex(sqlite3.OperationalError, "disk I/O error"),
@@ -934,7 +936,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
 
             with (
                 patch(
-                    "neuro_code.infrastructure.persistence.sqlite_session._upsert_search_document",
+                    "neuro_code.infrastructure.persistence.sqlite_session_turns._upsert_search_document",
                     side_effect=RuntimeError("index failure"),
                 ),
                 self.assertRaisesRegex(RuntimeError, "index failure"),
@@ -1008,7 +1010,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
 
             with (
                 patch(
-                    "neuro_code.infrastructure.persistence.sqlite_session._upsert_search_document",
+                    "neuro_code.infrastructure.persistence.sqlite_session_turns._upsert_search_document",
                     side_effect=RuntimeError("index failure"),
                 ),
                 self.assertRaisesRegex(RuntimeError, "index failure"),
@@ -1761,7 +1763,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
 
             with (
                 patch(
-                    "neuro_code.infrastructure.persistence.sqlite_session._upsert_search_document",
+                    "neuro_code.infrastructure.persistence.sqlite_session_core._upsert_search_document",
                     side_effect=RuntimeError("injected index failure"),
                 ),
                 self.assertRaisesRegex(RuntimeError, "injected index failure"),
@@ -2062,7 +2064,7 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             store = SqliteSessionStore(database)
             with (
                 patch(
-                    "neuro_code.infrastructure.persistence.sqlite_session._backfill_search_documents",
+                    "neuro_code.infrastructure.persistence.sqlite_session_core._backfill_search_documents",
                     side_effect=RuntimeError("injected backfill failure"),
                 ),
                 self.assertRaisesRegex(RuntimeError, "injected backfill failure"),
