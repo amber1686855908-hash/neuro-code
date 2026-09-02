@@ -103,16 +103,19 @@ def default_tool_registry(
         ClientTerminalTool,
         ClientTerminalWaitTool,
     )
-    from neuro_code.infrastructure.tools.filesystem import (
-        ApplyPatchTool,
+    from neuro_code.infrastructure.tools.filesystem_discovery import (
         GlobTool,
-        GrepManyTool,
-        GrepTool,
         ListDirTool,
         ListTreeTool,
-        ReadFilesTool,
-        ReadFileTool,
+    )
+    from neuro_code.infrastructure.tools.filesystem_mutation import (
+        ApplyPatchTool,
         SearchReplaceTool,
+    )
+    from neuro_code.infrastructure.tools.filesystem_read import ReadFilesTool, ReadFileTool
+    from neuro_code.infrastructure.tools.filesystem_search import (
+        GrepManyTool,
+        GrepTool,
     )
     from neuro_code.infrastructure.tools.interaction import AskUserTool
     from neuro_code.infrastructure.tools.lsp import LspTool

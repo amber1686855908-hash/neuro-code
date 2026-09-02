@@ -766,7 +766,7 @@ class FilesystemToolTests(unittest.IsolatedAsyncioTestCase):
 
             with (
                 patch(
-                    "neuro_code.infrastructure.tools.filesystem.os.replace",
+                    "neuro_code.infrastructure.tools.filesystem_mutation.os.replace",
                     side_effect=replace_with_one_commit_failure,
                 ),
                 self.assertRaisesRegex(ToolError, "rolled back"),
@@ -969,7 +969,9 @@ class FilesystemToolTests(unittest.IsolatedAsyncioTestCase):
             assert many.metadata is not None
             self.assertGreaterEqual(many.metadata["unreadable_files"], 1)
 
-            with patch("neuro_code.infrastructure.tools.filesystem.MAX_FILE_SCAN_ENTRIES", 1):
+            with patch(
+                "neuro_code.infrastructure.tools.filesystem_discovery.MAX_FILE_SCAN_ENTRIES", 1
+            ):
                 limited = await GrepTool().execute(
                     {"query": "Needle", "path": "."}, ToolContext(root)
                 )
@@ -1000,13 +1002,18 @@ class FilesystemToolTests(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(patch=patch_text), self.assertRaises(ToolError):
                     await ApplyPatchTool().execute({"patch": patch_text}, ToolContext(root))
             with (
-                patch("neuro_code.infrastructure.tools.filesystem.MAX_APPLY_PATCH_BYTES", 1),
+                patch(
+                    "neuro_code.infrastructure.tools.filesystem_mutation.MAX_APPLY_PATCH_BYTES", 1
+                ),
                 self.assertRaisesRegex(ToolError, "at most"),
             ):
                 await ApplyPatchTool().execute(
                     {"patch": "*** Begin Patch\n*** End Patch"}, ToolContext(root)
                 )
-            with patch("neuro_code.infrastructure.tools.filesystem.MAX_APPLY_PATCH_FILE_BYTES", 1):
+            with patch(
+                "neuro_code.infrastructure.tools.filesystem_mutation.MAX_APPLY_PATCH_FILE_BYTES",
+                1,
+            ):
                 oversized = (
                     "*** Begin Patch\n*** Update File: target.txt\n@@\n-old\n+new\n*** End Patch"
                 )
@@ -1083,7 +1090,9 @@ class FilesystemToolTests(unittest.IsolatedAsyncioTestCase):
                 {"queries": ["needle"], "max_results_per_query": 1}, ToolContext(root)
             )
             self.assertEqual(many_limited.metadata and many_limited.metadata["match_count"], 1)
-            with patch("neuro_code.infrastructure.tools.filesystem.MAX_FILE_SCAN_ENTRIES", 1):
+            with patch(
+                "neuro_code.infrastructure.tools.filesystem_discovery.MAX_FILE_SCAN_ENTRIES", 1
+            ):
                 many_scan_limited = await GrepManyTool().execute(
                     {"queries": ["needle"]}, ToolContext(root)
                 )
@@ -1221,7 +1230,7 @@ class FilesystemToolTests(unittest.IsolatedAsyncioTestCase):
 
             with (
                 patch(
-                    "neuro_code.infrastructure.tools.filesystem.os.replace",
+                    "neuro_code.infrastructure.tools.filesystem_mutation.os.replace",
                     side_effect=OSError("replace failed"),
                 ),
                 self.assertRaises(OSError),

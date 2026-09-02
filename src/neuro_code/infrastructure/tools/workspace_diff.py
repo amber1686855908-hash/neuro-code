@@ -30,6 +30,7 @@ from neuro_code.application.ports.workspace_changes import (
     WorkspaceDiffResult,
 )
 from neuro_code.domain.tools import ToolDefinition, ToolResult
+from neuro_code.infrastructure.tools.filesystem_security import _ensure_no_link_components
 from neuro_code.infrastructure.workspace.changes import (
     WorkspaceFileSnapshot,
     WorkspaceSnapshot,
@@ -490,41 +491,6 @@ class WorkspaceMutationJournal:
         return None
 
 
-def _ensure_no_link_components(context: ToolContext, raw_path: str) -> None:
-    candidate = Path(raw_path).expanduser()
-    if not candidate.is_absolute():
-        candidate = context.cwd / candidate
-    # Ignore symlink aliases above the workspace root (for example macOS's
-    # /var -> /private/var).  Security checks apply to components inside an
-    # explicitly allowed root, not to the root spelling itself.
-    roots = (context.cwd, *context.additional_workspace_roots)
-    for root in roots:
-        root_path = root.expanduser()
-        try:
-            relative = candidate.relative_to(root_path)
-        except ValueError:
-            continue
-        current = root_path
-        relative_parts = relative.parts
-        for part in relative_parts[:-1]:
-            current /= part
-            if _is_link_like(current):
-                raise ToolError("workspace diff paths must not traverse symlinks or junctions")
-        if _is_link_like(candidate):
-            raise ToolError("workspace diff paths must not target symlinks or junctions")
-        return
-
-
-def _is_link_like(path: Path) -> bool:
-    try:
-        if path.is_symlink():
-            return True
-        is_junction = getattr(path, "is_junction", None)
-        return bool(is_junction is not None and is_junction())
-    except OSError:
-        return True
-
-
 def _protected_redactions(context: ToolContext) -> tuple[str, ...]:
     protected = {name.casefold() for name in context.protected_environment_variables}
     return tuple(
@@ -589,7 +555,14 @@ class WorkspaceDiffTool:
             raise ToolError(f"paths must contain at most {MAX_WORKSPACE_DIFF_PATHS} items")
         normalized_paths: list[str] = []
         for raw_path in paths:
-            _ensure_no_link_components(context, raw_path)
+            _ensure_no_link_components(
+                context,
+                raw_path,
+                traversal_error_message=(
+                    "workspace diff paths must not traverse symlinks or junctions"
+                ),
+                target_error_message="workspace diff paths must not target symlinks or junctions",
+            )
             resolved = resolve_workspace_path(
                 context.cwd,
                 raw_path,

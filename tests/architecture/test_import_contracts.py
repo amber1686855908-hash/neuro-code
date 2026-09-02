@@ -1292,12 +1292,23 @@ assert settings is importlib.import_module(
 
 
 def test_filesystem_canonical_owner_includes_the_write_tool() -> None:
-    """Stage 5G makes the filesystem tool module the single owner.
+    """Filesystem facade exports tools from their cohesive canonical owners.
 
-    验证阶段 5G 使文件系统工具模块成为唯一所有者."""
-    canonical = importlib.import_module("neuro_code.infrastructure.tools.filesystem")
+    验证文件系统门面从各自职责模块导出工具."""
+    facade = importlib.import_module("neuro_code.infrastructure.tools.filesystem")
 
-    assert canonical.SearchReplaceTool.__module__ == canonical.__name__
+    expected_owners = {
+        "ReadFileTool": "neuro_code.infrastructure.tools.filesystem_read",
+        "ListDirTool": "neuro_code.infrastructure.tools.filesystem_discovery",
+        "GrepTool": "neuro_code.infrastructure.tools.filesystem_search",
+        "SearchReplaceTool": "neuro_code.infrastructure.tools.filesystem_mutation",
+        "ApplyPatchTool": "neuro_code.infrastructure.tools.filesystem_mutation",
+        "ExactWorkspaceMutationTool": "neuro_code.infrastructure.tools.filesystem_mutation",
+    }
+    for name, module_name in expected_owners.items():
+        tool = getattr(facade, name)
+        assert tool.__module__ == module_name
+        assert tool is getattr(importlib.import_module(module_name), name)
 
 
 def test_importing_canonical_filesystem_tools_does_not_load_legacy_facade() -> None:
@@ -1339,6 +1350,12 @@ for module_name in (
     "neuro_code.tools.client_terminal",
     "neuro_code.tools.filesystem",
     "neuro_code.infrastructure.tools.filesystem",
+    "neuro_code.infrastructure.tools.filesystem_discovery",
+    "neuro_code.infrastructure.tools.filesystem_mutation",
+    "neuro_code.infrastructure.tools.filesystem_output",
+    "neuro_code.infrastructure.tools.filesystem_read",
+    "neuro_code.infrastructure.tools.filesystem_search",
+    "neuro_code.infrastructure.tools.filesystem_security",
     "neuro_code.infrastructure.tools.plans",
     "neuro_code.infrastructure.tools.skills",
 ):

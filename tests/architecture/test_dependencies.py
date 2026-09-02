@@ -1302,6 +1302,12 @@ def test_canonical_tool_modules_are_the_only_tool_implementations() -> None:
         "neuro_code.infrastructure.tools.bash",
         "neuro_code.infrastructure.tools.client_terminal",
         "neuro_code.infrastructure.tools.filesystem",
+        "neuro_code.infrastructure.tools.filesystem_discovery",
+        "neuro_code.infrastructure.tools.filesystem_mutation",
+        "neuro_code.infrastructure.tools.filesystem_output",
+        "neuro_code.infrastructure.tools.filesystem_read",
+        "neuro_code.infrastructure.tools.filesystem_search",
+        "neuro_code.infrastructure.tools.filesystem_security",
         "neuro_code.infrastructure.tools.interaction",
         "neuro_code.infrastructure.tools.lsp",
         "neuro_code.infrastructure.tools.plans",
@@ -1314,6 +1320,56 @@ def test_canonical_tool_modules_are_the_only_tool_implementations() -> None:
     assert {
         module for module in modules if module.startswith("neuro_code.infrastructure.tools")
     } == canonical_modules
+
+
+def test_filesystem_facade_contains_no_implementation() -> None:
+    modules = _source_modules()
+    facade_path = modules["neuro_code.infrastructure.tools.filesystem"]
+    tree = ast.parse(facade_path.read_text(encoding="utf-8"), filename=str(facade_path))
+
+    assert not any(
+        isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        for node in tree.body
+    )
+
+
+def test_filesystem_path_security_has_one_canonical_owner() -> None:
+    modules = _source_modules()
+    owners: dict[str, list[str]] = {}
+    for module, path in modules.items():
+        if not module.startswith("neuro_code.infrastructure.tools"):
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in {
+                "_ensure_no_link_components",
+                "_is_link_like",
+            }:
+                owners.setdefault(node.name, []).append(module)
+
+    assert owners == {
+        "_ensure_no_link_components": ["neuro_code.infrastructure.tools.filesystem_security"],
+        "_is_link_like": ["neuro_code.infrastructure.tools.filesystem_security"],
+    }
+
+
+def test_tool_registry_assembles_filesystem_tools_from_canonical_modules() -> None:
+    modules = _source_modules()
+    path = modules["neuro_code.infrastructure.tools.registry"]
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    imported_modules = {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module is not None
+    }
+
+    assert "neuro_code.infrastructure.tools.filesystem" not in imported_modules
+    assert {
+        "neuro_code.infrastructure.tools.filesystem_discovery",
+        "neuro_code.infrastructure.tools.filesystem_mutation",
+        "neuro_code.infrastructure.tools.filesystem_read",
+        "neuro_code.infrastructure.tools.filesystem_search",
+    }.issubset(imported_modules)
 
 
 def test_production_modules_do_not_import_the_removed_ports_package() -> None:

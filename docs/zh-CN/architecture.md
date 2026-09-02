@@ -418,6 +418,13 @@ USER 候选。按名称先见为准的去重确保 LOCAL 技能遮蔽同名 REPO
 
 权限链严格按以下顺序执行：
 
+文件系统工具适配器在内部按职责拆分：路径与工作区边界策略位于
+`filesystem_security`，有界输出位于 `filesystem_output`，目标读取位于
+`filesystem_read`，目录遍历与 glob 位于 `filesystem_discovery`，内容搜索位于
+`filesystem_search`，写入与结果采纳位于 `filesystem_mutation`。既有的
+`filesystem` 导入路径只是薄兼容门面；registry 和 composition root 直接组装具体 owner。
+`workspace_diff` 复用同一套链接/reparse-point 策略，不再定义第二套策略。
+
 1. 一次解析全部目标，包括 `apply_patch` 的所有源路径和目标路径。对缺失的创建叶子会证明
    已存在的父级/祖先，并拒绝符号链接、junction、Windows reparse traversal、父级逃逸以及
    含义不明确的 Windows device/extended/ADS 命名空间。

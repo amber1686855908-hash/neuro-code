@@ -1746,7 +1746,7 @@ async def test_exact_workspace_mutation_enforces_local_exact_file_boundary(tmp_p
 
 
 def test_exact_workspace_image_helpers_fail_closed(tmp_path: Path) -> None:
-    from neuro_code.infrastructure.tools import filesystem as filesystem_tools
+    from neuro_code.infrastructure.tools import filesystem_mutation as filesystem_tools
 
     missing = tmp_path / "missing.txt"
     expected = _entry("missing.txt", BASE_CONTENT_A)

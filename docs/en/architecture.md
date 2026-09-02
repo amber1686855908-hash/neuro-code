@@ -564,6 +564,15 @@ rules and forward slashes. The raw spelling remains diagnostic only.
 
 The authority chain is deliberately ordered:
 
+The filesystem tool adapter is internally split by responsibility: path and
+workspace-boundary policy lives in `filesystem_security`, bounded output in
+`filesystem_output`, targeted reads in `filesystem_read`, directory traversal
+and globbing in `filesystem_discovery`, content search in `filesystem_search`,
+and writes/result adoption in `filesystem_mutation`. The established
+`filesystem` import path is a thin compatibility facade; the registry and
+composition root assemble the concrete owners directly. `workspace_diff`
+reuses the same link/reparse-point policy rather than defining a second one.
+
 1. Resolve every target once, including all `apply_patch` source and destination
    paths. Existing parents/ancestors are proven for missing create leaves, and
    symlinks, junctions, Windows reparse traversal, parent escapes, and ambiguous

@@ -794,6 +794,12 @@ application 和 domain 模块不得导入具体 infrastructure 实现。所有�
      `neuro_code.application.tools.service`；package 聚合入口仍保留保持 identity 的兼容导出。artifact 句柄、
      会话可见性校验、脱敏、字节上限、清理、权限、存储、Runtime 与协议行为保持不变。本阶段不暴露文件系统路径，
      也不创建第二套 artifact 模型。
+149. 阶段 5CQ 将文件系统工具 God Module 拆分为有内聚性的 canonical owner：`filesystem_security` 负责目标规划与
+     链接/reparse-point 策略，`filesystem_output` 负责有界输出，`filesystem_read` 负责目标读取，
+     `filesystem_discovery` 负责目录遍历与 glob，`filesystem_search` 负责内容搜索，`filesystem_mutation` 负责补丁、
+     替换和精确结果采纳写入。`filesystem.py` 仅保留保持 identity 的薄 facade；registry 与 composition 直接导入具体
+     owner，`workspace_diff` 复用同一链接策略。工具名称、schema、结果形状、权限、sandbox 行为、工作区边界以及
+     文件系统/client 委托语义均保持不变。
 
 ## 影响
 

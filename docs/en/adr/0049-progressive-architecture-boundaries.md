@@ -1272,6 +1272,17 @@ session formats, ACP behavior, permissions, sandboxing, or security semantics.
      pruning, permissions, storage, Runtime, and protocol behavior remain
      unchanged. This stage does not expose filesystem paths or create a second
      artifact model.
+149. Stage 5CQ decomposes the filesystem tool God Module into cohesive
+     canonical owners: `filesystem_security` for target planning and
+     link/reparse-point policy, `filesystem_output` for bounded output,
+     `filesystem_read` for targeted reads, `filesystem_discovery` for
+     directory traversal and globbing, `filesystem_search` for content search,
+     and `filesystem_mutation` for patch, replacement, and exact result-adoption
+     writes. `filesystem.py` remains only a thin identity-preserving facade;
+     registry and composition import the concrete owners directly, and
+     `workspace_diff` reuses the same link policy. Tool names, schemas, result
+     shapes, permissions, sandbox behavior, workspace boundaries, and all
+     filesystem/client delegation semantics remain unchanged.
 
 ## Consequences
 
