@@ -173,6 +173,113 @@ def _source_modules() -> dict[str, Path]:
     return {_module_name(path): path for path in _PACKAGE_ROOT.rglob("*.py")}
 
 
+_TUI_CANONICAL_CLASS_OWNERS = {
+    "NeuroCodeApp": "neuro_code.interfaces.tui.app",
+    "TuiUserInteraction": "neuro_code.interfaces.tui.interaction",
+    "CollapsingPulseAnimation": "neuro_code.interfaces.tui.state",
+    "TranscriptEntry": "neuro_code.interfaces.tui.state",
+    "ToolFeedbackState": "neuro_code.interfaces.tui.state",
+    "ToolActivityGroupState": "neuro_code.interfaces.tui.state",
+    "ProviderSettingsSubmission": "neuro_code.interfaces.tui.state",
+    "MenuOptionButton": "neuro_code.interfaces.tui.widgets",
+    "AssistantMarkdown": "neuro_code.interfaces.tui.widgets",
+    "ConversationMessage": "neuro_code.interfaces.tui.widgets",
+    "AssistantMessage": "neuro_code.interfaces.tui.widgets",
+    "PromptInput": "neuro_code.interfaces.tui.widgets",
+    "ToolFeedbackMessage": "neuro_code.interfaces.tui.widgets",
+    "TranscriptCopyScreen": "neuro_code.interfaces.tui.screens.transcript",
+    "SettingsScreen": "neuro_code.interfaces.tui.screens.settings",
+    "LanguageSettingsScreen": "neuro_code.interfaces.tui.screens.settings",
+    "NetworkProxySettingsScreen": "neuro_code.interfaces.tui.screens.settings",
+    "BackgroundWakeSettingsScreen": "neuro_code.interfaces.tui.screens.settings",
+    "ProviderSettingsScreen": "neuro_code.interfaces.tui.screens.provider",
+    "ProviderSetupApp": "neuro_code.interfaces.tui.screens.provider",
+    "ReasoningEffortScreen": "neuro_code.interfaces.tui.screens.selection",
+    "PermissionApprovalScreen": "neuro_code.interfaces.tui.screens.selection",
+    "ProviderSelectionScreen": "neuro_code.interfaces.tui.screens.selection",
+    "SessionSelectionScreen": "neuro_code.interfaces.tui.screens.selection",
+    "TurnControllerMixin": "neuro_code.interfaces.tui.controllers.turns",
+    "ToolActivityEventsMixin": "neuro_code.interfaces.tui.controllers.tool_activity.events",
+    "ToolActivityInspectorMixin": "neuro_code.interfaces.tui.controllers.tool_activity.inspector",
+    "ToolActivityPresentationMixin": "neuro_code.interfaces.tui.controllers.tool_activity.presentation",
+    "CommandControllerMixin": "neuro_code.interfaces.tui.controllers.commands",
+    "PreferencesControllerMixin": "neuro_code.interfaces.tui.controllers.preferences",
+    "ProviderControllerMixin": "neuro_code.interfaces.tui.controllers.provider",
+    "SessionControllerMixin": "neuro_code.interfaces.tui.controllers.session",
+    "PlanControllerMixin": "neuro_code.interfaces.tui.controllers.plans",
+    "TaskControllerMixin": "neuro_code.interfaces.tui.controllers.tasks",
+    "BackgroundControllerMixin": "neuro_code.interfaces.tui.controllers.background",
+    "TranscriptControllerMixin": "neuro_code.interfaces.tui.controllers.transcript",
+    "RuntimeControllerMixin": "neuro_code.interfaces.tui.controllers.runtime",
+}
+
+
+def _top_level_classes(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
+
+
+def _class_method_names(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            names.update(
+                child.name
+                for child in node.body
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+            )
+    return names
+
+
+def test_tui_canonical_class_ownership_is_unique() -> None:
+    modules = _source_modules()
+    definitions: dict[str, list[str]] = {}
+    for module, path in modules.items():
+        if not module.startswith("neuro_code.interfaces.tui"):
+            continue
+        for name in _top_level_classes(path):
+            definitions.setdefault(name, []).append(module)
+
+    for name, expected_module in _TUI_CANONICAL_CLASS_OWNERS.items():
+        assert definitions.get(name) == [expected_module]
+
+
+def test_tui_app_and_controller_method_ownership_is_disjoint() -> None:
+    modules = _source_modules()
+    app_methods = _class_method_names(modules["neuro_code.interfaces.tui.app"])
+    controller_methods: dict[str, set[str]] = {}
+    for module, path in modules.items():
+        if not module.startswith("neuro_code.interfaces.tui.controllers."):
+            continue
+        for name in _class_method_names(path):
+            controller_methods.setdefault(name, set()).add(module)
+
+    assert app_methods.isdisjoint(controller_methods)
+    duplicates = {name: owners for name, owners in controller_methods.items() if len(owners) > 1}
+    assert not duplicates
+
+
+def test_tui_app_defines_only_the_app_and_lifecycle_helper() -> None:
+    modules = _source_modules()
+    path = modules["neuro_code.interfaces.tui.app"]
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    assert {node.name for node in tree.body if isinstance(node, ast.ClassDef)} == {"NeuroCodeApp"}
+    assert {
+        node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    } == {"_read_terminal_size"}
+
+
+def test_tui_controllers_do_not_import_the_app_module() -> None:
+    modules = _source_modules()
+    known_modules = frozenset(modules)
+    for module, path in modules.items():
+        if not module.startswith("neuro_code.interfaces.tui.controllers."):
+            continue
+        imports = _internal_imports(path, source=module, known_modules=known_modules)
+        assert "neuro_code.interfaces.tui.app" not in imports
+
+
 def _resolve_import_base(node: ast.ImportFrom, *, package: str) -> str | None:
     if node.level == 0:
         return node.module
@@ -1586,17 +1693,24 @@ def test_canonical_runtime_consumers_use_explicit_submodules() -> None:
             "neuro_code.application.tools.service",
         },
         "neuro_code.interfaces.tui.app": {
-            "neuro_code.application.runtime.agent",
-            "neuro_code.application.permissions.broker",
-            "neuro_code.application.providers.contracts",
-            "neuro_code.application.providers.service",
-            "neuro_code.application.sessions.contracts",
-            "neuro_code.application.sessions.selection",
-            "neuro_code.application.sessions.subagent_queries",
-            "neuro_code.application.tools.service",
-            "neuro_code.application.workflows.plan_execution",
-            "neuro_code.application.workflows.plan_scheduling",
-            "neuro_code.application.workflows.session_task_execution",
+            "neuro_code.interfaces.tui.contracts",
+            "neuro_code.interfaces.tui.controllers.background",
+            "neuro_code.interfaces.tui.controllers.commands",
+            "neuro_code.interfaces.tui.controllers.plans",
+            "neuro_code.interfaces.tui.controllers.preferences",
+            "neuro_code.interfaces.tui.controllers.provider",
+            "neuro_code.interfaces.tui.controllers.runtime",
+            "neuro_code.interfaces.tui.controllers.session",
+            "neuro_code.interfaces.tui.controllers.tasks",
+            "neuro_code.interfaces.tui.controllers.tool_activity.events",
+            "neuro_code.interfaces.tui.controllers.tool_activity.inspector",
+            "neuro_code.interfaces.tui.controllers.tool_activity.presentation",
+            "neuro_code.interfaces.tui.controllers.transcript",
+            "neuro_code.interfaces.tui.controllers.turns",
+            "neuro_code.interfaces.tui.interaction",
+            "neuro_code.interfaces.tui.screens",
+            "neuro_code.interfaces.tui.state",
+            "neuro_code.interfaces.tui.widgets",
         },
         "neuro_code.interfaces.cli.app": {
             "neuro_code.application.sessions.lifecycle",

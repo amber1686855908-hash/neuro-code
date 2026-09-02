@@ -172,12 +172,10 @@ class BootstrapCliServices:
         settings: ApplicationSettings,
     ) -> int:
         try:
-            from neuro_code.interfaces.tui.app import (
-                TUI_RELOAD_PROVIDER_SETTINGS,
-                NeuroCodeApp,
-                ProviderSetupApp,
-                TuiUserInteraction,
-            )
+            from neuro_code.interfaces.tui.app import NeuroCodeApp
+            from neuro_code.interfaces.tui.interaction import TuiUserInteraction
+            from neuro_code.interfaces.tui.screens.provider import ProviderSetupApp
+            from neuro_code.interfaces.tui.state import TUI_RELOAD_PROVIDER_SETTINGS
         except ModuleNotFoundError as error:
             if error.name in {"rich", "textual"}:
                 raise ConfigurationError(

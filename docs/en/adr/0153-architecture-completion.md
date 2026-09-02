@@ -31,8 +31,13 @@ The inbound adapters have these canonical owners:
 
 - `interfaces.cli.app` owns CLI parsing, dispatch, presentation, and exit-code
   handling; `interfaces.cli.sessions` owns the parsed sessions command boundary.
-- `interfaces.tui.app`, `interfaces.tui.commands`, `interfaces.tui.text`, and
-  `interfaces.tui.theme` own the TUI implementation and presentation catalog.
+- `interfaces.tui.app` owns only the Textual lifecycle, high-level wiring, and
+  app-owned state. `interfaces.tui.contracts`, `interaction`, and `state` own
+  TUI contracts and local models; `widgets` and `screens` own reusable visual
+  surfaces; `controllers` owns cohesive turns, commands, preferences,
+  provider/session selection, plans/tasks, background, transcript, runtime, and
+  tool-activity orchestration. The existing `commands`, `text`, `theme`, and
+  `tool_activity` modules remain their canonical owners.
 - `interfaces.acp.agent` owns the ACP protocol agent and delegates bounded
   content, update projection, client I/O, MCP conversion, transport, and
   session-runtime responsibilities to its ACP submodules.
@@ -86,9 +91,8 @@ TUI presentation and shortcuts, ACP wire semantics, Runtime and Provider
 behavior, permission and sandbox gates, and session persistence semantics are
 unchanged.
 
-Two large but cohesive owners remain deliberately bounded rather than being
-split mechanically: `interfaces.tui.app` coordinates the existing full-screen
-TUI surface, and `infrastructure.persistence.sqlite_session` remains the one
-SQLite session-store/schema/transaction owner. They are follow-up candidates
-only when a second independent reason to change creates a safe ownership seam;
-this ADR does not duplicate or weaken either implementation.
+The TUI decomposition deliberately keeps `interfaces.tui.app` as the lifecycle
+and wiring owner; its controller mixins are split by reason to change and do
+not import the app module. `infrastructure.persistence.sqlite_session` remains
+the one SQLite session-store/schema/transaction owner. Neither boundary is
+duplicated or weakened.

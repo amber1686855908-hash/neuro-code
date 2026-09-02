@@ -67,9 +67,17 @@ The pre-v1 architecture completion makes the three inbound adapters explicit.
 `neuro_code.interfaces.cli.app` owns CLI parsing, dispatch, presentation, and
 exit-code handling; `interfaces.cli.sessions` owns the parsed `sessions`
 execution boundary through the narrow `SessionCliServices` contract.
-`neuro_code.interfaces.tui.app`, `commands`, `text`, and `theme` are the TUI
-owners, while `TuiUserInteraction` remains the queue-backed application port
-adapter. `neuro_code.interfaces.acp.agent` owns the ACP protocol agent and
+`neuro_code.interfaces.tui.app` owns only the Textual app lifecycle, high-level
+wiring, and app-owned state. TUI contracts and local state live in
+`interfaces.tui.contracts`, `interfaces.tui.interaction`, and
+`interfaces.tui.state`; widgets and modal surfaces live in `interfaces.tui.widgets`
+and `interfaces.tui.screens`. Cohesive inbound orchestration is split into
+`interfaces.tui.controllers` for turns, commands, preferences, provider/session
+selection, plans/tasks, background wake, transcript, runtime chrome, and tool
+activity event/Inspector/presentation handling. The existing `commands`, `text`,
+`theme`, and `tool_activity` modules remain their respective canonical owners.
+`TuiUserInteraction` remains the queue-backed application port adapter.
+`neuro_code.interfaces.acp.agent` owns the ACP protocol agent and
 delegates content, event projection, client I/O, MCP declaration conversion,
 transport, and per-session runtime state to the explicit ACP submodules. The
 root-level `neuro_code.cli`, `neuro_code.tui`, `neuro_code.acp`,
@@ -819,7 +827,10 @@ application ports; no ACP SDK type reaches application code. See
 [ADR 0055](adr/0055-bounded-acp-embedded-text-resources.md), and
 [ADR 0056](adr/0056-bounded-acp-client-background-terminals.md).
 
-The minimal TUI is a presentation adapter over `AgentEvent`. It owns prompt
+The minimal TUI is a presentation adapter over `AgentEvent`. Its source tree
+keeps app lifecycle, local models, widgets/screens, and cohesive controller
+responsibilities in separate owners; no controller imports the app module.
+The TUI owns prompt
 input, scrollback, a live text surface, and local slash commands. It never
 renders raw reasoning or unrestricted argument/result mappings. A bounded
 allowlist supplies invocation previews such as path, command, pattern, query,
