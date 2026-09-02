@@ -56,8 +56,15 @@ shared owner，同时不改变语言值或持久化行为。
 第一版发布前的 Architecture Completion 让三个入站适配器都拥有明确的 canonical 路径。
 `neuro_code.interfaces.cli.app` 负责 CLI 参数解析、分发、展示和退出码；
 `interfaces.cli.sessions` 通过窄的 `SessionCliServices` contract 负责已解析的 `sessions` 执行边界。
-`neuro_code.interfaces.tui.app`、`commands`、`text` 和 `theme` 负责 TUI；队列式
-`TuiUserInteraction` 仍是用户交互端口的入站适配器。`neuro_code.interfaces.acp.agent` 负责 ACP
+`neuro_code.interfaces.tui.app` 只负责 Textual app lifecycle、high-level wiring 和 app-owned state。
+TUI contract 与本地 state 位于 `interfaces.tui.contracts`、`interfaces.tui.interaction` 和
+`interfaces.tui.state`；widgets 与 modal surface 位于 `interfaces.tui.widgets` 和
+`interfaces.tui.screens`。内聚的入站 orchestration 拆到
+`interfaces.tui.controllers`，分别承载 turns、commands、preferences、provider/session selection、
+plans/tasks、background wake、transcript、runtime chrome，以及 tool activity 的 event/Inspector/presentation。
+既有 `commands`、`text`、`theme` 和 `tool_activity` 模块继续各自拥有 canonical implementation。
+队列式 `TuiUserInteraction` 仍是用户交互端口的入站适配器。
+`neuro_code.interfaces.acp.agent` 负责 ACP
 协议 Agent，并把 content、event projection、client I/O、MCP declaration conversion、transport
 和 per-session runtime state 委托给明确的 ACP 子模块。根级的
 `neuro_code.cli`、`neuro_code.tui`、`neuro_code.acp`、`neuro_code.tui_commands`、
@@ -599,7 +606,8 @@ ACP adapter 仍保留调用这些 projection 所需的 session-bound wiring、li
 [ADR 0055](adr/0055-bounded-acp-embedded-text-resources.md)，以及
 [ADR 0056](adr/0056-bounded-acp-client-background-terminals.md)。
 
-最小 TUI 是 `AgentEvent` 之上的表现适配器，负责提示输入、滚动记录、实时文本表面和
+最小 TUI 是 `AgentEvent` 之上的表现适配器。源码树把 app lifecycle、本地 model、widgets/screens
+和内聚 controller 职责放在独立 owner 中；controller 不导入 app 模块。TUI 负责提示输入、滚动记录、实时文本表面和
 本地斜杠命令。它绝不渲染原始推理或不受限制的参数/结果映射；只有路径、命令、模式、
 查询与任务 ID 等有界白名单参数可进入调用摘要。每个本地工具调用仍保留按 call ID 标识的
 稳定状态，但 TUI 会把连续调用投影为一个活动组。活动组默认折叠，编辑也不例外；摘要只

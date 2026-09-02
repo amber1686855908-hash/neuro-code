@@ -26,8 +26,12 @@ package 根目录不再放置 production implementation module。源码根目录
 
 - `interfaces.cli.app` 负责 CLI parser、dispatch、展示和 exit-code handling；
   `interfaces.cli.sessions` 负责已解析的 sessions command boundary。
-- `interfaces.tui.app`、`interfaces.tui.commands`、`interfaces.tui.text` 和
-  `interfaces.tui.theme` 负责 TUI implementation 与 presentation catalog。
+- `interfaces.tui.app` 只负责 Textual lifecycle、high-level wiring 和 app-owned state。
+  `interfaces.tui.contracts`、`interaction` 与 `state` 负责 TUI contract 和本地 model；
+  `widgets` 与 `screens` 负责可复用的视觉 surface；`controllers` 按 reason to change 负责 turns、
+  commands、preferences、provider/session selection、plans/tasks、background、transcript、runtime
+  以及 tool activity orchestration。既有 `commands`、`text`、`theme` 和 `tool_activity` 模块继续是
+  各自的 canonical owner。
 - `interfaces.acp.agent` 负责 ACP protocol Agent，并把有界的 content、update projection、
   client I/O、MCP conversion、transport 和 session-runtime 职责委托给 ACP 子模块。
 
@@ -68,7 +72,6 @@ modular monolith 架构。Interface import 不会装配具体 infrastructure，a
 本次重构保持行为不变：command grammar、输出与 exit code、TUI 展示与快捷键、ACP wire semantics、
 Runtime 与 Provider 行为、permission 与 sandbox gate，以及 session persistence semantics 均不变。
 
-两个大型但具有单一 cohesion 的 owner 被有意保留，没有机械拆分：
-`interfaces.tui.app` 协调现有全屏 TUI surface，`infrastructure.persistence.sqlite_session` 仍是
-SQLite session-store/schema/transaction 的唯一 owner。只有出现第二个独立 reason to change 并形成安全
-ownership seam 时，才适合继续拆分；本 ADR 不复制实现，也不削弱任一边界。
+TUI decomposition 有意让 `interfaces.tui.app` 只保留 lifecycle 与 wiring；controller mixin 按
+reason to change 拆分，且不导入 app 模块。`infrastructure.persistence.sqlite_session` 仍是 SQLite
+session-store/schema/transaction 的唯一 owner。两个边界都没有被复制或削弱。

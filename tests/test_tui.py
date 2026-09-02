@@ -116,28 +116,22 @@ from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, Sessio
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.infrastructure.providers.provider_settings import JsonProviderSettingsStore
 from neuro_code.interfaces.tui import recoverable_terminal_status
-from neuro_code.interfaces.tui.app import (
-    TUI_RELOAD_PROVIDER_SETTINGS,
-    AssistantMarkdown,
-    AssistantMessage,
+from neuro_code.interfaces.tui.app import NeuroCodeApp
+from neuro_code.interfaces.tui.clipboard import ClipboardWriteResult
+from neuro_code.interfaces.tui.screens import (
     BackgroundWakeSettingsScreen,
-    CollapsingPulseAnimation,
-    ConversationMessage,
     LanguageSettingsScreen,
     NetworkProxySettingsScreen,
-    NeuroCodeApp,
     PermissionApprovalScreen,
-    PromptInput,
     ProviderSelectionScreen,
     ProviderSettingsScreen,
     ProviderSetupApp,
     ReasoningEffortScreen,
     SessionSelectionScreen,
     SettingsScreen,
-    ToolFeedbackMessage,
     TranscriptCopyScreen,
 )
-from neuro_code.interfaces.tui.clipboard import ClipboardWriteResult
+from neuro_code.interfaces.tui.state import TUI_RELOAD_PROVIDER_SETTINGS, CollapsingPulseAnimation
 from neuro_code.interfaces.tui.theme import (
     ACCENT_CODE,
     ACCENT_ERROR,
@@ -158,6 +152,13 @@ from neuro_code.interfaces.tui.theme import (
     TEXTUAL_THEME,
 )
 from neuro_code.interfaces.tui.tool_activity import ToolInspectorScreen
+from neuro_code.interfaces.tui.widgets import (
+    AssistantMarkdown,
+    AssistantMessage,
+    ConversationMessage,
+    PromptInput,
+    ToolFeedbackMessage,
+)
 from neuro_code.shared.errors import ProviderError
 from neuro_code.shared.ui_language import UiLanguage
 
@@ -5016,7 +5017,16 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                 refresh.assert_not_called()
                 app._refresh_running_tool_elapsed()
                 refresh.assert_called_once_with(group)
-            with patch("neuro_code.interfaces.tui.app.monotonic", return_value=112.7):
+            with (
+                patch(
+                    "neuro_code.interfaces.tui.controllers.tool_activity.presentation.monotonic",
+                    return_value=112.7,
+                ),
+                patch(
+                    "neuro_code.interfaces.tui.controllers.runtime.monotonic",
+                    return_value=112.7,
+                ),
+            ):
                 app._refresh_running_tool_elapsed()
             running_text = next(entry.text for entry in app.entries if entry.category == "tool")
             self.assertIn("Waiting", running_text)
@@ -5150,7 +5160,10 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             await app._handle_event(
                 AgentEvent.create(2, AgentEventKind.MODEL_STEP_STARTED, {"step": 20})
             )
-            with patch("neuro_code.interfaces.tui.app.monotonic", return_value=125.0):
+            with patch(
+                "neuro_code.interfaces.tui.controllers.runtime.monotonic",
+                return_value=125.0,
+            ):
                 app._advance_model_loading_animation()
                 app._advance_model_loading_animation()
 

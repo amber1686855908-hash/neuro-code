@@ -29,7 +29,7 @@ from neuro_code.domain.conversation.messages import ToolCall
 from neuro_code.domain.tools import ToolDefinition, ToolResult
 from neuro_code.infrastructure.tools.interaction import AskUserTool
 from neuro_code.infrastructure.tools.registry import ToolRegistry, default_tool_registry
-from neuro_code.interfaces.tui.app import TuiUserInteraction
+from neuro_code.interfaces.tui.interaction import TuiUserInteraction
 from neuro_code.shared.errors import ToolError
 from tests.fakes import EmptyWorkspaceChangeObserver
 

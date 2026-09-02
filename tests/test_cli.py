@@ -1564,7 +1564,10 @@ api_key_env = "FIXTURE_KEY"
                     {"HOME": str(root), "NEURO_CODE_HOME": str(state)},
                     clear=True,
                 ),
-                patch("neuro_code.interfaces.tui.app.ProviderSetupApp", SetupFixture),
+                patch(
+                    "neuro_code.interfaces.tui.screens.provider.ProviderSetupApp",
+                    SetupFixture,
+                ),
             ):
                 exit_code = main(("--cwd", str(root)))
 
@@ -1608,7 +1611,10 @@ api_key_env = "FIXTURE_KEY"
                     },
                     clear=True,
                 ),
-                patch("neuro_code.interfaces.tui.app.ProviderSetupApp", SetupFixture),
+                patch(
+                    "neuro_code.interfaces.tui.screens.provider.ProviderSetupApp",
+                    SetupFixture,
+                ),
             ):
                 exit_code = main(("--cwd", str(root)))
 
