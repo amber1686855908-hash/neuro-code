@@ -13,15 +13,15 @@ from neuro_code.application.ports.provider_settings import (
     ManagedProviderSettings,
     ManagedProxyPolicy,
 )
-from neuro_code.configuration.managed_provider_settings import (
+from neuro_code.domain.background_tasks.models import BackgroundTaskWakePolicy
+from neuro_code.infrastructure.providers.managed_provider_settings import (
     _CREDENTIALS_NAME,
     _METADATA_NAME,
     _SCHEMA_VERSION,
 )
-from neuro_code.configuration.managed_provider_settings import (
+from neuro_code.infrastructure.providers.managed_provider_settings import (
     load_managed_provider_settings as _load_managed_provider_settings,
 )
-from neuro_code.domain.background_tasks.models import BackgroundTaskWakePolicy
 from neuro_code.shared.async_utils import run_blocking
 from neuro_code.shared.errors import ConfigurationError
 

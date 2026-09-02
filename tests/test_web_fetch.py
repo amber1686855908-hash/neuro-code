@@ -32,7 +32,7 @@ from neuro_code.application.ports.web_fetch import (
 from neuro_code.application.settings import ApplicationSettings
 from neuro_code.application.web_fetch.service import WebFetchService
 from neuro_code.bootstrap.composition import ApplicationComposition
-from neuro_code.configuration.app import load_config
+from neuro_code.bootstrap.configuration import load_config
 from neuro_code.domain.conversation.context import ModelContext
 from neuro_code.domain.conversation.events import ModelEvent
 from neuro_code.domain.tools import ToolDefinition

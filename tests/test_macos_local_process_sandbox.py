@@ -20,7 +20,7 @@ from neuro_code.application.ports.sandbox import (
     LocalWorkspaceAccessMode,
     SandboxedProcessRequest,
 )
-from neuro_code.bootstrap.composition import _default_local_process_sandbox_factory
+from neuro_code.bootstrap.factories import _default_local_process_sandbox_factory
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.terminal import TerminalSize
 from neuro_code.infrastructure.sandbox.macos_local_process import (
@@ -221,7 +221,7 @@ class MacOSSeatbeltLocalProcessSandboxTests(unittest.IsolatedAsyncioTestCase):
             sentinel = object()
             with (
                 mock.patch(
-                    "neuro_code.bootstrap.composition._runtime_platform", return_value="darwin"
+                    "neuro_code.bootstrap.factories._runtime_platform", return_value="darwin"
                 ),
                 mock.patch(
                     "neuro_code.infrastructure.sandbox.macos_local_process."
@@ -237,7 +237,7 @@ class MacOSSeatbeltLocalProcessSandboxTests(unittest.IsolatedAsyncioTestCase):
 
             with (
                 mock.patch(
-                    "neuro_code.bootstrap.composition._runtime_platform", return_value="freebsd14"
+                    "neuro_code.bootstrap.factories._runtime_platform", return_value="freebsd14"
                 ),
                 self.assertRaisesRegex(SandboxError, "not enforceable"),
             ):

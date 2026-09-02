@@ -11,14 +11,14 @@ _CORE_ROOTS = (
     _PACKAGE_ROOT / "domain",
     _PACKAGE_ROOT / "infrastructure" / "persistence",
     _PACKAGE_ROOT / "interfaces",
-    _PACKAGE_ROOT / "tui.py",
+    _PACKAGE_ROOT / "interfaces" / "tui",
 )
 _ALLOWED_PROVIDER_PRESENTATION = frozenset(
     {
         _PACKAGE_ROOT / "application" / "ports" / "provider_catalog.py",
         _PACKAGE_ROOT / "application" / "ports" / "provider_services.py",
         _PACKAGE_ROOT / "application" / "ports" / "provider_settings.py",
-        _PACKAGE_ROOT / "tui_text.py",
+        _PACKAGE_ROOT / "interfaces" / "tui" / "text.py",
     }
 )
 _VENDOR_PATTERN = re.compile(

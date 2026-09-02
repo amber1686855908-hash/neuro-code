@@ -6,13 +6,13 @@ from typing import Any
 
 import pytest
 
+from neuro_code.application.ports.configuration import ProviderProfile
 from neuro_code.application.ports.model import ModelProvider
 from neuro_code.application.ports.web_search import (
     MAX_TOTAL_RESULT_BYTES,
     HostedWebSearchEvent,
     WebSearchRequest,
 )
-from neuro_code.configuration.app import ProviderProfile
 from neuro_code.infrastructure.providers import create_provider
 from neuro_code.infrastructure.providers.hosted_web_search import (
     AnthropicHostedWebSearchBackend,

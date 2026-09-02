@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import httpx
 
+from neuro_code.application.ports.configuration import AppConfig, ProviderProfile
 from neuro_code.application.ports.model import ModelCapability
 from neuro_code.application.ports.routing import ModelRoute, RuntimeRole
 from neuro_code.application.ports.web_search import (
@@ -17,7 +18,6 @@ from neuro_code.application.ports.web_search import (
     WebSearchErrorCode,
     WebSearchRequest,
 )
-from neuro_code.configuration.app import AppConfig, ProviderProfile
 from neuro_code.domain.conversation.context import ModelContext
 from neuro_code.domain.conversation.messages import Message, Role
 from neuro_code.infrastructure.providers.gemini_interactions import (

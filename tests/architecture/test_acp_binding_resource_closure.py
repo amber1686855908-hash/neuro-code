@@ -4,7 +4,7 @@ import ast
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_ACP_PATH = _PROJECT_ROOT / "src" / "neuro_code" / "acp.py"
+_ACP_PATH = _PROJECT_ROOT / "src" / "neuro_code" / "interfaces" / "acp" / "agent.py"
 _SESSION_RUNTIME_PATH = _PROJECT_ROOT / "src" / "neuro_code" / "interfaces" / "acp" / "session.py"
 
 

@@ -4,9 +4,9 @@ import os
 import unittest
 from unittest.mock import patch
 
+from neuro_code.application.ports.configuration import ProviderProfile
 from neuro_code.application.ports.model import ModelCapability
 from neuro_code.application.ports.provider_services import DEFAULT_PROVIDER_SERVICE_CATALOG
-from neuro_code.configuration.app import ProviderProfile
 from neuro_code.infrastructure.providers import create_provider
 from neuro_code.infrastructure.providers.anthropic import AnthropicProvider
 from neuro_code.infrastructure.providers.openai_compatible import OpenAICompatibleProvider

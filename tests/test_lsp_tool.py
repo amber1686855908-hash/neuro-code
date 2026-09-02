@@ -5,9 +5,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from neuro_code.application.ports.configuration import AppConfig
 from neuro_code.application.ports.lsp import LanguageServerProfile
 from neuro_code.application.ports.tools import ToolContext
-from neuro_code.configuration.app import AppConfig
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.infrastructure.lsp.manager import LanguageServerManager
 from neuro_code.infrastructure.sandbox.local_process import ProcessTreeLocalProcessSandbox

@@ -22,6 +22,7 @@ from neuro_code.application.memory.compaction_runtime import (
     ContextCompactionCommandResult,
     ContextCompactionCommandStatus,
 )
+from neuro_code.application.ports.configuration import AppConfig
 from neuro_code.application.ports.model import ModelToolPolicy
 from neuro_code.application.ports.provider_settings import ManagedProviderProfile
 from neuro_code.application.ports.storage import SessionStore
@@ -50,18 +51,8 @@ from neuro_code.application.workflows import (
 )
 from neuro_code.application.workflows.subagent import MAX_SUBAGENT_STEPS
 from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
-from neuro_code.bootstrap.entrypoints import BootstrapCliServices, main
-from neuro_code.cli import (
-    _application_settings,
-    _execution_control_mode,
-    _normalize_rule,
-    _run_agent,
-    _run_subagent,
-    _run_subagent_lifecycle,
-    build_parser,
-    run,
-)
-from neuro_code.configuration.app import AppConfig
+from neuro_code.bootstrap.cli import BootstrapCliServices
+from neuro_code.bootstrap.entrypoints import main
 from neuro_code.domain.conversation.context import ModelContext
 from neuro_code.domain.conversation.events import (
     AgentEvent,
@@ -86,6 +77,16 @@ from neuro_code.infrastructure.persistence.output_artifacts import FileToolOutpu
 from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
 from neuro_code.infrastructure.providers.catalog_cache import PersistentProviderCatalog
 from neuro_code.infrastructure.providers.provider_settings import JsonProviderSettingsStore
+from neuro_code.interfaces.cli.app import (
+    _application_settings,
+    _execution_control_mode,
+    _normalize_rule,
+    _run_agent,
+    _run_subagent,
+    _run_subagent_lifecycle,
+    build_parser,
+    run,
+)
 from neuro_code.interfaces.cli.serialization import (
     serialize_context_compaction_result,
     serialize_execution_outcome,
@@ -484,7 +485,7 @@ api_key_env = "FIXTURE_KEY"
                 clear=True,
             ),
             patch(
-                "neuro_code.bootstrap.composition.create_routed_provider",
+                "neuro_code.bootstrap.factories.create_routed_provider",
                 return_value=provider,
             ),
             redirect_stdout(output),
@@ -1041,7 +1042,7 @@ api_key_env = "FIXTURE_KEY"
 
     def test_tui_launch_receives_execution_control_setting(self) -> None:
         launch = AsyncMock(return_value=0)
-        with patch("neuro_code.bootstrap.entrypoints.BootstrapCliServices.run_tui", launch):
+        with patch("neuro_code.bootstrap.cli.BootstrapCliServices.run_tui", launch):
             exit_code = main(("code", "--execution-control", "observe-only"))
 
         self.assertEqual(exit_code, 0)
@@ -1187,7 +1188,7 @@ api_key_env = "FIXTURE_KEY"
                     clear=True,
                 ),
                 patch(
-                    "neuro_code.bootstrap.composition.create_routed_provider", return_value=provider
+                    "neuro_code.bootstrap.factories.create_routed_provider", return_value=provider
                 ),
                 redirect_stdout(output),
             ):
@@ -1258,12 +1259,12 @@ api_key_env = "FIXTURE_KEY"
                     clear=True,
                 ),
                 patch(
-                    "neuro_code.bootstrap.composition.LinuxBubblewrapLocalProcessSandbox",
+                    "neuro_code.bootstrap.factories.LinuxBubblewrapLocalProcessSandbox",
                     return_value=object(),
                 ) as create_local_sandbox,
-                patch("neuro_code.bootstrap.composition._runtime_platform", return_value="linux"),
+                patch("neuro_code.bootstrap.factories._runtime_platform", return_value="linux"),
                 patch(
-                    "neuro_code.bootstrap.composition.create_routed_provider",
+                    "neuro_code.bootstrap.factories.create_routed_provider",
                     return_value=CliProvider(),
                 ),
                 redirect_stdout(output),
@@ -1311,12 +1312,12 @@ api_key_env = "FIXTURE_KEY"
             with (
                 patch.dict("os.environ", environment, clear=True),
                 patch(
-                    "neuro_code.bootstrap.composition.LinuxBubblewrapLocalProcessSandbox",
+                    "neuro_code.bootstrap.factories.LinuxBubblewrapLocalProcessSandbox",
                     return_value=object(),
                 ) as create_local_sandbox,
-                patch("neuro_code.bootstrap.composition._runtime_platform", return_value="linux"),
+                patch("neuro_code.bootstrap.factories._runtime_platform", return_value="linux"),
                 patch(
-                    "neuro_code.bootstrap.composition.create_routed_provider",
+                    "neuro_code.bootstrap.factories.create_routed_provider",
                     return_value=CliProvider(),
                 ),
                 redirect_stdout(output),
@@ -1403,7 +1404,7 @@ api_key_env = "FIXTURE_KEY"
                         clear=True,
                     ),
                     patch(
-                        "neuro_code.bootstrap.composition.create_routed_provider",
+                        "neuro_code.bootstrap.factories.create_routed_provider",
                         return_value=CliProvider(),
                     ),
                     redirect_stdout(output),
@@ -1484,7 +1485,7 @@ api_key_env = "FIXTURE_KEY"
                     clear=True,
                 ),
                 patch(
-                    "neuro_code.bootstrap.composition.create_routed_provider",
+                    "neuro_code.bootstrap.factories.create_routed_provider",
                     return_value=BackgroundProvider(),
                 ),
                 redirect_stdout(output),
@@ -1531,14 +1532,14 @@ api_key_env = "FIXTURE_KEY"
 
     def test_no_subcommand_launches_the_tui(self) -> None:
         launch = AsyncMock(return_value=0)
-        with patch("neuro_code.bootstrap.entrypoints.BootstrapCliServices.run_tui", launch):
+        with patch("neuro_code.bootstrap.cli.BootstrapCliServices.run_tui", launch):
             exit_code = main(())
         self.assertEqual(exit_code, 0)
         launch.assert_awaited_once()
 
     def test_code_alias_launches_the_tui(self) -> None:
         launch = AsyncMock(return_value=0)
-        with patch("neuro_code.bootstrap.entrypoints.BootstrapCliServices.run_tui", launch):
+        with patch("neuro_code.bootstrap.cli.BootstrapCliServices.run_tui", launch):
             exit_code = main(("code",))
         self.assertEqual(exit_code, 0)
         launch.assert_awaited_once()
@@ -1563,7 +1564,7 @@ api_key_env = "FIXTURE_KEY"
                     {"HOME": str(root), "NEURO_CODE_HOME": str(state)},
                     clear=True,
                 ),
-                patch("neuro_code.tui.ProviderSetupApp", SetupFixture),
+                patch("neuro_code.interfaces.tui.app.ProviderSetupApp", SetupFixture),
             ):
                 exit_code = main(("--cwd", str(root)))
 
@@ -1607,7 +1608,7 @@ api_key_env = "FIXTURE_KEY"
                     },
                     clear=True,
                 ),
-                patch("neuro_code.tui.ProviderSetupApp", SetupFixture),
+                patch("neuro_code.interfaces.tui.app.ProviderSetupApp", SetupFixture),
             ):
                 exit_code = main(("--cwd", str(root)))
 
@@ -1662,6 +1663,7 @@ api_key_env = "FIXTURE_KEY"
                     model_name: str,
                     cwd: Path,
                     user_interaction: object,
+                    socks_supported: bool,
                 ) -> None:
                     captured.update(
                         runner=runner,
@@ -1692,6 +1694,7 @@ api_key_env = "FIXTURE_KEY"
                         provider_name=provider_name,
                         model_name=model_name,
                         cwd=cwd,
+                        socks_supported=socks_supported,
                     )
 
                 async def run_async(self) -> None:
@@ -1708,10 +1711,10 @@ api_key_env = "FIXTURE_KEY"
                     clear=True,
                 ),
                 patch(
-                    "neuro_code.bootstrap.composition.create_routed_provider",
+                    "neuro_code.bootstrap.factories.create_routed_provider",
                     return_value=CliProvider(),
                 ),
-                patch("neuro_code.tui.NeuroCodeApp", TuiFixture),
+                patch("neuro_code.interfaces.tui.app.NeuroCodeApp", TuiFixture),
             ):
                 exit_code = main(("--cwd", str(root)))
 
@@ -1769,14 +1772,14 @@ api_key_env = "FIXTURE_KEY"
                     clear=True,
                 ),
                 patch(
-                    "neuro_code.bootstrap.composition.LocalBackgroundTaskManager",
+                    "neuro_code.bootstrap.factories.LocalBackgroundTaskManager",
                     return_value=supervisor,
                 ),
                 patch(
-                    "neuro_code.bootstrap.composition.create_routed_provider",
+                    "neuro_code.bootstrap.factories.create_routed_provider",
                     return_value=CliProvider(),
                 ),
-                patch("neuro_code.tui.NeuroCodeApp", TuiFixture),
+                patch("neuro_code.interfaces.tui.app.NeuroCodeApp", TuiFixture),
             ):
                 exit_code = main(("--cwd", str(root)))
 
@@ -1810,14 +1813,14 @@ api_key_env = "FIXTURE_KEY"
                     clear=True,
                 ),
                 patch(
-                    "neuro_code.bootstrap.composition.LocalBackgroundTaskManager",
+                    "neuro_code.bootstrap.factories.LocalBackgroundTaskManager",
                     return_value=supervisor,
                 ),
                 patch(
-                    "neuro_code.bootstrap.composition.create_routed_provider",
+                    "neuro_code.bootstrap.factories.create_routed_provider",
                     return_value=CliProvider(),
                 ),
-                patch("neuro_code.tui.NeuroCodeApp", TuiFixture),
+                patch("neuro_code.interfaces.tui.app.NeuroCodeApp", TuiFixture),
                 self.assertRaisesRegex(RuntimeError, "fixture TUI failure"),
             ):
                 main(("--cwd", str(root)))
@@ -1896,6 +1899,7 @@ api_key_env = "FIXTURE_KEY"
                     model_name: str,
                     cwd: Path,
                     user_interaction: object,
+                    socks_supported: bool,
                 ) -> None:
                     del (
                         runner,
@@ -1925,6 +1929,7 @@ api_key_env = "FIXTURE_KEY"
                         provider_name,
                         model_name,
                         cwd,
+                        socks_supported,
                     )
                     self.session_controller = session_controller
 
@@ -1942,10 +1947,10 @@ api_key_env = "FIXTURE_KEY"
                     clear=True,
                 ),
                 patch(
-                    "neuro_code.bootstrap.composition.create_routed_provider",
+                    "neuro_code.bootstrap.factories.create_routed_provider",
                     return_value=CliProvider(),
                 ),
-                patch("neuro_code.tui.NeuroCodeApp", TuiFixture),
+                patch("neuro_code.interfaces.tui.app.NeuroCodeApp", TuiFixture),
             ):
                 exit_code = main(("--cwd", str(workspace)))
 
@@ -2023,6 +2028,7 @@ api_key_env = "SECOND_KEY"
                     model_name: str,
                     cwd: Path,
                     user_interaction: object,
+                    socks_supported: bool,
                 ) -> None:
                     del (
                         approval_controller,
@@ -2048,6 +2054,7 @@ api_key_env = "SECOND_KEY"
                         provider_name,
                         model_name,
                         cwd,
+                        socks_supported,
                     )
                     self.runner = runner
                     self.provider_controller = provider_controller
@@ -2078,10 +2085,8 @@ api_key_env = "SECOND_KEY"
                     },
                     clear=True,
                 ),
-                patch(
-                    "neuro_code.bootstrap.composition.create_routed_provider", side_effect=create
-                ),
-                patch("neuro_code.tui.NeuroCodeApp", TuiFixture),
+                patch("neuro_code.bootstrap.factories.create_routed_provider", side_effect=create),
+                patch("neuro_code.interfaces.tui.app.NeuroCodeApp", TuiFixture),
             ):
                 exit_code = main(("--cwd", str(root)))
 
@@ -2193,6 +2198,7 @@ api_key_env = "SECOND_KEY"
                     model_name: str,
                     cwd: Path,
                     user_interaction: object,
+                    socks_supported: bool,
                 ) -> None:
                     del (
                         approval_controller,
@@ -2218,6 +2224,7 @@ api_key_env = "SECOND_KEY"
                         provider_name,
                         model_name,
                         cwd,
+                        socks_supported,
                     )
                     self.runner = runner
                     self.provider_controller = provider_controller
@@ -2243,14 +2250,12 @@ api_key_env = "SECOND_KEY"
 
             with (
                 patch.dict("os.environ", environment, clear=True),
-                patch(
-                    "neuro_code.bootstrap.composition.create_routed_provider", side_effect=create
-                ),
+                patch("neuro_code.bootstrap.factories.create_routed_provider", side_effect=create),
             ):
                 root_session = create_session(root, "second")
                 other_session = create_session(other, "first")
                 captured["root_session"] = root_session
-                with patch("neuro_code.tui.NeuroCodeApp", TuiFixture):
+                with patch("neuro_code.interfaces.tui.app.NeuroCodeApp", TuiFixture):
                     exit_code = main(("--cwd", str(root)))
 
             self.assertEqual(exit_code, 0)
@@ -2282,7 +2287,7 @@ api_key_env = "SECOND_KEY"
                 with (
                     patch.dict("os.environ", environment, clear=True),
                     patch(
-                        "neuro_code.bootstrap.composition.create_routed_provider",
+                        "neuro_code.bootstrap.factories.create_routed_provider",
                         return_value=CliProvider(),
                     ),
                     redirect_stdout(output),
@@ -2708,7 +2713,7 @@ api_key_env = "SECOND_KEY"
                     clear=True,
                 ),
                 patch(
-                    "neuro_code.bootstrap.composition.create_routed_provider",
+                    "neuro_code.bootstrap.factories.create_routed_provider",
                     return_value=resume_provider,
                 ),
                 redirect_stdout(output),
@@ -2796,9 +2801,7 @@ api_key_env = "SECOND_KEY"
             output = io.StringIO()
             with (
                 patch.dict("os.environ", environment, clear=True),
-                patch(
-                    "neuro_code.bootstrap.composition.create_routed_provider", side_effect=create
-                ),
+                patch("neuro_code.bootstrap.factories.create_routed_provider", side_effect=create),
                 redirect_stdout(output),
             ):
                 exit_code = main(("-p", "hello", "--provider", "second", "--cwd", str(root)))
@@ -2809,9 +2812,7 @@ api_key_env = "SECOND_KEY"
             output = io.StringIO()
             with (
                 patch.dict("os.environ", environment, clear=True),
-                patch(
-                    "neuro_code.bootstrap.composition.create_routed_provider", side_effect=create
-                ),
+                patch("neuro_code.bootstrap.factories.create_routed_provider", side_effect=create),
                 redirect_stdout(output),
             ):
                 exit_code = main(("-p", "hello", "--no-failover", "--cwd", str(root)))

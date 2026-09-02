@@ -35,6 +35,7 @@ from neuro_code.application.permissions.scopes import (
     PermissionScopeCandidate,
     PermissionScopeKind,
 )
+from neuro_code.application.ports.configuration import resolve_http_client_policy
 from neuro_code.application.ports.http import HttpClientPolicy
 from neuro_code.application.ports.model import ModelCapabilitySet
 from neuro_code.application.ports.provider_catalog import (
@@ -110,7 +111,6 @@ from neuro_code.application.workflows.subagent import (
     RunSubagentRequest,
 )
 from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
-from neuro_code.configuration.app import resolve_http_client_policy
 from neuro_code.domain.background_tasks.models import (
     BackgroundTaskSnapshot,
     BackgroundTaskStatus,
@@ -133,33 +133,15 @@ from neuro_code.domain.execution import (
 from neuro_code.domain.plans import PlanComment, PlanStepStatus, SessionPlan
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
-from neuro_code.interfaces.tui import recoverable_terminal_status
 from neuro_code.interfaces.tui.clipboard import (
     ClipboardWriter,
     ClipboardWriteResult,
     SystemClipboardWriter,
 )
-from neuro_code.interfaces.tui.tool_activity import (
-    TOOL_PEEK_LOGICAL_LINE_BUDGET,
-    ToolActivityPeekPresentation,
-    ToolCallSnapshot,
-    ToolDisclosureLevel,
-    ToolInspectorPresentation,
-    ToolInspectorScreen,
-    ToolPeekLine,
-    present_tool_activity_peek,
-    present_tool_inspector,
-)
-from neuro_code.interfaces.tui.tool_activity.renderers import (
-    bounded_inline,
-    safe_tool_text,
-)
-from neuro_code.shared.errors import ConfigurationError, ProviderError
-from neuro_code.shared.redaction import redact_sensitive_text
-from neuro_code.shared.ui_language import UiLanguage
-from neuro_code.tui_commands import SlashCompletion, slash_completions
-from neuro_code.tui_text import language_name, ui_text
-from neuro_code.tui_theme import (
+from neuro_code.interfaces.tui.commands import SlashCompletion, slash_completions
+from neuro_code.interfaces.tui.execution import recoverable_terminal_status
+from neuro_code.interfaces.tui.text import language_name, ui_text
+from neuro_code.interfaces.tui.theme import (
     ACCENT_CODE,
     ACCENT_SUCCESS,
     ACCENT_WARNING,
@@ -200,6 +182,24 @@ from neuro_code.tui_theme import (
     WAITING_STYLE,
     loading_style,
 )
+from neuro_code.interfaces.tui.tool_activity import (
+    TOOL_PEEK_LOGICAL_LINE_BUDGET,
+    ToolActivityPeekPresentation,
+    ToolCallSnapshot,
+    ToolDisclosureLevel,
+    ToolInspectorPresentation,
+    ToolInspectorScreen,
+    ToolPeekLine,
+    present_tool_activity_peek,
+    present_tool_inspector,
+)
+from neuro_code.interfaces.tui.tool_activity.renderers import (
+    bounded_inline,
+    safe_tool_text,
+)
+from neuro_code.shared.errors import ConfigurationError, ProviderError
+from neuro_code.shared.redaction import redact_sensitive_text
+from neuro_code.shared.ui_language import UiLanguage
 
 
 class TuiUserInteraction(UserInteractionPort):
@@ -1306,11 +1306,13 @@ class NetworkProxySettingsScreen(ModalScreen[ManagedProviderSettings | None]):
         language: UiLanguage,
         provider_settings: ManagedProviderSettings,
         provider_settings_store: ProviderSettingsStore,
+        socks_supported: bool = False,
     ) -> None:
         super().__init__()
         self.language = language
         self.provider_settings = provider_settings
         self.provider_settings_store = provider_settings_store
+        self.socks_supported = socks_supported
         self._active_proxy_mode = provider_settings.proxy_defaults.mode
 
     def compose(self) -> ComposeResult:
@@ -1398,6 +1400,7 @@ class NetworkProxySettingsScreen(ModalScreen[ManagedProviderSettings | None]):
                 proxy_mode=proxy_defaults.mode,
                 proxy_url_env=proxy_defaults.proxy_url_env,
                 environ=os.environ,
+                socks_supported=self.socks_supported,
             )
             settings = await self.provider_settings_store.save_proxy_defaults(proxy_defaults)
         except Exception as error:
@@ -1746,6 +1749,7 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         provider_settings_store: ProviderSettingsStore,
         provider_catalog: ProviderCatalog | None = None,
         service_catalog: ProviderServiceCatalog | None = None,
+        socks_supported: bool = False,
         first_run: bool = False,
         initial_profile: str | None = None,
         initial_error: str | None = None,
@@ -1756,6 +1760,7 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
         self.provider_settings_store = provider_settings_store
         self.provider_catalog = provider_catalog
         self.service_catalog = service_catalog or DEFAULT_PROVIDER_SERVICE_CATALOG
+        self.socks_supported = socks_supported
         self.first_run = first_run
         self.initial_profile = initial_profile
         self.initial_error = initial_error
@@ -2541,6 +2546,7 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
             proxy_mode=proxy_policy.mode,
             proxy_url_env=proxy_policy.proxy_url_env,
             environ=os.environ,
+            socks_supported=self.socks_supported,
         )
         return (
             ProviderConnectionSpec(
@@ -2774,6 +2780,7 @@ class ProviderSettingsScreen(ModalScreen[ProviderSettingsSubmission | None]):
                 proxy_mode=proxy_policy.mode,
                 proxy_url_env=proxy_policy.proxy_url_env,
                 environ=os.environ,
+                socks_supported=self.socks_supported,
             )
             await self.provider_settings_store.save_profile(profile, make_default=True)
         except Exception as error:
@@ -2892,6 +2899,7 @@ class ProviderSetupApp(App[bool]):
         provider_settings: ManagedProviderSettings,
         provider_settings_store: ProviderSettingsStore,
         provider_catalog: ProviderCatalog | None = None,
+        socks_supported: bool = False,
         language: UiLanguage = UiLanguage.ENGLISH,
         first_run: bool = True,
         initial_profile: str | None = None,
@@ -2903,6 +2911,7 @@ class ProviderSetupApp(App[bool]):
         self._provider_settings = provider_settings
         self._provider_settings_store = provider_settings_store
         self._provider_catalog = provider_catalog
+        self._socks_supported = socks_supported
         self._language = language
         self._first_run = first_run
         self._initial_profile = initial_profile
@@ -2915,6 +2924,7 @@ class ProviderSetupApp(App[bool]):
                 provider_settings=self._provider_settings,
                 provider_settings_store=self._provider_settings_store,
                 provider_catalog=self._provider_catalog,
+                socks_supported=self._socks_supported,
                 first_run=self._first_run,
                 initial_profile=self._initial_profile,
                 initial_error=self._initial_error,
@@ -3923,6 +3933,7 @@ class NeuroCodeApp(App[None]):
         background_wake_limits: BackgroundWakeLimits = _DEFAULT_BACKGROUND_WAKE_LIMITS,
         user_interaction: TuiUserInteraction | None = None,
         clipboard_writer: ClipboardWriter | None = None,
+        socks_supported: bool = False,
     ) -> None:
         if context_window_tokens is not None and context_window_tokens <= 0:
             raise ValueError("context window tokens must be positive")
@@ -3980,6 +3991,7 @@ class NeuroCodeApp(App[None]):
         self._provider_settings_store = provider_settings_store
         self._provider_catalog = provider_catalog
         self._managed_provider_settings = managed_provider_settings
+        self._socks_supported = socks_supported
         if background_task_wake_policy is not None and not isinstance(
             background_task_wake_policy, BackgroundTaskWakePolicy
         ):
@@ -6137,6 +6149,7 @@ class NeuroCodeApp(App[None]):
                     provider_settings=self._managed_provider_settings,
                     provider_settings_store=self._provider_settings_store,
                     provider_catalog=self._provider_catalog,
+                    socks_supported=self._socks_supported,
                 ),
                 self._provider_settings_selected,
             )
@@ -6149,6 +6162,7 @@ class NeuroCodeApp(App[None]):
                     language=self._language,
                     provider_settings=self._managed_provider_settings,
                     provider_settings_store=self._provider_settings_store,
+                    socks_supported=self._socks_supported,
                 ),
                 self._network_proxy_settings_selected,
             )

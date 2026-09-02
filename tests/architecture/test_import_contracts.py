@@ -15,8 +15,8 @@ _PACKAGE_ROOT = _PROJECT_ROOT / "src" / "neuro_code"
 
 _EXPECTED_IMPORTS = (
     ("neuro_code", "__version__"),
-    ("neuro_code.acp", "NeuroCodeAcpAgent"),
-    ("neuro_code.acp", "serve_acp"),
+    ("neuro_code.interfaces.acp.agent", "NeuroCodeAcpAgent"),
+    ("neuro_code.interfaces.acp.agent", "serve_acp"),
     ("neuro_code.infrastructure.persistence.sqlite_session", "SqliteSessionStore"),
     ("neuro_code.infrastructure.persistence", "RustSessionImport"),
     ("neuro_code.infrastructure.persistence", "load_rust_session"),
@@ -45,7 +45,7 @@ _EXPECTED_IMPORTS = (
     ),
     ("neuro_code.application", "ApplicationSettings"),
     (
-        "neuro_code.configuration.managed_provider_settings",
+        "neuro_code.infrastructure.providers.managed_provider_settings",
         "load_managed_provider_settings",
     ),
     ("neuro_code.application.runtime.agent", "AgentRunResult"),
@@ -559,13 +559,13 @@ _EXPECTED_IMPORTS = (
     ("neuro_code.domain.terminal.models", "TerminalSize"),
     ("neuro_code.domain.workspace", "SkillInfo"),
     ("neuro_code.domain.workspace.skills", "SkillInfo"),
-    ("neuro_code.configuration.app", "AppConfig"),
-    ("neuro_code.configuration.app", "ProviderProfile"),
-    ("neuro_code.configuration.app", "load_config"),
-    ("neuro_code.configuration.app", "override_provider"),
-    ("neuro_code.configuration.app", "override_sandbox"),
-    ("neuro_code.configuration.app", "pin_resumed_sandbox"),
-    ("neuro_code.configuration.app", "resolve_http_client_policy"),
+    ("neuro_code.application.ports.configuration", "AppConfig"),
+    ("neuro_code.application.ports.configuration", "ProviderProfile"),
+    ("neuro_code.bootstrap.configuration", "load_config"),
+    ("neuro_code.application.ports.configuration", "override_provider"),
+    ("neuro_code.application.ports.configuration", "override_sandbox"),
+    ("neuro_code.application.ports.configuration", "pin_resumed_sandbox"),
+    ("neuro_code.application.ports.configuration", "resolve_http_client_policy"),
     ("neuro_code.shared.async_utils", "run_blocking"),
     ("neuro_code.shared.errors", "ConfigurationError"),
     ("neuro_code.shared.redaction", "redact_sensitive_text"),
@@ -598,14 +598,14 @@ _EXPECTED_IMPORTS = (
     ("neuro_code.bootstrap.composition", "ApplicationComposition"),
     ("neuro_code.bootstrap.composition", "WorkspaceChangeObserverFactory"),
     ("neuro_code.bootstrap.entrypoints", "main"),
-    ("neuro_code.cli", "build_parser"),
+    ("neuro_code.interfaces.cli.app", "build_parser"),
     ("neuro_code.infrastructure.providers", "create_provider"),
     ("neuro_code.infrastructure.providers", "create_routed_provider"),
     (
         "neuro_code.infrastructure.providers.openai_responses",
         "OpenAIResponsesProvider",
     ),
-    ("neuro_code.tui", "NeuroCodeApp"),
+    ("neuro_code.interfaces.tui.app", "NeuroCodeApp"),
 )
 
 _COMPATIBILITY_IDENTITY_EXPORTS = (
@@ -677,38 +677,6 @@ _COMPATIBILITY_IDENTITY_EXPORTS = (
         "neuro_code.application.sessions.terminal_sessions",
         ("LocalInteractiveTerminalManager", "LocalInteractiveTerminalSession"),
     ),
-    (
-        "neuro_code.acp",
-        "neuro_code.interfaces.acp.content",
-        (
-            "ConvertedPrompt",
-            "MAX_ANNOTATION_AUDIENCE",
-            "MAX_ANNOTATION_AUDIENCE_BYTES",
-            "MAX_ANNOTATIONS_BYTES",
-            "MAX_AUDIO_BLOCK_BYTES",
-            "MAX_AUDIO_BLOCKS",
-            "MAX_AUDIO_TOTAL_BYTES",
-            "MAX_EMBEDDED_BINARY_RESOURCE_BYTES",
-            "MAX_EMBEDDED_BINARY_TOTAL_BYTES",
-            "MAX_EMBEDDED_TEXT_RESOURCE_BYTES",
-            "MAX_EMBEDDED_TEXT_RESOURCES",
-            "MAX_EMBEDDED_TEXT_TOTAL_BYTES",
-            "MAX_IMAGE_BLOCK_BYTES",
-            "MAX_IMAGE_BLOCKS",
-            "MAX_IMAGE_TOTAL_BYTES",
-            "MAX_PROMPT_BLOCKS",
-            "MAX_PROMPT_BYTES",
-            "MAX_RESOURCE_FIELD_BYTES",
-            "MAX_RESOURCE_LINK_BYTES",
-            "MAX_RESOURCE_LINKS",
-            "MAX_RESOURCE_NAME_BYTES",
-            "MAX_RESOURCE_URI_BYTES",
-            "MAX_TEXT_BLOCK_BYTES",
-            "MAX_TEXT_BLOCKS",
-            "PromptBlock",
-            "convert_prompt_content",
-        ),
-    ),
 )
 
 # These are the remaining runtime compatibility facades. The quarantine is
@@ -739,9 +707,16 @@ def test_key_compatibility_imports_remain_available() -> None:
 
 def test_removed_root_compatibility_modules_are_absent() -> None:
     removed = (
+        "neuro_code.acp",
         "neuro_code.bash_commands",
+        "neuro_code.cli",
         "neuro_code.config",
+        "neuro_code.configuration",
         "neuro_code.permissions",
+        "neuro_code.tui",
+        "neuro_code.tui_commands",
+        "neuro_code.tui_text",
+        "neuro_code.tui_theme",
         "neuro_code.workspace",
         "neuro_code.workspace_changes",
     )
@@ -1279,6 +1254,16 @@ assert "neuro_code.adapters.skill_discovery" not in sys.modules
     assert result.returncode == 0, result.stderr or result.stdout
 
 
+def test_workspace_relative_path_normalizer_has_one_domain_owner() -> None:
+    paths = importlib.import_module("neuro_code.domain.workspace.paths")
+    instructions = importlib.import_module("neuro_code.domain.workspace.instructions")
+    skills = importlib.import_module("neuro_code.domain.workspace.skills")
+
+    assert paths.normalize_relative_path.__module__ == paths.__name__
+    assert instructions.normalize_relative_path is paths.normalize_relative_path
+    assert skills.normalize_relative_path is paths.normalize_relative_path
+
+
 def test_provider_infrastructure_aggregate_exports_are_lazy_and_identity_preserving() -> None:
     script = """
 import importlib
@@ -1528,15 +1513,21 @@ assert "neuro_code.infrastructure.sandbox.process_tree" not in sys.modules
         assert result.returncode == 0, f"{module_name}: {result.stderr or result.stdout}"
 
 
-def test_removed_configuration_compatibility_exports_are_not_public() -> None:
-    canonical_app = importlib.import_module("neuro_code.configuration.app")
-    canonical = importlib.import_module("neuro_code.configuration.managed_provider_settings")
+def test_configuration_ownership_is_split_and_legacy_package_is_absent() -> None:
+    models = importlib.import_module("neuro_code.application.ports.configuration")
+    loader = importlib.import_module("neuro_code.bootstrap.configuration")
+    managed_settings = importlib.import_module(
+        "neuro_code.infrastructure.providers.managed_provider_settings"
+    )
 
-    assert canonical.__all__ == ["load_managed_provider_settings"]
-    assert canonical.load_managed_provider_settings.__module__ == canonical.__name__
+    assert managed_settings.__all__ == ["load_managed_provider_settings"]
+    assert managed_settings.load_managed_provider_settings.__module__ == managed_settings.__name__
     assert importlib.util.find_spec("neuro_code.config") is None
-    assert canonical_app.AppConfig.__module__ == canonical_app.__name__
-    assert canonical_app.ProviderProfile.__module__ == canonical_app.__name__
+    configuration_path = _PROJECT_ROOT / "src" / "neuro_code" / "configuration"
+    assert not any(configuration_path.glob("*.py"))
+    assert models.AppConfig.__module__ == models.__name__
+    assert models.ProviderProfile.__module__ == models.__name__
+    assert loader.load_config.__module__ == loader.__name__
 
 
 def test_importing_canonical_configuration_does_not_load_legacy_facade() -> None:
@@ -1544,8 +1535,10 @@ def test_importing_canonical_configuration_does_not_load_legacy_facade() -> None
 import importlib
 import sys
 
-importlib.import_module("neuro_code.configuration.app")
+importlib.import_module("neuro_code.application.ports.configuration")
+importlib.import_module("neuro_code.bootstrap.configuration")
 assert "neuro_code.config" not in sys.modules
+assert "neuro_code.configuration" not in sys.modules
 """
     result = subprocess.run(
         [sys.executable, "-c", script],
@@ -1696,7 +1689,7 @@ def test_application_package_retains_settings_without_composition_facade() -> No
 def test_permissions_can_initialize_before_the_tui_module() -> None:
     script = """
 import neuro_code.application.permissions
-import neuro_code.tui
+import neuro_code.interfaces.tui.app
 """
     result = subprocess.run(
         [sys.executable, "-c", script],
@@ -2495,7 +2488,7 @@ def test_importing_cli_does_not_load_bootstrap_or_concrete_infrastructure() -> N
     script = """
 import sys
 
-import neuro_code.cli as cli
+import neuro_code.interfaces.cli.app as cli
 
 assert not hasattr(cli, "main")
 
@@ -2504,10 +2497,8 @@ disallowed = [
     for name in sys.modules
     if name == "neuro_code.bootstrap"
     or name.startswith("neuro_code.bootstrap.")
-    or name == "neuro_code.adapters"
-    or name.startswith("neuro_code.adapters.")
-    or name == "neuro_code.providers"
-    or name.startswith("neuro_code.providers.")
+    or name == "neuro_code.infrastructure"
+    or name.startswith("neuro_code.infrastructure.")
 ]
 assert not disallowed, disallowed
 """
@@ -2521,7 +2512,7 @@ assert not disallowed, disallowed
 
 
 def test_sessions_execution_boundary_is_canonical_and_identity_preserving() -> None:
-    cli_path = _PACKAGE_ROOT / "cli.py"
+    cli_path = _PACKAGE_ROOT / "interfaces" / "cli" / "app.py"
     sessions_path = _PACKAGE_ROOT / "interfaces" / "cli" / "sessions.py"
     cli_tree = ast.parse(cli_path.read_text(encoding="utf-8"), filename=str(cli_path))
     sessions_tree = ast.parse(
@@ -2541,13 +2532,13 @@ def test_sessions_execution_boundary_is_canonical_and_identity_preserving() -> N
     assert not any(
         (
             isinstance(node, ast.Import)
-            and any(alias.name == "neuro_code.cli" for alias in node.names)
+            and any(alias.name == "neuro_code.interfaces.cli.app" for alias in node.names)
         )
-        or (isinstance(node, ast.ImportFrom) and node.module == "neuro_code.cli")
+        or (isinstance(node, ast.ImportFrom) and node.module == "neuro_code.interfaces.cli.app")
         for node in ast.walk(sessions_tree)
     )
 
-    cli = importlib.import_module("neuro_code.cli")
+    cli = importlib.import_module("neuro_code.interfaces.cli.app")
     sessions = importlib.import_module("neuro_code.interfaces.cli.sessions")
     assert cli._sessions_command is sessions.run_sessions_command
 
@@ -2556,17 +2547,15 @@ def test_importing_acp_does_not_load_bootstrap_or_selected_concrete_dependencies
     script = """
 import sys
 
-import neuro_code.acp
+import neuro_code.interfaces.acp.agent
 
 disallowed = [
     name
     for name in sys.modules
     if name == "neuro_code.bootstrap"
     or name.startswith("neuro_code.bootstrap.")
-    or name == "neuro_code.adapters.mcp_stdio"
-    or name == "neuro_code.adapters.sqlite_session"
-    or name == "neuro_code.providers"
-    or name.startswith("neuro_code.providers.")
+    or name == "neuro_code.infrastructure"
+    or name.startswith("neuro_code.infrastructure.")
 ]
 assert not disallowed, disallowed
 """
@@ -2579,7 +2568,7 @@ assert not disallowed, disallowed
     assert result.returncode == 0, result.stderr or result.stdout
 
 
-def test_acp_content_is_canonical_and_does_not_import_legacy_adapter() -> None:
+def test_acp_content_is_canonical_and_does_not_import_protocol_agent() -> None:
     path = _PROJECT_ROOT / "src" / "neuro_code" / "interfaces" / "acp" / "content.py"
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     imported_modules: set[str] = set()
@@ -2588,7 +2577,7 @@ def test_acp_content_is_canonical_and_does_not_import_legacy_adapter() -> None:
             imported_modules.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module is not None:
             imported_modules.add(node.module)
-    assert "neuro_code.acp" not in imported_modules
+    assert "neuro_code.interfaces.acp.agent" not in imported_modules
     assert not any(
         module == "neuro_code.bootstrap" or module.startswith("neuro_code.bootstrap.")
         for module in imported_modules
@@ -2612,7 +2601,7 @@ def test_acp_update_projection_is_canonical_and_private_aliases_are_stable() -> 
             imported_modules.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module is not None:
             imported_modules.add(node.module)
-    assert "neuro_code.acp" not in imported_modules
+    assert "neuro_code.interfaces.acp.agent" not in imported_modules
     assert not any(
         module == "neuro_code.bootstrap" or module.startswith("neuro_code.bootstrap.")
         for module in imported_modules
@@ -2622,24 +2611,15 @@ def test_acp_update_projection_is_canonical_and_private_aliases_are_stable() -> 
         for module in imported_modules
     )
 
-    legacy = importlib.import_module("neuro_code.acp")
     canonical = importlib.import_module("neuro_code.interfaces.acp.updates")
     serialization = importlib.import_module("neuro_code.interfaces.acp.serialization")
-    assert legacy._AcpEventMapper is canonical._AcpEventMapper
-    assert legacy._history_updates is canonical._history_updates
-    assert legacy._bounded_identifier is serialization._bounded_identifier
     assert canonical._AcpEventMapper.__module__ == canonical.__name__
     assert canonical._history_updates.__module__ == canonical.__name__
 
-    legacy_tree = ast.parse(
-        (_PROJECT_ROOT / "src" / "neuro_code" / "acp.py").read_text(encoding="utf-8"),
-        filename=str(_PROJECT_ROOT / "src" / "neuro_code" / "acp.py"),
-    )
-    assert not any(
-        isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name in {"_AcpEventMapper", "_history_updates"}
-        for node in ast.walk(legacy_tree)
-    )
+    agent = importlib.import_module("neuro_code.interfaces.acp.agent")
+    assert agent._AcpEventMapper is canonical._AcpEventMapper
+    assert agent._history_updates is canonical._history_updates
+    assert agent._bounded_identifier is serialization._bounded_identifier
     assert any(
         isinstance(node, ast.ClassDef) and node.name == "_AcpEventMapper" for node in ast.walk(tree)
     )
@@ -2649,8 +2629,33 @@ def test_acp_update_projection_is_canonical_and_private_aliases_are_stable() -> 
     )
 
 
+def test_importing_tui_does_not_load_bootstrap_or_concrete_infrastructure() -> None:
+    script = """
+import sys
+
+import neuro_code.interfaces.tui.app
+
+disallowed = [
+    name
+    for name in sys.modules
+    if name == "neuro_code.bootstrap"
+    or name.startswith("neuro_code.bootstrap.")
+    or name == "neuro_code.infrastructure"
+    or name.startswith("neuro_code.infrastructure.")
+]
+assert not disallowed, disallowed
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
 def test_acp_uses_only_its_narrow_application_service() -> None:
-    path = _PROJECT_ROOT / "src" / "neuro_code" / "acp.py"
+    path = _PROJECT_ROOT / "src" / "neuro_code" / "interfaces" / "acp" / "agent.py"
     source = path.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(path))
     imports = {

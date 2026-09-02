@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from neuro_code.application.ports.routing import RuntimeRole
-from neuro_code.configuration.app import load_config
+from neuro_code.bootstrap.configuration import load_config
 from neuro_code.shared.errors import ConfigurationError
 
 

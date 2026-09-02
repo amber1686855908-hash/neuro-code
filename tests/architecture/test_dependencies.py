@@ -16,7 +16,6 @@ _INFRASTRUCTURE = "infrastructure"
 _INTERFACES = "interfaces"
 _BOOTSTRAP = "bootstrap"
 _SHARED = "shared"
-_CONFIGURATION = "configuration"
 
 _ALL_LAYERS = frozenset(
     {
@@ -27,38 +26,28 @@ _ALL_LAYERS = frozenset(
         _INTERFACES,
         _BOOTSTRAP,
         _SHARED,
-        _CONFIGURATION,
     }
 )
 
 _ALLOWED_TARGET_LAYERS = {
     _DOMAIN: frozenset({_DOMAIN, _SHARED}),
-    _APPLICATION: frozenset({_APPLICATION, _PORTS, _DOMAIN, _SHARED, _CONFIGURATION}),
+    _APPLICATION: frozenset({_APPLICATION, _PORTS, _DOMAIN, _SHARED}),
     _PORTS: frozenset({_PORTS, _DOMAIN, _SHARED}),
-    _INFRASTRUCTURE: frozenset({_INFRASTRUCTURE, _PORTS, _DOMAIN, _SHARED, _CONFIGURATION}),
-    _INTERFACES: frozenset({_INTERFACES, _APPLICATION, _PORTS, _DOMAIN, _SHARED, _CONFIGURATION}),
+    _INFRASTRUCTURE: frozenset({_INFRASTRUCTURE, _PORTS, _DOMAIN, _SHARED}),
+    _INTERFACES: frozenset({_INTERFACES, _APPLICATION, _PORTS, _DOMAIN, _SHARED}),
     _BOOTSTRAP: _ALL_LAYERS,
     _SHARED: frozenset({_SHARED}),
-    # The mixed legacy config module is deliberately transitional. It may be consumed by
-    # existing layers, but it must not reach into concrete infrastructure itself.
-    _CONFIGURATION: frozenset({_CONFIGURATION, _PORTS, _DOMAIN, _SHARED}),
 }
 
 _EXACT_LAYERS = {
     "neuro_code": _SHARED,
     "neuro_code.__main__": _INTERFACES,
-    "neuro_code.acp": _INTERFACES,
     "neuro_code.application.permissions.broker": _APPLICATION,
     "neuro_code.application.permissions.service": _APPLICATION,
     "neuro_code.application.permissions.policy": _APPLICATION,
-    "neuro_code.configuration.app": _CONFIGURATION,
+    "neuro_code.bootstrap.configuration": _BOOTSTRAP,
     "neuro_code.domain.permissions.bash_commands": _DOMAIN,
     "neuro_code.domain.sessions.search": _DOMAIN,
-    "neuro_code.cli": _INTERFACES,
-    "neuro_code.tui": _INTERFACES,
-    "neuro_code.tui_commands": _INTERFACES,
-    "neuro_code.tui_text": _INTERFACES,
-    "neuro_code.tui_theme": _INTERFACES,
 }
 
 # More-specific canonical prefixes must precede their parents.
@@ -66,7 +55,6 @@ _PREFIX_LAYERS = (
     ("neuro_code.application.ports", _PORTS),
     ("neuro_code.application.permissions", _PORTS),
     ("neuro_code.application", _APPLICATION),
-    ("neuro_code.configuration", _CONFIGURATION),
     ("neuro_code.infrastructure", _INFRASTRUCTURE),
     ("neuro_code.interfaces", _INTERFACES),
     ("neuro_code.bootstrap", _BOOTSTRAP),
@@ -534,6 +522,62 @@ def _internal_imports(
     return imported
 
 
+class _RuntimeImportVisitor(ast.NodeVisitor):
+    """Collect runtime internal imports while ignoring TYPE_CHECKING-only edges."""
+
+    def __init__(self, *, source: str, path: Path, known_modules: frozenset[str]) -> None:
+        self._source = source
+        self._path = path
+        self._known_modules = known_modules
+        self.imports: set[str] = set()
+
+    def visit_If(self, node: ast.If) -> None:
+        if self._is_type_checking_test(node.test):
+            for statement in node.orelse:
+                self.visit(statement)
+            return
+        self.generic_visit(node)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        self.imports.update(
+            alias.name
+            for alias in node.names
+            if alias.name.startswith("neuro_code") and alias.name in self._known_modules
+        )
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        package = (
+            self._source if self._path.name == "__init__.py" else self._source.rpartition(".")[0]
+        )
+        base = _resolve_import_base(node, package=package)
+        if base is None or not base.startswith("neuro_code"):
+            return
+        if base in self._known_modules:
+            self.imports.add(base)
+        self.imports.update(
+            candidate
+            for alias in node.names
+            if (candidate := f"{base}.{alias.name}") in self._known_modules
+        )
+
+    @staticmethod
+    def _is_type_checking_test(node: ast.AST) -> bool:
+        return (isinstance(node, ast.Name) and node.id == "TYPE_CHECKING") or (
+            isinstance(node, ast.Attribute) and node.attr == "TYPE_CHECKING"
+        )
+
+
+def _runtime_internal_imports(
+    path: Path,
+    *,
+    source: str,
+    known_modules: frozenset[str],
+) -> set[str]:
+    visitor = _RuntimeImportVisitor(source=source, path=path, known_modules=known_modules)
+    visitor.visit(ast.parse(path.read_text(encoding="utf-8"), filename=str(path)))
+    return visitor.imports
+
+
 def _forbidden_dependencies() -> set[Dependency]:
     modules = _source_modules()
     known_modules = frozenset(modules)
@@ -549,6 +593,43 @@ def _forbidden_dependencies() -> set[Dependency]:
     return violations
 
 
+def test_runtime_production_import_graph_is_acyclic() -> None:
+    modules = _source_modules()
+    known_modules = frozenset(modules)
+    graph = {
+        source: _runtime_internal_imports(
+            path,
+            source=source,
+            known_modules=known_modules,
+        )
+        for source, path in modules.items()
+    }
+    state: dict[str, int] = {}
+    stack: list[str] = []
+    cycles: list[tuple[str, ...]] = []
+
+    def visit(source: str) -> None:
+        state[source] = 1
+        stack.append(source)
+        for target in graph[source]:
+            target_state = state.get(target, 0)
+            if target_state == 0:
+                visit(target)
+            elif target_state == 1:
+                start = stack.index(target)
+                cycles.append((*stack[start:], target))
+        stack.pop()
+        state[source] = 2
+
+    for source in sorted(graph):
+        if state.get(source, 0) == 0:
+            visit(source)
+
+    assert not cycles, "runtime import cycles detected:\n" + "\n".join(
+        f"  - {' -> '.join(cycle)}" for cycle in cycles
+    )
+
+
 def _render_dependencies(dependencies: set[Dependency]) -> str:
     return "\n".join(
         f"  - {dependency.source} -> {dependency.target}" for dependency in sorted(dependencies)
@@ -559,6 +640,104 @@ def test_all_owned_modules_have_an_architecture_layer() -> None:
     unknown = sorted(module for module in _source_modules() if _layer(module) is None)
     assert not unknown, "unclassified Neuro Code modules:\n" + "\n".join(
         f"  - {module}" for module in unknown
+    )
+
+
+def test_source_package_top_level_is_architecture_only() -> None:
+    source_files = {
+        path.name for path in _PACKAGE_ROOT.iterdir() if path.is_file() and path.suffix == ".py"
+    }
+    source_packages = {
+        path.name
+        for path in _PACKAGE_ROOT.iterdir()
+        if path.is_dir() and path.name != "__pycache__" and any(path.rglob("*.py"))
+    }
+    assert source_files == {"__init__.py", "__main__.py"}
+    assert source_packages == {
+        "application",
+        "bootstrap",
+        "domain",
+        "infrastructure",
+        "interfaces",
+        "shared",
+    }
+
+
+def test_application_configuration_port_has_no_concrete_input_loading() -> None:
+    """Configuration ports must remain explicit-input contracts, not adapters."""
+
+    path = _PACKAGE_ROOT / "application" / "ports" / "configuration.py"
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(path))
+    imported_modules = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    imported_from = {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module is not None
+    }
+    assert imported_modules.isdisjoint({"os", "tomllib"})
+    assert "importlib.util" not in imported_from
+
+    concrete_calls = {
+        ast.unparse(node.func)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and (
+            ast.unparse(node.func) in {"find_spec", "importlib.util.find_spec"}
+            or (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"cwd", "home", "expanduser", "resolve"}
+            )
+        )
+    }
+    assert not concrete_calls, "configuration port performs concrete input loading: " + ", ".join(
+        sorted(concrete_calls)
+    )
+
+
+def test_forbidden_layer_directions_are_explicitly_guarded() -> None:
+    forbidden_prefixes = {
+        "neuro_code.interfaces": (
+            "neuro_code.infrastructure",
+            "neuro_code.bootstrap",
+        ),
+        "neuro_code.application": (
+            "neuro_code.infrastructure",
+            "neuro_code.interfaces",
+            "neuro_code.bootstrap",
+        ),
+        "neuro_code.domain": (
+            "neuro_code.application",
+            "neuro_code.infrastructure",
+            "neuro_code.interfaces",
+            "neuro_code.bootstrap",
+        ),
+        "neuro_code.infrastructure": (
+            "neuro_code.interfaces",
+            "neuro_code.bootstrap",
+        ),
+    }
+    modules = _source_modules()
+    known_modules = frozenset(modules)
+    violations: set[Dependency] = set()
+    for source, path in modules.items():
+        for source_prefix, target_prefixes in forbidden_prefixes.items():
+            if source != source_prefix and not source.startswith(f"{source_prefix}."):
+                continue
+            imports = _internal_imports(path, source=source, known_modules=known_modules)
+            for target in imports:
+                if any(
+                    target == target_prefix or target.startswith(f"{target_prefix}.")
+                    for target_prefix in target_prefixes
+                ):
+                    violations.add(Dependency(source, target))
+    assert not violations, "forbidden layer directions detected:\n" + _render_dependencies(
+        violations
     )
 
 
@@ -730,10 +909,10 @@ def test_current_production_tree_has_no_dynamic_import_violations() -> None:
             known_modules=known_modules,
         )
         issues.extend(scan.issues)
-        if source == "neuro_code.configuration.app":
+        if source == "neuro_code.bootstrap.configuration":
             config_scans[source] = scan
 
-    assert set(config_scans) == {"neuro_code.configuration.app"}
+    assert set(config_scans) == {"neuro_code.bootstrap.configuration"}
     for config_scan in config_scans.values():
         assert not config_scan.targets
         assert not config_scan.issues
@@ -745,9 +924,9 @@ def test_current_production_tree_has_no_dynamic_import_violations() -> None:
 def test_managed_provider_settings_reader_is_canonical_and_consumed_privately() -> None:
     modules = _source_modules()
     known_modules = frozenset(modules)
-    canonical = "neuro_code.configuration.managed_provider_settings"
+    canonical = "neuro_code.infrastructure.providers.managed_provider_settings"
     implementation = "neuro_code.infrastructure.providers.provider_settings"
-    config = "neuro_code.configuration.app"
+    config = "neuro_code.bootstrap.configuration"
     implementation_tree = ast.parse(modules[implementation].read_text(encoding="utf-8"))
     config_tree = ast.parse(modules[config].read_text(encoding="utf-8"))
     implementation_imports = _internal_imports(
@@ -843,6 +1022,7 @@ def test_canonical_ports_are_the_only_port_modules() -> None:
         "neuro_code.application.ports.client_filesystem",
         "neuro_code.application.ports.client_terminal",
         "neuro_code.application.ports.checkpoints",
+        "neuro_code.application.ports.configuration",
         "neuro_code.application.ports.http",
         "neuro_code.application.ports.instructions",
         "neuro_code.application.ports.leader",
@@ -856,6 +1036,7 @@ def test_canonical_ports_are_the_only_port_modules() -> None:
         "neuro_code.application.ports.task_dag_recovery",
         "neuro_code.application.ports.task_dag_result_relay",
         "neuro_code.application.ports.provider_catalog",
+        "neuro_code.application.ports.provider_dialects",
         "neuro_code.application.ports.provider_services",
         "neuro_code.application.ports.provider_settings",
         "neuro_code.application.ports.result_adoption",
@@ -944,6 +1125,7 @@ def test_canonical_provider_modules_are_the_only_provider_implementations() -> N
     canonical_modules = {
         "neuro_code.infrastructure.providers",
         "neuro_code.infrastructure.providers.anthropic",
+        "neuro_code.infrastructure.providers.binding",
         "neuro_code.infrastructure.providers.catalog_cache",
         "neuro_code.infrastructure.providers.failover",
         "neuro_code.infrastructure.providers.failure_conformance",
@@ -955,6 +1137,7 @@ def test_canonical_provider_modules_are_the_only_provider_implementations() -> N
         "neuro_code.infrastructure.providers.openai_responses",
         "neuro_code.infrastructure.providers.provider_catalog",
         "neuro_code.infrastructure.providers.provider_settings",
+        "neuro_code.infrastructure.providers.managed_provider_settings",
         "neuro_code.infrastructure.providers.hosted_web_search",
         "neuro_code.infrastructure.providers.resilience",
     }
@@ -1373,7 +1556,6 @@ def test_canonical_runtime_consumers_use_explicit_submodules() -> None:
             "neuro_code.application.providers.contracts",
         },
         "neuro_code.bootstrap.composition": {
-            "neuro_code.infrastructure.background_tasks",
             "neuro_code.application.runtime.agent",
             "neuro_code.application.providers.service",
             "neuro_code.application.sessions.summary",
@@ -1389,7 +1571,7 @@ def test_canonical_runtime_consumers_use_explicit_submodules() -> None:
             "neuro_code.application.workflows.session_task_execution",
             "neuro_code.application.workflows.subagent",
         },
-        "neuro_code.bootstrap.entrypoints": {
+        "neuro_code.bootstrap.cli": {
             "neuro_code.application.permissions.broker",
             "neuro_code.application.providers.contracts",
             "neuro_code.application.sessions.binding",
@@ -1398,12 +1580,12 @@ def test_canonical_runtime_consumers_use_explicit_submodules() -> None:
             "neuro_code.application.sessions.service",
             "neuro_code.application.tools.service",
         },
-        "neuro_code.acp": {
+        "neuro_code.interfaces.acp.agent": {
             "neuro_code.application.permissions.broker",
             "neuro_code.application.sessions.binding",
             "neuro_code.application.tools.service",
         },
-        "neuro_code.tui": {
+        "neuro_code.interfaces.tui.app": {
             "neuro_code.application.runtime.agent",
             "neuro_code.application.permissions.broker",
             "neuro_code.application.providers.contracts",
@@ -1416,7 +1598,7 @@ def test_canonical_runtime_consumers_use_explicit_submodules() -> None:
             "neuro_code.application.workflows.plan_scheduling",
             "neuro_code.application.workflows.session_task_execution",
         },
-        "neuro_code.cli": {
+        "neuro_code.interfaces.cli.app": {
             "neuro_code.application.sessions.lifecycle",
             "neuro_code.application.sessions.service",
             "neuro_code.application.tools.service",
@@ -1436,7 +1618,7 @@ def test_canonical_runtime_consumers_use_explicit_submodules() -> None:
             "neuro_code.application.sessions.recovery",
             "neuro_code.application.settings",
             "neuro_code.application.tools.service",
-            "neuro_code.configuration.app",
+            "neuro_code.application.ports.configuration",
             "neuro_code.interfaces.cli.serialization",
             "neuro_code.shared.errors",
         },

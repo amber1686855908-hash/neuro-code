@@ -4,8 +4,8 @@ import os
 
 import pytest
 
+from neuro_code.application.ports.configuration import ProviderProfile
 from neuro_code.application.ports.model import ModelProvider
-from neuro_code.configuration.app import ProviderProfile
 from neuro_code.infrastructure.providers import create_provider
 
 

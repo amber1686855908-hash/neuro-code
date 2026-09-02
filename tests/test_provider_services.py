@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from neuro_code.application.ports.configuration import ProviderProfile
 from neuro_code.application.ports.model import (
     CapabilityStatus,
     ModelCapability,
@@ -15,7 +16,6 @@ from neuro_code.application.ports.provider_services import (
     ProviderServiceCatalog,
     ProviderServiceDescriptor,
 )
-from neuro_code.configuration.app import ProviderProfile
 from neuro_code.infrastructure.providers.anthropic import AnthropicProvider
 from neuro_code.infrastructure.providers.gemini_interactions import (
     GeminiInteractionsProvider,

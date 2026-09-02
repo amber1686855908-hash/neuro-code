@@ -32,13 +32,13 @@ from neuro_code.application.workflows.writable_subagent import (
     WritableSubagentRuntime,
     WritableSubagentRuntimeFactory,
 )
-from neuro_code.bootstrap.composition import ApplicationComposition
 from neuro_code.domain.parent_context_relay import ParentContextRelay
 from neuro_code.domain.worktree import WorktreeWorkspaceBinding
 from neuro_code.shared.errors import ConfigurationError
 
 if TYPE_CHECKING:
-    from neuro_code.configuration.app import AppConfig
+    from neuro_code.application.ports.configuration import AppConfig
+    from neuro_code.bootstrap.composition import ApplicationComposition
 
 
 READ_ONLY_SUBAGENT_TOOL_NAMES = (

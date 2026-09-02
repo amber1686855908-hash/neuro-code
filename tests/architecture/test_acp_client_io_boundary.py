@@ -6,7 +6,7 @@ from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _CLIENT_IO_PATH = _PROJECT_ROOT / "src" / "neuro_code" / "interfaces" / "acp" / "client_io.py"
-_ACP_PATH = _PROJECT_ROOT / "src" / "neuro_code" / "acp.py"
+_ACP_PATH = _PROJECT_ROOT / "src" / "neuro_code" / "interfaces" / "acp" / "agent.py"
 
 _MOVED_SYMBOLS = (
     "_AcpClientTerminalTask",
@@ -55,15 +55,15 @@ def _defined_names(tree: ast.AST) -> set[str]:
     return names
 
 
-def test_client_io_is_canonical_and_legacy_private_aliases_are_identity_preserving() -> None:
-    legacy = importlib.import_module("neuro_code.acp")
+def test_client_io_is_canonical_and_agent_aliases_are_identity_preserving() -> None:
+    agent = importlib.import_module("neuro_code.interfaces.acp.agent")
     canonical = importlib.import_module("neuro_code.interfaces.acp.client_io")
 
     for name in _MOVED_SYMBOLS:
-        assert getattr(legacy, name) is getattr(canonical, name)
+        assert getattr(agent, name) is getattr(canonical, name)
 
-    assert legacy.MAX_CLIENT_TERMINAL_OUTPUT_BYTES is canonical.MAX_CLIENT_TERMINAL_OUTPUT_BYTES
-    assert legacy.ClientTerminalResult is canonical.ClientTerminalResult
+    assert agent.MAX_CLIENT_TERMINAL_OUTPUT_BYTES is canonical.MAX_CLIENT_TERMINAL_OUTPUT_BYTES
+    assert agent.ClientTerminalResult is canonical.ClientTerminalResult
 
     for name in _MOVED_SYMBOLS[:3] + _MOVED_SYMBOLS[3:11]:
         assert getattr(canonical, name).__module__ == canonical.__name__
@@ -91,9 +91,9 @@ def test_client_io_has_no_legacy_or_concrete_dependency() -> None:
     assert set(_MOVED_SYMBOLS).issubset(defined)
 
 
-def test_legacy_acp_retains_only_client_io_import_aliases_and_capability_ownership() -> None:
-    legacy_tree = ast.parse(_ACP_PATH.read_text(encoding="utf-8"), filename=str(_ACP_PATH))
-    defined = _defined_names(legacy_tree)
+def test_agent_retains_only_client_io_import_aliases_and_capability_ownership() -> None:
+    agent_tree = ast.parse(_ACP_PATH.read_text(encoding="utf-8"), filename=str(_ACP_PATH))
+    defined = _defined_names(agent_tree)
 
     assert not defined.intersection(_MOVED_SYMBOLS)
     assert "_client_file_system" in defined

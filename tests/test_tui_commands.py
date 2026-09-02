@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from neuro_code.tui_commands import slash_completions
+from neuro_code.interfaces.tui.commands import slash_completions
 
 
 class SlashCompletionTests(unittest.TestCase):

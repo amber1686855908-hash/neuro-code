@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -62,7 +63,7 @@ from neuro_code.interfaces.cli.sessions import run_sessions_command as _sessions
 from neuro_code.shared.errors import ConfigurationError, NeuroCodeError
 
 if TYPE_CHECKING:
-    from neuro_code.configuration.app import AppConfig
+    from neuro_code.application.ports.configuration import AppConfig
 
 
 _EXECUTION_CONTROL_CHOICES = {
@@ -499,7 +500,7 @@ def _rules(args: argparse.Namespace) -> tuple[PermissionRule, ...]:
 
 
 def _plain_config(config: AppConfig) -> str:
-    payload = config.redacted_dict()
+    payload = config.redacted_dict(os.environ)
     provider = payload["provider"]
     loaded_files = payload["loaded_files"]
     assert isinstance(loaded_files, list)
@@ -820,7 +821,7 @@ def _execution_control_mode(value: object) -> ExecutionControlMode:
 def _provider_rows(config: AppConfig) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for name, profile in config.providers.items():
-        row = profile.redacted_dict()
+        row = profile.redacted_dict(os.environ)
         row["default"] = name == config.default_provider
         row["selected"] = name == config.selected_provider
         row["fallback"] = name in config.fallback_providers
@@ -856,7 +857,7 @@ def _providers_command(args: argparse.Namespace, services: CliServices) -> int:
         profile = config.providers[profile_name]
     except KeyError as error:
         raise ConfigurationError(f"provider profile does not exist: {profile_name}") from error
-    payload = profile.redacted_dict()
+    payload = profile.redacted_dict(os.environ)
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
@@ -948,7 +949,7 @@ def run(argv: Sequence[str] | None, *, services: CliServices) -> int:
         if args.command == "inspect":
             config = services.load_config(args.cwd)
             if args.json:
-                inspect_payload: dict[str, object] = config.redacted_dict()
+                inspect_payload: dict[str, object] = config.redacted_dict(os.environ)
                 result = services.discover_instructions(config.cwd)
                 inspect_payload["instructions"] = {
                     "files": [

@@ -13,8 +13,8 @@ from neuro_code.domain.workspace.instructions import (
     InstructionRejection,
     InstructionRejectionReason,
     compute_instruction_fingerprint,
-    normalize_relative_path,
 )
+from neuro_code.domain.workspace.paths import normalize_relative_path
 from neuro_code.domain.workspace.skills import (
     MAX_DESCRIPTION_LEN,
     MAX_FRONTMATTER_BYTES,
@@ -46,9 +46,8 @@ from neuro_code.domain.workspace.skills import (
     normalize_skill_name,
     parse_frontmatter,
 )
-from neuro_code.domain.workspace.skills import (
-    normalize_relative_path as normalize_skill_relative_path,
-)
+
+normalize_skill_relative_path = normalize_relative_path
 
 __all__ = [
     "INSTRUCTION_FILENAME",

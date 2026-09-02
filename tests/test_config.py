@@ -7,17 +7,17 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from neuro_code.application.ports.provider_settings import (
-    ManagedProviderProfile,
-    ManagedProxyPolicy,
-)
-from neuro_code.configuration.app import (
+from neuro_code.application.ports.configuration import (
     ProviderProfile,
-    load_config,
     override_provider,
     override_sandbox,
     pin_resumed_sandbox,
 )
+from neuro_code.application.ports.provider_settings import (
+    ManagedProviderProfile,
+    ManagedProxyPolicy,
+)
+from neuro_code.bootstrap.configuration import load_config
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.infrastructure.providers import create_provider
 from neuro_code.infrastructure.providers.provider_settings import JsonProviderSettingsStore
@@ -48,7 +48,7 @@ class ConfigTests(unittest.TestCase):
             )
 
             with patch(
-                "neuro_code.configuration.app.Path.home",
+                "neuro_code.bootstrap.configuration.Path.home",
                 side_effect=RuntimeError("home unavailable"),
             ):
                 config = load_config(root, environ={"NEURO_CODE_HOME": str(state_dir)})
@@ -61,7 +61,7 @@ class ConfigTests(unittest.TestCase):
         with (
             tempfile.TemporaryDirectory() as directory,
             patch(
-                "neuro_code.configuration.app.Path.home",
+                "neuro_code.bootstrap.configuration.Path.home",
                 side_effect=RuntimeError("home unavailable"),
             ),
             self.assertRaisesRegex(ConfigurationError, "set NEURO_CODE_HOME"),
@@ -346,10 +346,7 @@ api_key_env = "FIXTURE_KEY"
             with self.subTest(value=value), self.assertRaises(ConfigurationError):
                 profile.http_client_policy({"HTTPS_PROXY": value})
 
-        with (
-            patch("neuro_code.configuration.app.find_spec", return_value=None),
-            self.assertRaisesRegex(ConfigurationError, "optional SOCKS support"),
-        ):
+        with self.assertRaisesRegex(ConfigurationError, "optional SOCKS support"):
             profile.http_client_policy({"ALL_PROXY": "socks5://127.0.0.1:7890"})
 
         inherited = profile.http_client_policy({"HTTPS_PROXY": "http://127.0.0.1:8080"})

@@ -7,12 +7,12 @@ from unittest import mock
 
 import httpx
 
+from neuro_code.application.ports.configuration import AppConfig, ProviderProfile
 from neuro_code.application.ports.model import (
     CapabilityStatus,
     ModelCapability,
     ModelToolPolicy,
 )
-from neuro_code.configuration.app import AppConfig, ProviderProfile
 from neuro_code.domain.conversation.context import UPSTREAM_IMPORT_PROVIDER, ModelContext
 from neuro_code.domain.conversation.events import (
     ModelCompleted,
