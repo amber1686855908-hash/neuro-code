@@ -1179,17 +1179,58 @@ def test_canonical_persistence_modules_are_the_only_persistence_implementations(
     modules = _source_modules()
     canonical_modules = {
         "neuro_code.infrastructure.persistence",
+        "neuro_code.infrastructure.persistence.sqlite_session_agent_swarm",
         "neuro_code.infrastructure.persistence.output_artifacts",
         "neuro_code.infrastructure.persistence.checkpoint_artifacts",
         "neuro_code.infrastructure.persistence.managed_worktrees",
         "neuro_code.infrastructure.persistence.workspace_checkpoints",
         "neuro_code.infrastructure.persistence.rust_session",
         "neuro_code.infrastructure.persistence.sqlite_session",
+        "neuro_code.infrastructure.persistence.sqlite_session_connection",
+        "neuro_code.infrastructure.persistence.sqlite_session_constants",
+        "neuro_code.infrastructure.persistence.sqlite_session_core",
+        "neuro_code.infrastructure.persistence.sqlite_session_dag",
+        "neuro_code.infrastructure.persistence.sqlite_session_dag_replan",
+        "neuro_code.infrastructure.persistence.sqlite_session_leader",
+        "neuro_code.infrastructure.persistence.sqlite_session_model_planning",
+        "neuro_code.infrastructure.persistence.sqlite_session_plans",
+        "neuro_code.infrastructure.persistence.sqlite_session_result_adoption",
+        "neuro_code.infrastructure.persistence.sqlite_session_schema",
+        "neuro_code.infrastructure.persistence.sqlite_session_subagents",
+        "neuro_code.infrastructure.persistence.sqlite_session_turns",
+        "neuro_code.infrastructure.persistence.sqlite_session_ultracode",
         "neuro_code.infrastructure.persistence.ui_preferences",
     }
     assert {
         module for module in modules if module.startswith("neuro_code.infrastructure.persistence")
     } == canonical_modules
+
+
+def test_sqlite_session_facade_only_composes_disjoint_canonical_owners() -> None:
+    modules = _source_modules()
+    facade_path = modules["neuro_code.infrastructure.persistence.sqlite_session"]
+    tree = ast.parse(facade_path.read_text(encoding="utf-8"), filename=str(facade_path))
+    classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+    assert [node.name for node in classes] == ["SqliteSessionStore"]
+    store = classes[0]
+    assert not any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) for node in store.body)
+
+    mixin_modules = {
+        module: path
+        for module, path in modules.items()
+        if module.startswith("neuro_code.infrastructure.persistence.sqlite_session_")
+    }
+    method_owners: dict[str, list[str]] = {}
+    for module, path in mixin_modules.items():
+        module_tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in module_tree.body:
+            if not isinstance(node, ast.ClassDef) or not node.name.endswith("Mixin"):
+                continue
+            for member in node.body:
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    method_owners.setdefault(member.name, []).append(module)
+
+    assert not {name: owners for name, owners in method_owners.items() if len(owners) > 1}
 
 
 def test_canonical_background_manager_is_the_only_manager_implementation() -> None:

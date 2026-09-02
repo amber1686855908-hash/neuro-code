@@ -49,11 +49,8 @@ from neuro_code.domain.writable_subagent import (
     WritableSubagentWorkspaceLease,
     WritableSubagentWorkspaceState,
 )
-from neuro_code.infrastructure.persistence.sqlite_session import (
-    _TASK_DAG_SELECT,
-    SCHEMA_VERSION,
-    SqliteSessionStore,
-)
+from neuro_code.infrastructure.persistence.sqlite_session import SCHEMA_VERSION, SqliteSessionStore
+from neuro_code.infrastructure.persistence.sqlite_session_dag import _TASK_DAG_SELECT
 from neuro_code.shared.errors import ConfigurationError
 
 
