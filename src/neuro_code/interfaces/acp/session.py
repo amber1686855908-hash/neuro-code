@@ -2,13 +2,14 @@
 
 一个 ACP 会话运行时的规范所有权边界.
 
-The connection-level ACP agent owns protocol routing, capabilities, and the
-external session registry.  This module owns only the mutable state and
-ephemeral resources that belong to one published ACP session.  It deliberately
-does not know about the agent, bootstrap, providers, stores, or transport.
-ACP 连接级 Agent 负责协议路由、能力和外部会话注册表;本模块只负责一个已发布
-ACP 会话的可变状态和临时资源,且有意不感知 Agent、bootstrap、provider、store 或
-transport.
+The ACP facade and its focused connection controllers own protocol routing,
+capabilities, and the external session registry.  This module owns only the
+mutable state and ephemeral resources that belong to one published ACP
+session.  It deliberately does not know about the agent, bootstrap, providers,
+stores, or transport.
+ACP facade 及其专用连接控制器负责协议路由、能力和外部会话注册表;本模块只负责
+一个已发布 ACP 会话的可变状态和临时资源,且有意不感知 Agent、bootstrap、provider、
+store 或 transport.
 """
 
 from __future__ import annotations

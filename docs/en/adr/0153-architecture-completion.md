@@ -38,9 +38,13 @@ The inbound adapters have these canonical owners:
   provider/session selection, plans/tasks, background, transcript, runtime, and
   tool-activity orchestration. The existing `commands`, `text`, `theme`, and
   `tool_activity` modules remain their canonical owners.
-- `interfaces.acp.agent` owns the ACP protocol agent and delegates bounded
-  content, update projection, client I/O, MCP conversion, transport, and
-  session-runtime responsibilities to its ACP submodules.
+- `interfaces.acp.agent` owns the public ACP protocol facade and high-level
+  wiring. `interfaces.acp.negotiation`, `session_registry`,
+  `session_lifecycle`, `mcp`, `extensions`, and `prompt` own connection
+  negotiation, published session state, session lifecycle, live MCP handling,
+  private extension dispatch, and prompt/permission execution respectively;
+  the existing `content`, `updates`, `client_io`, `mcp_config`, `transport`,
+  and `session` modules remain the canonical owners of their boundaries.
 
 The former root implementations `neuro_code.cli`, `neuro_code.tui`,
 `neuro_code.acp`, `neuro_code.tui_commands`, `neuro_code.tui_text`, and

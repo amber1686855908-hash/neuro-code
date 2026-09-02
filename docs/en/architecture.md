@@ -77,10 +77,12 @@ selection, plans/tasks, background wake, transcript, runtime chrome, and tool
 activity event/Inspector/presentation handling. The existing `commands`, `text`,
 `theme`, and `tool_activity` modules remain their respective canonical owners.
 `TuiUserInteraction` remains the queue-backed application port adapter.
-`neuro_code.interfaces.acp.agent` owns the ACP protocol agent and
-delegates content, event projection, client I/O, MCP declaration conversion,
-transport, and per-session runtime state to the explicit ACP submodules. The
-root-level `neuro_code.cli`, `neuro_code.tui`, `neuro_code.acp`,
+`neuro_code.interfaces.acp.agent` owns the public ACP protocol facade and
+high-level wiring. Connection negotiation, session registry state, session
+lifecycle, live MCP handling, private extension dispatch, prompt/permission
+execution, content, event projection, client I/O, MCP declaration conversion,
+transport, and per-session runtime state each have explicit canonical ACP
+submodules. The root-level `neuro_code.cli`, `neuro_code.tui`, `neuro_code.acp`,
 `neuro_code.tui_commands`, `neuro_code.tui_text`, and `neuro_code.tui_theme`
 implementation modules have been removed; there is no compatibility wrapper
 that remains authoritative.
@@ -692,9 +694,16 @@ and kills. Every enabled sandbox omits the tools and direct use fails closed, so
 a client terminal cannot weaken an explicit local sandbox. Interactive
 input/resize, cursor streaming, and PTY framing/backpressure remain unsupported.
 The adapter implementation and its foreground/background lifecycle state are
-canonically owned by `neuro_code.interfaces.acp.client_io`; capability
-negotiation and session ownership remain in the top-level ACP adapter. See
-[ADR 0147](adr/0147-acp-client-io-adapter-boundary.md).
+canonically owned by `neuro_code.interfaces.acp.client_io`. Connection
+negotiation is owned by `neuro_code.interfaces.acp.negotiation`, published
+session identity/registry state by `neuro_code.interfaces.acp.session_registry`,
+and session construction/close/shutdown coordination by
+`neuro_code.interfaces.acp.session_lifecycle`. Live MCP callbacks and
+projections belong to `neuro_code.interfaces.acp.mcp`, private method
+dispatch to `neuro_code.interfaces.acp.extensions`, and prompt/permission
+execution to `neuro_code.interfaces.acp.prompt`. The top-level
+`neuro_code.interfaces.acp.agent` module is only the public Agent facade and
+high-level wiring. See [ADR 0147](adr/0147-acp-client-io-adapter-boundary.md).
 
 Non-empty `mcpServers` accept ACP stdio, Streamable HTTP (`http`), and legacy
 SSE (`sse`) shapes; ACP-transport MCP server declarations are rejected
@@ -718,8 +727,9 @@ set from the ACP service; it does not scan environment state or obtain
 authority from bootstrap, infrastructure, providers, or stores. Configuration
 conversion performs no I/O. `MAX_MCP_SERVERS` remains an application contract
 because the MCP runtime adapters also consume that shared server-count bound;
-the URL and serialized-configuration bounds are reused by live ACP projection
-without moving live callback or MCP lifecycle code. See
+the URL and serialized-configuration bounds are reused by the live ACP
+projection. Live callbacks and MCP lifecycle remain separate owners in
+`neuro_code.interfaces.acp.mcp`; this keeps configuration conversion stateless. See
 [ADR 0148](adr/0148-acp-mcp-configuration-boundary.md).
 
 The official `mcp>=1.28.1,<2` SDK owns MCP schemas, `ClientSession`, version
@@ -801,11 +811,13 @@ validated before its first update and is bounded by stored-item, update-count,
 per-field, and aggregate serialized-byte limits.
 
 The history projection and the live `AgentEvent` allowlist are implemented in
-`neuro_code.interfaces.acp.updates`. The top-level ACP adapter retains the
-session-bound wiring, lifecycle, client-capability, and MCP responsibilities
-that invoke these projections; canonical transport owns the SDK connection
-and wire framing. The extraction is structural and preserves the existing ACP
-wire behavior; it does not add event kinds or move permission authority.
+`neuro_code.interfaces.acp.updates`. The top-level ACP Agent facade retains
+only public protocol methods and high-level wiring; session-bound lifecycle,
+client-capability negotiation, MCP handling, private extension dispatch, and
+prompt/permission execution are owned by their focused ACP controllers.
+Canonical transport owns the SDK connection and wire framing. The extraction
+is structural and preserves the existing ACP wire behavior; it does not add
+event kinds or move permission authority.
 
 The event projection is an explicit allowlist:
 

@@ -15,7 +15,6 @@ import json
 import math
 from dataclasses import dataclass
 
-from acp.exceptions import RequestError
 from acp.schema import (
     Annotations,
     AudioContentBlock,
@@ -28,6 +27,7 @@ from acp.schema import (
 )
 
 from neuro_code.domain.conversation.messages import ContentPart, ContentPartKind
+from neuro_code.interfaces.acp.errors import invalid_params as _invalid_params
 from neuro_code.interfaces.acp.serialization import (
     MAX_RESOURCE_FIELD_BYTES,
     sanitize_controls,
@@ -87,13 +87,6 @@ class ConvertedPrompt:
 
     content: str
     content_parts: tuple[ContentPart, ...]
-
-
-def _invalid_params(reason: str, details: str | None = None) -> RequestError:
-    data = {"reason": reason}
-    if details is not None:
-        data["details"] = details
-    return RequestError.invalid_params(data)
 
 
 def _bounded_input_text(value: str, *, limit: int, field_name: str) -> str:

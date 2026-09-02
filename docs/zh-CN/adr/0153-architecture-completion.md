@@ -32,8 +32,11 @@ package 根目录不再放置 production implementation module。源码根目录
   commands、preferences、provider/session selection、plans/tasks、background、transcript、runtime
   以及 tool activity orchestration。既有 `commands`、`text`、`theme` 和 `tool_activity` 模块继续是
   各自的 canonical owner。
-- `interfaces.acp.agent` 负责 ACP protocol Agent，并把有界的 content、update projection、
-  client I/O、MCP conversion、transport 和 session-runtime 职责委托给 ACP 子模块。
+- `interfaces.acp.agent` 负责 public ACP protocol facade 与 high-level wiring。
+  `interfaces.acp.negotiation`、`session_registry`、`session_lifecycle`、`mcp`、`extensions` 和
+  `prompt` 分别负责连接协商、已发布 session state、session lifecycle、实时 MCP、私有 extension
+  dispatch 以及 prompt/permission execution；既有 `content`、`updates`、`client_io`、`mcp_config`、
+  `transport` 和 `session` 模块继续拥有各自 boundary 的 canonical implementation。
 
 原根级 implementation `neuro_code.cli`、`neuro_code.tui`、`neuro_code.acp`、
 `neuro_code.tui_commands`、`neuro_code.tui_text` 和 `neuro_code.tui_theme` 已删除。

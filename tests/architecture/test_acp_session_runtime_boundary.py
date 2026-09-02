@@ -8,6 +8,8 @@ from pathlib import Path
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _ACP_PATH = _PROJECT_ROOT / "src" / "neuro_code" / "interfaces" / "acp" / "agent.py"
 _SESSION_PATH = _PROJECT_ROOT / "src" / "neuro_code" / "interfaces" / "acp" / "session.py"
+_REGISTRY_PATH = _PROJECT_ROOT / "src" / "neuro_code" / "interfaces" / "acp" / "session_registry.py"
+_NEGOTIATION_PATH = _PROJECT_ROOT / "src" / "neuro_code" / "interfaces" / "acp" / "negotiation.py"
 
 _FORBIDDEN_SESSION_IMPORTS = (
     "neuro_code.bootstrap",
@@ -97,8 +99,10 @@ def test_session_runtime_has_no_reverse_or_concrete_dependency() -> None:
     assert not any(name.endswith("Mixin") for name in _defined_classes(tree))
 
 
-def test_agent_keeps_registry_and_connection_capability_ownership() -> None:
+def test_registry_and_negotiation_owners_are_separate_from_agent_facade() -> None:
     source = _ACP_PATH.read_text(encoding="utf-8")
+    registry_source = _REGISTRY_PATH.read_text(encoding="utf-8")
+    negotiation_source = _NEGOTIATION_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(_ACP_PATH))
     agent = next(
         node
@@ -106,10 +110,17 @@ def test_agent_keeps_registry_and_connection_capability_ownership() -> None:
         if isinstance(node, ast.ClassDef) and node.name == "NeuroCodeAcpAgent"
     )
     assert agent.name == "NeuroCodeAcpAgent"
-    assert "_client_capabilities" in source
-    assert "_client_info" in source
-    assert "_sessions: dict[str, AcpSessionRuntime]" in source
-    assert "_registry_lock" in source
+    assert "class AcpSessionRegistry" in registry_source
+    assert "self._sessions: dict[str, AcpSessionRuntime]" in registry_source
+    assert "self._pending_session_tasks" in registry_source
+    assert "self._registry_lock" in registry_source
+    assert "self._client_capabilities" in negotiation_source
+    assert "self._client_info" in negotiation_source
+    assert "self._initialize_lock" in negotiation_source
+    assert "self._registry" in source
+    assert "self._connection" in source
+    assert "self._sessions: dict[str, AcpSessionRuntime]" not in source
+    assert "self._registry_lock" not in source
     assert _session_attribute_writes(tree) == set()
 
 

@@ -16,7 +16,6 @@ import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Literal
 
-from acp.exceptions import RequestError
 from acp.interfaces import Client
 from acp.schema import (
     AgentMessageChunk,
@@ -35,6 +34,7 @@ from acp.schema import (
 from neuro_code.application.permissions.contracts import PermissionRequest
 from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
 from neuro_code.domain.conversation.messages import Message, Role, SessionItem, ToolCall
+from neuro_code.interfaces.acp.errors import invalid_params as _invalid_params
 from neuro_code.interfaces.acp.serialization import (
     MAX_RESOURCE_FIELD_BYTES,
     AcpStopReason,
@@ -65,13 +65,6 @@ _TOOL_KINDS: dict[str, Literal["read", "edit", "search", "execute", "other"]] = 
 }
 
 HistoryUpdate = UserMessageChunk | AgentMessageChunk | ToolCallStart | ToolCallProgress
-
-
-def _invalid_params(reason: str, details: str | None = None) -> RequestError:
-    data = {"reason": reason}
-    if details is not None:
-        data["details"] = details
-    return RequestError.invalid_params(data)
 
 
 def _safe_text(
