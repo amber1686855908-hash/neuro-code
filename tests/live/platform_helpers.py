@@ -5,8 +5,8 @@ from collections.abc import Mapping, Sequence
 
 import pytest
 
+from neuro_code.application.ports.configuration import ProviderProfile
 from neuro_code.application.ports.model import ModelProvider
-from neuro_code.configuration.app import ProviderProfile
 from neuro_code.domain.conversation.context import ModelContext
 from neuro_code.domain.conversation.events import (
     ModelCompleted,

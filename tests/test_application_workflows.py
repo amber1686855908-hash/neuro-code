@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
+from neuro_code.application.ports.configuration import AppConfig, ProviderProfile
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.runtime.agent import AgentRunResult, EventSink
 from neuro_code.application.sessions.binding import ConversationBinding
@@ -35,7 +36,6 @@ from neuro_code.bootstrap.subagent import (
     READ_ONLY_SUBAGENT_TOOL_NAMES,
     CompositionReadOnlySubagentRuntimeFactory,
 )
-from neuro_code.configuration.app import AppConfig, ProviderProfile
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.session_tasks import (
     SessionTask,

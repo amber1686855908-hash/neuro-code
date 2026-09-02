@@ -6,7 +6,7 @@ import inspect
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_ACP_PATH = _PROJECT_ROOT / "src" / "neuro_code" / "acp.py"
+_ACP_PATH = _PROJECT_ROOT / "src" / "neuro_code" / "interfaces" / "acp" / "agent.py"
 _TRANSPORT_PATH = _PROJECT_ROOT / "src" / "neuro_code" / "interfaces" / "acp" / "transport.py"
 
 _MOVED_SYMBOLS = (
@@ -17,7 +17,6 @@ _MOVED_SYMBOLS = (
 )
 
 _FORBIDDEN_TRANSPORT_IMPORTS = (
-    "neuro_code.acp",
     "neuro_code.bootstrap",
     "neuro_code.infrastructure",
     "neuro_code.providers",
@@ -48,14 +47,14 @@ def _defined_names(tree: ast.AST) -> set[str]:
     return names
 
 
-def test_transport_symbols_have_one_canonical_owner_and_legacy_identity() -> None:
-    legacy = importlib.import_module("neuro_code.acp")
+def test_transport_symbols_have_one_canonical_owner_and_agent_identity() -> None:
+    agent = importlib.import_module("neuro_code.interfaces.acp.agent")
     canonical = importlib.import_module("neuro_code.interfaces.acp.transport")
 
     for name in _MOVED_SYMBOLS:
-        assert getattr(legacy, name) is getattr(canonical, name)
+        assert getattr(agent, name) is getattr(canonical, name)
 
-    assert legacy.stdio_streams is canonical.stdio_streams
+    assert agent.stdio_streams is canonical.stdio_streams
     for name in _MOVED_SYMBOLS[0:3]:
         assert getattr(canonical, name).__module__ == canonical.__name__
     assert canonical.serve_stdio.__module__ == canonical.__name__
@@ -64,9 +63,9 @@ def test_transport_symbols_have_one_canonical_owner_and_legacy_identity() -> Non
     transport_tree = ast.parse(
         _TRANSPORT_PATH.read_text(encoding="utf-8"), filename=str(_TRANSPORT_PATH)
     )
-    acp_tree = ast.parse(_ACP_PATH.read_text(encoding="utf-8"), filename=str(_ACP_PATH))
+    agent_tree = ast.parse(_ACP_PATH.read_text(encoding="utf-8"), filename=str(_ACP_PATH))
     assert set(_MOVED_SYMBOLS).issubset(_defined_names(transport_tree))
-    assert not _defined_names(acp_tree).intersection(_MOVED_SYMBOLS)
+    assert not _defined_names(agent_tree).intersection(_MOVED_SYMBOLS)
 
 
 def test_transport_has_no_reverse_or_concrete_application_dependency() -> None:
@@ -88,7 +87,7 @@ def test_transport_has_no_reverse_or_concrete_application_dependency() -> None:
 
 def test_transport_receives_agent_or_factory_and_agent_keeps_protocol_ownership() -> None:
     canonical = importlib.import_module("neuro_code.interfaces.acp.transport")
-    legacy_tree = ast.parse(_ACP_PATH.read_text(encoding="utf-8"), filename=str(_ACP_PATH))
+    agent_tree = ast.parse(_ACP_PATH.read_text(encoding="utf-8"), filename=str(_ACP_PATH))
     transport_tree = ast.parse(
         _TRANSPORT_PATH.read_text(encoding="utf-8"), filename=str(_TRANSPORT_PATH)
     )
@@ -102,16 +101,16 @@ def test_transport_receives_agent_or_factory_and_agent_keeps_protocol_ownership(
 
     assert "class NeuroCodeAcpAgent" in _ACP_PATH.read_text(encoding="utf-8")
     assert "class NeuroCodeAcpAgent" not in ast.unparse(transport_tree)
-    legacy_source = _ACP_PATH.read_text(encoding="utf-8")
-    assert "asyncio.StreamReader" not in legacy_source
-    assert "from websockets" not in legacy_source
-    assert "build_agent_router" not in legacy_source
-    assert "await _serve_stdio(" in legacy_source
-    assert "await _serve_websocket(" in legacy_source
-    assert "NeuroCodeAcpAgent" in ast.unparse(legacy_tree)
+    agent_source = _ACP_PATH.read_text(encoding="utf-8")
+    assert "asyncio.StreamReader" not in agent_source
+    assert "from websockets" not in agent_source
+    assert "build_agent_router" not in agent_source
+    assert "await _serve_stdio(" in agent_source
+    assert "await _serve_websocket(" in agent_source
+    assert "NeuroCodeAcpAgent" in ast.unparse(agent_tree)
 
 
 def test_session_runtime_remains_the_canonical_per_session_owner() -> None:
-    legacy = importlib.import_module("neuro_code.acp")
+    agent = importlib.import_module("neuro_code.interfaces.acp.agent")
     runtime = importlib.import_module("neuro_code.interfaces.acp.session")
-    assert legacy._AcpSession is runtime.AcpSessionRuntime
+    assert agent._AcpSession is runtime.AcpSessionRuntime

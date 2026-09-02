@@ -48,20 +48,10 @@ from acp.schema import (
     WriteTextFileResponse,
 )
 
-import neuro_code.acp as acp_module
+import neuro_code.interfaces.acp.agent as acp_module
 import neuro_code.interfaces.acp.content as content_module
 import neuro_code.interfaces.acp.mcp_config as mcp_config_module
 import neuro_code.interfaces.acp.updates as updates_module
-from neuro_code.acp import (
-    ACP_CONTEXT_COMPACTION_EXTENSION,
-    ACP_MCP_EXTENSION,
-    ACP_READ_ONLY_SUBAGENT_EXTENSION,
-    ACP_STDIO_BUFFER_LIMIT_BYTES,
-    ACP_SUBAGENT_LIFECYCLE_EXTENSION,
-    ACP_TOOL_OUTPUT_ARTIFACT_EXTENSION,
-    NeuroCodeAcpAgent,
-    serve_acp,
-)
 from neuro_code.application.acp.contracts import (
     AcpMcpQueryError,
     AcpMcpToolError,
@@ -78,6 +68,7 @@ from neuro_code.application.memory.compaction_runtime import (
 )
 from neuro_code.application.permissions.contracts import PermissionApproval, PermissionRequest
 from neuro_code.application.ports.approval import PermissionApprover
+from neuro_code.application.ports.configuration import AppConfig, ProviderProfile
 from neuro_code.application.ports.mcp import (
     McpPrompt,
     McpPromptMessage,
@@ -120,9 +111,8 @@ from neuro_code.application.workflows import (
     SubagentResultProjection,
 )
 from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
+from neuro_code.bootstrap.cli import BootstrapCliServices
 from neuro_code.bootstrap.composition import ApplicationComposition
-from neuro_code.bootstrap.entrypoints import BootstrapCliServices
-from neuro_code.configuration.app import AppConfig, ProviderProfile
 from neuro_code.domain.background_tasks import BackgroundTaskStatus, BackgroundTaskWaitMode
 from neuro_code.domain.conversation.context import ModelContext
 from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind, ModelEvent
@@ -150,6 +140,16 @@ from neuro_code.domain.session_tasks import SessionTaskStatus
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.domain.tools import ToolDefinition, ToolResult
 from neuro_code.infrastructure.sandbox.local_process import ProcessTreeLocalProcessSandbox
+from neuro_code.interfaces.acp.agent import (
+    ACP_CONTEXT_COMPACTION_EXTENSION,
+    ACP_MCP_EXTENSION,
+    ACP_READ_ONLY_SUBAGENT_EXTENSION,
+    ACP_STDIO_BUFFER_LIMIT_BYTES,
+    ACP_SUBAGENT_LIFECYCLE_EXTENSION,
+    ACP_TOOL_OUTPUT_ARTIFACT_EXTENSION,
+    NeuroCodeAcpAgent,
+    serve_acp,
+)
 from neuro_code.interfaces.acp.content import (
     MAX_ANNOTATION_AUDIENCE,
     MAX_EMBEDDED_TEXT_RESOURCE_BYTES,
@@ -3112,7 +3112,7 @@ context_window_tokens = 131072
                 side_effect=(first_collection, second_collection),
             )
             with patch(
-                "neuro_code.bootstrap.entrypoints.McpStdioToolCollection.open",
+                "neuro_code.bootstrap.acp.McpStdioToolCollection.open",
                 new=open_mcp,
             ):
                 created = await agent.new_session(str(root), mcp_servers=[server])
@@ -3166,7 +3166,7 @@ context_window_tokens = 131072
             agent, _, _ = await initialized_agent(root, [RunnerFixture(), RunnerFixture()])
             open_mcp = AsyncMock(return_value=collection)
             with patch(
-                "neuro_code.bootstrap.entrypoints.McpStdioToolCollection.open",
+                "neuro_code.bootstrap.acp.McpStdioToolCollection.open",
                 new=open_mcp,
             ):
                 created_without_mcp = await agent.new_session(str(root))
@@ -3192,7 +3192,7 @@ context_window_tokens = 131072
             agent, application, _ = await initialized_agent(root, [RunnerFixture()])
             open_mcp = AsyncMock(return_value=collection)
             with patch(
-                "neuro_code.bootstrap.entrypoints.McpHttpToolCollection.open",
+                "neuro_code.bootstrap.acp.McpHttpToolCollection.open",
                 new=open_mcp,
             ):
                 created = await agent.new_session(str(root), mcp_servers=[server])
@@ -3226,7 +3226,7 @@ context_window_tokens = 131072
             await agent.initialize(1)
             with (
                 patch(
-                    "neuro_code.bootstrap.entrypoints.McpStdioToolCollection.open",
+                    "neuro_code.bootstrap.acp.McpStdioToolCollection.open",
                     new=AsyncMock(return_value=collection),
                 ),
                 self.assertRaises(RequestError) as error,
@@ -3273,7 +3273,7 @@ context_window_tokens = 131072
 
             with (
                 patch(
-                    "neuro_code.bootstrap.entrypoints.McpStdioToolCollection.open",
+                    "neuro_code.bootstrap.acp.McpStdioToolCollection.open",
                     new=AsyncMock(return_value=collection),
                 ),
                 patch.object(agent, "_client_terminal", return_value=cast(Any, terminal)),
@@ -3299,7 +3299,7 @@ context_window_tokens = 131072
             root = Path(directory)
             agent, _, _ = await initialized_agent(root, [runner])
             with patch(
-                "neuro_code.bootstrap.entrypoints.McpStdioToolCollection.open",
+                "neuro_code.bootstrap.acp.McpStdioToolCollection.open",
                 new=AsyncMock(return_value=collection),
             ):
                 created = await agent.new_session(str(root), mcp_servers=[server])
@@ -3608,7 +3608,7 @@ context_window_tokens = 131072
                 "internal-3",
             )
 
-            with patch("neuro_code.acp.ACP_SESSION_LIST_PAGE_SIZE", 2):
+            with patch("neuro_code.interfaces.acp.agent.ACP_SESSION_LIST_PAGE_SIZE", 2):
                 first = await agent.list_sessions()
                 self.assertIsNotNone(first.next_cursor)
                 second = await agent.list_sessions(
@@ -4442,11 +4442,11 @@ context_window_tokens = 131072
             connection = AsyncMock()
             with (
                 patch(
-                    "neuro_code.acp.stdio_streams",
+                    "neuro_code.interfaces.acp.agent.stdio_streams",
                     new=AsyncMock(return_value=(object(), object())),
                 ) as streams,
                 patch(
-                    "neuro_code.acp._AcpSdkConnection",
+                    "neuro_code.interfaces.acp.agent._AcpSdkConnection",
                     return_value=connection,
                 ) as connection_type,
             ):

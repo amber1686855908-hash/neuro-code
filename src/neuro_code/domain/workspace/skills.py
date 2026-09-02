@@ -32,6 +32,8 @@ from enum import IntEnum, StrEnum
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING
 
+from neuro_code.domain.workspace.paths import normalize_relative_path
+
 if TYPE_CHECKING:
     from neuro_code.domain.conversation.messages import Message
 
@@ -617,13 +619,6 @@ def compute_skill_fingerprint(files: tuple[SkillInfo, ...]) -> str:
         hasher.update(skill.content_fingerprint.encode("ascii"))
         hasher.update(b"\x00")
     return hasher.hexdigest()
-
-
-def normalize_relative_path(path: PurePosixPath) -> str:
-    """Return a normalized POSIX-style relative path string.
-
-    返回规范化的 POSIX 风格相对路径字符串."""
-    return str(path)
 
 
 __all__ = [

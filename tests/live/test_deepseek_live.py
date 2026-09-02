@@ -6,11 +6,11 @@ import pytest
 from tests.fakes import EmptyWorkspaceChangeObserver
 
 from neuro_code.application.permissions.policy import PermissionManager
+from neuro_code.application.ports.configuration import ProviderProfile
 from neuro_code.application.ports.model import ModelProvider
 from neuro_code.application.ports.provider_catalog import ProviderConnectionSpec
 from neuro_code.application.ports.tools import ToolContext
 from neuro_code.application.runtime.agent import AgentRuntime
-from neuro_code.configuration.app import ProviderProfile
 from neuro_code.domain.conversation.context import ModelContext
 from neuro_code.domain.conversation.events import (
     AgentEventKind,
@@ -20,6 +20,7 @@ from neuro_code.domain.conversation.events import (
     ModelTextDelta,
 )
 from neuro_code.domain.conversation.messages import Message, Role
+from neuro_code.infrastructure.providers.binding import resolve_provider_binding
 from neuro_code.infrastructure.providers.failover import FailoverModelProvider, ProviderCandidate
 from neuro_code.infrastructure.providers.provider_catalog import HttpProviderCatalog
 from neuro_code.infrastructure.tools.filesystem import ReadFileTool
@@ -36,14 +37,15 @@ _TOOL_MARKER = "NEURO_CODE_DEEPSEEK_TOOL_ROUNDTRIP_7F3A91"
 async def test_deepseek_model_catalog_connection(
     deepseek_profile: ProviderProfile,
 ) -> None:
+    binding = resolve_provider_binding(deepseek_profile)
     result = await HttpProviderCatalog().discover_models(
         ProviderConnectionSpec(
             protocol=deepseek_profile.protocol,
             dialect=deepseek_profile.dialect,
             base_url=deepseek_profile.base_url,
-            api_key=deepseek_profile.api_key(),
+            api_key=binding.api_key,
         ),
-        http_policy=deepseek_profile.http_client_policy(),
+        http_policy=binding.http_policy,
     )
 
     assert deepseek_profile.model in result.models

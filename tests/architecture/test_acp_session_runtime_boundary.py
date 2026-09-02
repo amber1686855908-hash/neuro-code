@@ -6,11 +6,10 @@ import inspect
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_ACP_PATH = _PROJECT_ROOT / "src" / "neuro_code" / "acp.py"
+_ACP_PATH = _PROJECT_ROOT / "src" / "neuro_code" / "interfaces" / "acp" / "agent.py"
 _SESSION_PATH = _PROJECT_ROOT / "src" / "neuro_code" / "interfaces" / "acp" / "session.py"
 
 _FORBIDDEN_SESSION_IMPORTS = (
-    "neuro_code.acp",
     "neuro_code.bootstrap",
     "neuro_code.infrastructure",
     "neuro_code.providers",
@@ -69,11 +68,11 @@ def _session_attribute_writes(tree: ast.AST) -> set[str]:
     return writes
 
 
-def test_session_runtime_is_canonical_and_legacy_identity_is_preserved() -> None:
-    legacy = importlib.import_module("neuro_code.acp")
+def test_session_runtime_is_canonical_and_agent_identity_is_preserved() -> None:
+    agent = importlib.import_module("neuro_code.interfaces.acp.agent")
     canonical = importlib.import_module("neuro_code.interfaces.acp.session")
 
-    assert legacy._AcpSession is canonical.AcpSessionRuntime
+    assert agent._AcpSession is canonical.AcpSessionRuntime
     assert canonical.AcpSessionRuntime.__module__ == canonical.__name__
     assert "_AcpSession" not in getattr(canonical, "__all__", ())
 

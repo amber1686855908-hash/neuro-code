@@ -29,8 +29,8 @@ from neuro_code.domain.conversation.messages import ToolCall
 from neuro_code.domain.tools import ToolDefinition, ToolResult
 from neuro_code.infrastructure.tools.interaction import AskUserTool
 from neuro_code.infrastructure.tools.registry import ToolRegistry, default_tool_registry
+from neuro_code.interfaces.tui.app import TuiUserInteraction
 from neuro_code.shared.errors import ToolError
-from neuro_code.tui import TuiUserInteraction
 from tests.fakes import EmptyWorkspaceChangeObserver
 
 
@@ -327,7 +327,7 @@ class UserInteractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(text_response.text, "because it is safer")
 
     async def test_cli_noninteractive_adapter_fails_closed(self) -> None:
-        from neuro_code.cli import CliUserInteraction
+        from neuro_code.interfaces.cli.app import CliUserInteraction
 
         with self.assertRaises(InteractionUnavailable):
             await CliUserInteraction(interactive=False).request(

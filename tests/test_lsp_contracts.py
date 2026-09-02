@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from neuro_code.application.ports.configuration import AppConfig
 from neuro_code.application.ports.lsp import (
     LanguageServerProfile,
     LspError,
@@ -14,7 +15,6 @@ from neuro_code.application.ports.lsp import (
     LspRequest,
     LspStatus,
 )
-from neuro_code.configuration.app import AppConfig
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.infrastructure.lsp.manager import (
     MAX_LSP_RESULT_ITEMS,

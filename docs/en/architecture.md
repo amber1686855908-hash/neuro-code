@@ -63,75 +63,34 @@ cleanup removed the root `PermissionApproval`, `PermissionApprovalKind`,
 the former `neuro_code.permissions` module is removed; policy is available only
 from `neuro_code.application.permissions.policy`.
 
-Stage 2B establishes `neuro_code.bootstrap.entrypoints` as the canonical CLI
-and TUI launcher, and the console scripts plus `python -m neuro_code` now use
-it directly. It selects application composition, SQLite session storage, the
-historical session importer, TUI settings/catalog/preferences ports, and
-workspace identity behavior only when the corresponding command needs them.
-`neuro_code.cli` retains parsing, dispatch, rendering, and exit-code handling;
-its injected `run` function is invoked by the canonical bootstrap entrypoint.
-Importing the CLI does not load bootstrap, adapters, providers, or create
-resources.
+The pre-v1 architecture completion makes the three inbound adapters explicit.
+`neuro_code.interfaces.cli.app` owns CLI parsing, dispatch, presentation, and
+exit-code handling; `interfaces.cli.sessions` owns the parsed `sessions`
+execution boundary through the narrow `SessionCliServices` contract.
+`neuro_code.interfaces.tui.app`, `commands`, `text`, and `theme` are the TUI
+owners, while `TuiUserInteraction` remains the queue-backed application port
+adapter. `neuro_code.interfaces.acp.agent` owns the ACP protocol agent and
+delegates content, event projection, client I/O, MCP declaration conversion,
+transport, and per-session runtime state to the explicit ACP submodules. The
+root-level `neuro_code.cli`, `neuro_code.tui`, `neuro_code.acp`,
+`neuro_code.tui_commands`, `neuro_code.tui_text`, and `neuro_code.tui_theme`
+implementation modules have been removed; there is no compatibility wrapper
+that remains authoritative.
 
-The parsed `sessions` command execution boundary is now canonically owned by
-`neuro_code.interfaces.cli.sessions`. Its `run_sessions_command` entrypoint
-uses the narrow `SessionCliServices` contract for configuration, session
-storage, bounded tool-output artifacts, and an opened application. It owns the
-existing list, search, rename, compact, artifacts, and recovery operations,
-including their validation, output, bounds, and cleanup behavior. The parser
-grammar and top-level dispatch remain in `neuro_code.cli`; its private
-`_sessions_command` name is an identity-preserving alias to the canonical
-entrypoint. The canonical command reuses
-`neuro_code.interfaces.cli.serialization`. This is an execution-boundary
-extraction only: `neuro_code.cli` is not yet a complete compatibility facade,
-and its remaining commands remain in place.
-
-Stage 2C keeps `neuro_code.acp` in place as the ACP/JSON-RPC inbound adapter,
-but gives it only `application.acp` contracts and an ACP-specific application
-service. The service exposes binding creation and safe resume preparation,
-session aliases and listing, workspace validation, protocol metadata, and a
-session-lazy MCP tool context. `bootstrap.entrypoints` adapts
-`ApplicationComposition`, the session store, workspace identity checks, and
-the concrete stdio MCP collection to those contracts, then starts the server.
-`serve_acp` accepts only the resulting `AcpApplicationService`; it no longer
-adapts an `ApplicationComposition` caller. ACP no longer imports MCP or workspace implementations, or reads composition
-configuration or storage directly; importing ACP does not load bootstrap, the
-MCP adapter, SQLite storage, or providers.
-
-ACP prompt/content validation and conversion is canonically owned by
-`neuro_code.interfaces.acp.content`, while durable history and live event
-projection are canonically owned by `neuro_code.interfaces.acp.updates`;
-`neuro_code.interfaces.acp.client_io` is now the canonical owner of the
-capability-gated client filesystem and terminal adapters, including their
-adapter-local bounds and terminal task lifecycle state. `neuro_code.acp`
-imports the same symbols as private compatibility aliases.
-`neuro_code.interfaces.acp.transport` is now the canonical owner of the ACP
-SDK connection adapter, stdio framing, WebSocket newline-JSON bridging,
-transport-local bounds, and outer transport close/shutdown lifecycle. The
-transport receives an already-constructed Agent or an Agent factory; it does
-not construct sessions or negotiate capabilities. `neuro_code.acp` retains
-the service-to-Agent public wrappers and imports the transport symbols as
-private compatibility aliases.
-`neuro_code.interfaces.acp.session.AcpSessionRuntime` is now the canonical
-owner of per-session mutable interface state, resource references, runtime
-locks, prompt/cancel/approval presentation state, identity transitions, and
-aggregate cleanup. `NeuroCodeAcpAgent` retains the protocol connection
-attachment, capabilities,
-registry, publication, outer lifecycle routing, extension dispatch, live MCP
-orchestration, and protocol-agent semantics; `SessionTurnService`/`ConversationRunner`
-remain the actual turn and recovery authorities.
-`neuro_code.interfaces.acp.mcp_config` is now the canonical owner of the
-stateless, bounded conversion from ACP MCP declarations to application MCP
-configuration contracts. `neuro_code.acp` supplies the protected-environment
-set and retains the caller, capability negotiation, session registry,
-publication and outer lifecycle routing, permission request coordination, live
-MCP, and the service-to-Agent compatibility wrappers. It is therefore still a
-mixed adapter rather than a facade. See [ADR 0145](adr/0145-acp-prompt-content-boundary.md),
+Process and resource wiring is separated from inbound behavior. The console
+scripts and `python -m neuro_code` call the lazy launcher in
+`neuro_code.bootstrap.entrypoints`. Concrete CLI/TUI service selection lives in
+`bootstrap.cli`, ACP workspace/MCP composition adapters live in
+`bootstrap.acp`, default concrete factory choices live in `bootstrap.factories`,
+and the single shared resource graph remains in `bootstrap.composition`.
+Importing an interface module does not assemble bootstrap or concrete
+infrastructure. See [ADR 0145](adr/0145-acp-prompt-content-boundary.md),
 [ADR 0146](adr/0146-acp-update-and-event-projection-boundary.md),
 [ADR 0147](adr/0147-acp-client-io-adapter-boundary.md),
 [ADR 0148](adr/0148-acp-mcp-configuration-boundary.md),
 [ADR 0150](adr/0150-acp-session-runtime-ownership-boundary.md), and
-[ADR 0151](adr/0151-acp-transport-boundary.md).
+[ADR 0151](adr/0151-acp-transport-boundary.md), and
+[ADR 0153](adr/0153-architecture-completion.md).
 
 Agent harness behavior currently lives in the explicit canonical submodules of
 `neuro_code.application.runtime`: `background_task_reminders`, `agent`,
@@ -229,13 +188,20 @@ submodules. `neuro_code.application.runtime.__init__` currently remains minimal
 and provides no aggregate API, and internal production code imports the
 canonical submodules directly.
 
-`neuro_code.configuration.app` owns `AppConfig` and `ProviderProfile`, TOML and
-CC Switch configuration, environment overrides, routing, managed overlays,
-sandbox policy, stored-credential injection, and HTTP proxy policy. The
-synchronous managed JSON reader in
-`neuro_code.configuration.managed_provider_settings` owns schema, protocol,
-and dialect checks, the file-size limit, metadata/credentials merging,
-structural validation, and `ManagedProviderSettings` construction.
+`neuro_code.application.ports.configuration` owns the immutable `AppConfig` and
+`ProviderProfile` contract plus validation and explicit-input proxy policy. It
+does not read the process environment, probe optional packages, or resolve
+filesystem paths. The loader in `neuro_code.bootstrap.configuration` owns TOML,
+CC Switch, environment overrides, routing, managed overlays, path resolution,
+sandbox selection, and stored-credential injection. Concrete environment
+credentials and optional HTTP capabilities are resolved by
+`neuro_code.infrastructure.providers.binding` before a provider adapter is
+created. The synchronous managed JSON reader in
+`neuro_code.infrastructure.providers.managed_provider_settings` owns schema,
+protocol, and dialect checks, the file-size limit, metadata/credentials
+merging, structural validation, and `ManagedProviderSettings` construction.
+Legacy dialect inference is an application port in
+`neuro_code.application.ports.provider_dialects`.
 The provider-settings value objects and persistence contract are owned by
 `neuro_code.application.ports.provider_settings`; the former
 `neuro_code.domain.provider_settings` facade has been removed. This keeps
@@ -244,24 +210,27 @@ without changing validation or persistence. `JsonProviderSettingsStore` is
 owned by `neuro_code.infrastructure.providers.provider_settings`, including
 asynchronous persistence, atomic writes, and POSIX private permissions. It uses
 the canonical reader through a private binding.
-The removed `neuro_code.config` facade no longer provides a compatibility
-import; callers use `neuro_code.configuration.app` directly. `ProviderProfile`
-and `AppConfig` replace the removed `ProviderConfig` alias for this boundary.
+There is no top-level `neuro_code.configuration` package and no
+`neuro_code.config` compatibility import. `ProviderProfile` and `AppConfig`
+replace the removed `ProviderConfig` alias for this boundary.
 The active temporary allowlist is empty. The only remaining raw forbidden edge
 is the canonical package-executable entrypoint,
 `neuro_code.__main__ -> neuro_code.bootstrap.entrypoints`; it is not
 compatibility debt.
 
-`ApplicationComposition` in `bootstrap.composition` resolves configuration and
-provider overrides, performs session-sandbox preflight, initializes SQLite,
-creates providers/tools/permission managers and conversation-scoped
-background-task registries, and owns supervisor shutdown. Stage 2A changes only
-its structural ownership: the initialization and failure-cleanup ordering is
-unchanged. CLI, TUI, and ACP continue to share the same service and typed
-runtime event stream.
+`ApplicationComposition` in `bootstrap.composition` remains the single owner of
+the shared resource graph: it resolves the loaded configuration and overrides,
+performs session-sandbox preflight, initializes SQLite, creates
+providers/tools/permission managers and conversation-scoped background-task
+registries, and owns supervisor shutdown. `bootstrap.factories` owns only the
+default concrete factory choices, while `bootstrap.cli` and `bootstrap.acp`
+adapt those choices to their inbound services. Initialization and
+failure-cleanup ordering is unchanged; CLI, TUI, and ACP continue to share the
+same services and typed runtime event stream.
 
-See [ADR 0049](adr/0049-progressive-architecture-boundaries.md) for the complete
-dependency rules, compatibility migration policy, and allowlist discipline.
+See [ADR 0049](adr/0049-progressive-architecture-boundaries.md) and
+[ADR 0153](adr/0153-architecture-completion.md) for the complete dependency
+rules, compatibility migration policy, and allowlist discipline.
 
 ## Runtime event model
 
@@ -636,9 +605,10 @@ resume, and close behind `use_unstable_protocol`. Its generated schema includes
 stable delete models but its Agent router omits that route, so the canonical
 transport adds only the generated delete request to the official
 `MessageRouter`; SDK streams, `Connection`, dispatcher, schemas, framing, and
-error normalization remain unchanged. The legacy `neuro_code.acp` server
-functions remain thin service-to-Agent wrappers and preserve their private
-transport aliases for existing integrations.
+error normalization remain unchanged. The canonical
+`neuro_code.interfaces.acp.agent` server functions remain thin
+service-to-Agent wrappers and preserve their private transport aliases for
+the supported in-process callers.
 
 One ACP connection is bound to the normalized launch workspace. Each accepted
 session owns a stable random ACP ID, one `AgentConversation`, one background

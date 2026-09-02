@@ -23,6 +23,7 @@ from unittest.mock import patch
 
 from neuro_code.application.permissions.policy import PermissionMode
 from neuro_code.application.ports.checkpoints import WorkspaceCheckpointApplication
+from neuro_code.application.ports.configuration import AppConfig
 from neuro_code.application.ports.lsp import LspOperation, LspRequest
 from neuro_code.application.ports.model import ModelCapabilitySet, ModelProvider, ModelToolPolicy
 from neuro_code.application.ports.parent_context_relay import (
@@ -78,7 +79,6 @@ from neuro_code.application.workflows.writable_subagent import (
     WritableWorktreeApplication,
 )
 from neuro_code.bootstrap.composition import ApplicationComposition
-from neuro_code.configuration.app import AppConfig
 from neuro_code.domain.checkpoints import (
     CheckpointCreateRequest,
     CheckpointId,

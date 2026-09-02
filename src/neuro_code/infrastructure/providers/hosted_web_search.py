@@ -17,6 +17,7 @@ from dataclasses import replace
 from typing import Any
 from urllib.parse import urlsplit
 
+from neuro_code.application.ports.configuration import AppConfig, ProviderProfile
 from neuro_code.application.ports.model import (
     CapabilityStatus,
     ModelCapability,
@@ -37,7 +38,6 @@ from neuro_code.application.ports.web_search import (
     WebSearchResult,
     WebSearchSource,
 )
-from neuro_code.configuration.app import AppConfig, ProviderProfile
 from neuro_code.domain.conversation.context import ModelContext
 from neuro_code.domain.conversation.events import (
     ModelBackendToolCompleted,

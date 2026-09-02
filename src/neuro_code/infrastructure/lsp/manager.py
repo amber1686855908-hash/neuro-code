@@ -66,7 +66,7 @@ from neuro_code.shared.errors import ToolError
 from neuro_code.shared.redaction import redact_sensitive_text
 
 if TYPE_CHECKING:
-    from neuro_code.configuration.app import AppConfig
+    from neuro_code.application.ports.configuration import AppConfig
 
 MAX_LSP_DOCUMENT_BYTES = 2 * 1024 * 1024
 MAX_LSP_HOVER_BYTES = 16 * 1024

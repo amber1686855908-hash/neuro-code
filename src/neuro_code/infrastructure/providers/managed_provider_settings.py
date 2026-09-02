@@ -9,13 +9,13 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from neuro_code.application.ports.model import ModelCapabilitySet
+from neuro_code.application.ports.provider_dialects import resolve_legacy_dialect
 from neuro_code.application.ports.provider_services import SUPPORTED_DIALECTS, SUPPORTED_PROTOCOLS
 from neuro_code.application.ports.provider_settings import (
     ManagedProviderProfile,
     ManagedProviderSettings,
     ManagedProxyPolicy,
 )
-from neuro_code.configuration.provider_dialects import resolve_legacy_dialect
 from neuro_code.domain.background_tasks.models import BackgroundTaskWakePolicy
 from neuro_code.shared.errors import ConfigurationError
 

@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
 
-import neuro_code.configuration.app as config_module
+import neuro_code.application.ports.configuration as config_models
+import neuro_code.bootstrap.configuration as config_module
 from neuro_code.application.execution_policy import ExecutionProfile
 from neuro_code.application.memory.compaction_runtime import ContextCompactionRuntimeGate
 from neuro_code.application.permissions.policy import (
@@ -22,6 +23,7 @@ from neuro_code.application.ports.background_tasks import (
     BackgroundTaskManager,
     BackgroundTaskSupervisor,
 )
+from neuro_code.application.ports.configuration import AppConfig, ProviderProfile
 from neuro_code.application.ports.model import ModelCapabilitySet, ModelProvider
 from neuro_code.application.ports.sandbox import LocalProcessSandbox
 from neuro_code.application.runtime.supervision import ExecutionControlMode
@@ -31,7 +33,6 @@ from neuro_code.application.sessions.summary import SessionSummaryQueryService
 from neuro_code.application.settings import ApplicationSettings
 from neuro_code.application.workflows import IsolatedSubagentExecutionService, SubagentCapabilitySet
 from neuro_code.bootstrap.composition import ApplicationComposition
-from neuro_code.configuration.app import AppConfig, ProviderProfile
 from neuro_code.domain.conversation.context import ModelContext
 from neuro_code.domain.conversation.events import ModelEvent
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
@@ -734,9 +735,9 @@ proxy_mode = "direct"
             calls: list[str] = []
             store = OrderedSessionStoreFixture(calls)
             original_load_config = config_module.load_config
-            original_override_provider = config_module.override_provider
-            original_override_sandbox = config_module.override_sandbox
-            original_pin_resumed_sandbox = config_module.pin_resumed_sandbox
+            original_override_provider = config_models.override_provider
+            original_override_sandbox = config_models.override_sandbox
+            original_pin_resumed_sandbox = config_models.pin_resumed_sandbox
 
             def load_config(cwd: Path | None) -> AppConfig:
                 calls.append("load config")
@@ -791,17 +792,19 @@ proxy_mode = "direct"
                 clear=True,
             ):
                 with (
-                    patch("neuro_code.configuration.app.load_config", side_effect=load_config),
                     patch(
-                        "neuro_code.configuration.app.override_sandbox",
+                        "neuro_code.bootstrap.configuration.load_config", side_effect=load_config
+                    ),
+                    patch(
+                        "neuro_code.application.ports.configuration.override_sandbox",
                         side_effect=override_sandbox,
                     ),
                     patch(
-                        "neuro_code.configuration.app.override_provider",
+                        "neuro_code.application.ports.configuration.override_provider",
                         side_effect=override_provider,
                     ),
                     patch(
-                        "neuro_code.configuration.app.pin_resumed_sandbox",
+                        "neuro_code.application.ports.configuration.pin_resumed_sandbox",
                         side_effect=pin_resumed_sandbox,
                     ),
                 ):

@@ -5,11 +5,11 @@
 from __future__ import annotations
 
 import asyncio
-import sys
-from collections.abc import Callable, Collection, Sequence
+import os
+from collections.abc import Collection, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 from neuro_code.application.checkpoints import WorkspaceCheckpointApplicationService
 from neuro_code.application.execution_policy import ExecutionBudgetPolicy
@@ -34,6 +34,7 @@ from neuro_code.application.ports.background_tasks import (
 )
 from neuro_code.application.ports.client_filesystem import ClientFileSystem
 from neuro_code.application.ports.client_terminal import ClientTerminal
+from neuro_code.application.ports.configuration import AppConfig
 from neuro_code.application.ports.instructions import InstructionDiscovery
 from neuro_code.application.ports.leader import LeaderStore
 from neuro_code.application.ports.model import (
@@ -71,7 +72,6 @@ from neuro_code.application.ports.web_search import (
     WebSearchMode,
     resolve_web_search_path,
 )
-from neuro_code.application.ports.workspace_changes import WorkspaceChangeObserver
 from neuro_code.application.ports.writable_subagent import WritableSubagentLeaseStore
 from neuro_code.application.providers.service import (
     ProviderChangeService,
@@ -145,8 +145,6 @@ from neuro_code.application.workflows.subagent_scheduler import (
 )
 from neuro_code.application.workflows.task_dag import (
     TaskDagApplicationService,
-    TaskDagWritableService,
-    TaskDagWritableWorkerFactory,
 )
 from neuro_code.application.workflows.task_dag_replan import (
     TaskDagReplanApplicationService,
@@ -158,13 +156,31 @@ from neuro_code.application.workflows.writable_subagent import (
     WritableSubagentApplicationService,
 )
 from neuro_code.application.worktrees import WorktreeApplicationService
+from neuro_code.bootstrap.factories import (
+    BackgroundSupervisorFactory,
+    CompositionTaskDagWritableWorkerFactory,
+    InstructionDiscoveryFactory,
+    LocalProcessSandboxFactory,
+    ProviderFactory,
+    SessionStoreFactory,
+    SkillDiscoveryFactory,
+    WorkspaceChangeObserverFactory,
+    _default_background_supervisor_factory,
+    _default_instruction_discovery_factory,
+    _default_local_process_sandbox_factory,
+    _default_provider_factory,
+    _default_session_store_factory,
+    _default_skill_discovery_factory,
+    _default_workspace_change_observer_factory,
+    _without_main_inline_web_fetch,
+    _without_main_inline_web_search,
+)
 from neuro_code.domain.conversation.messages import Message, Role, SyntheticReason
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
 from neuro_code.domain.parent_context_relay import (
     ParentContextRelay,
     render_parent_context_relay,
 )
-from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.task_dag import TaskDagNodeState
 from neuro_code.domain.task_dag_result_relay import (
     TaskDagDependencyResultRelay,
@@ -172,24 +188,16 @@ from neuro_code.domain.task_dag_result_relay import (
 )
 from neuro_code.domain.workspace.instructions import InstructionDiscoveryResult
 from neuro_code.domain.workspace.skills import SkillDiscoveryResult
-from neuro_code.infrastructure.background_tasks import LocalBackgroundTaskManager
 from neuro_code.infrastructure.git.worktree import LocalGitWorktreeAdapter
 from neuro_code.infrastructure.lsp.manager import LanguageServerManager
 from neuro_code.infrastructure.persistence.checkpoint_artifacts import LocalCheckpointArtifactStore
 from neuro_code.infrastructure.persistence.managed_worktrees import SqliteManagedWorktreeStore
 from neuro_code.infrastructure.persistence.output_artifacts import FileToolOutputArtifactStore
-from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
 from neuro_code.infrastructure.persistence.workspace_checkpoints import (
     SqliteWorkspaceCheckpointStore,
 )
-from neuro_code.infrastructure.providers import create_routed_provider
 from neuro_code.infrastructure.providers.hosted_web_search import (
     RoutedWebSearchBackendResolver,
-)
-from neuro_code.infrastructure.sandbox.linux_local_process import LinuxBubblewrapLocalProcessSandbox
-from neuro_code.infrastructure.sandbox.local_process import ProcessTreeLocalProcessSandbox
-from neuro_code.infrastructure.sandbox.windows_native_local_process import (
-    WindowsNativeLocalProcessSandbox,
 )
 from neuro_code.infrastructure.tools.filesystem import ExactWorkspaceMutationTool
 from neuro_code.infrastructure.tools.registry import ToolRegistry, default_tool_registry
@@ -198,154 +206,12 @@ from neuro_code.infrastructure.tools.web_search import WebSearchTool
 from neuro_code.infrastructure.tools.workspace_diff import WorkspaceMutationJournal
 from neuro_code.infrastructure.web_fetch.local import LocalWebFetcher
 from neuro_code.infrastructure.workspace.changes import (
-    FilesystemWorkspaceChangeObserver,
     MultiRootWorkspaceChangeObserver,
 )
 from neuro_code.infrastructure.workspace.checkpoints import LocalWorkspaceStateAdapter
-from neuro_code.infrastructure.workspace.instructions import FilesystemInstructionDiscovery
 from neuro_code.infrastructure.workspace.paths import FilesystemWorkspaceIdentity, workspaces_match
 from neuro_code.infrastructure.workspace.projection import LocalParentWorkspaceProjectionReader
-from neuro_code.infrastructure.workspace.skills import FilesystemSkillDiscovery
-from neuro_code.shared.errors import ConfigurationError, SandboxError
-
-if TYPE_CHECKING:
-    from neuro_code.configuration.app import AppConfig
-
-
-ProviderFactory = Callable[["AppConfig", bool], ModelProvider]
-LocalProcessSandboxFactory = Callable[[SandboxProfile, Path, Path], LocalProcessSandbox]
-SessionStoreFactory = Callable[[Path], SessionStore]
-BackgroundSupervisorFactory = Callable[[], BackgroundTaskSupervisor]
-InstructionDiscoveryFactory = Callable[[], InstructionDiscovery]
-SkillDiscoveryFactory = Callable[[], SkillDiscovery]
-WorkspaceChangeObserverFactory = Callable[[], WorkspaceChangeObserver]
-
-
-def _default_provider_factory(config: AppConfig, failover: bool) -> ModelProvider:
-    return create_routed_provider(config, failover=failover)
-
-
-def _without_main_inline_web_search(config: AppConfig) -> AppConfig:
-    """Disable only MAIN hosted search for explicit sidecar/disabled modes."""
-
-    route = config.main_route
-    names = {route.provider_profile, *route.fallback_profiles}
-    profiles = dict(config.providers)
-    for name in names:
-        profile = profiles.get(name)
-        if profile is None or not ({"web_search", "google_search"} & set(profile.builtin_tools)):
-            continue
-        profiles[name] = replace(
-            profile,
-            builtin_tools=tuple(
-                tool_name
-                for tool_name in profile.builtin_tools
-                if tool_name not in {"web_search", "google_search"}
-            ),
-        )
-    return replace(config, providers=profiles)
-
-
-def _without_main_inline_web_fetch(config: AppConfig) -> AppConfig:
-    """Disable only MAIN hosted fetch tools for local/disabled modes."""
-
-    route = config.main_route
-    names = {route.provider_profile, *route.fallback_profiles}
-    profiles = dict(config.providers)
-    for name in names:
-        profile = profiles.get(name)
-        if profile is None or not ({"web_fetch", "url_context"} & set(profile.builtin_tools)):
-            continue
-        profiles[name] = replace(
-            profile,
-            builtin_tools=tuple(
-                tool_name
-                for tool_name in profile.builtin_tools
-                if tool_name not in {"web_fetch", "url_context"}
-            ),
-        )
-    return replace(config, providers=profiles)
-
-
-def _default_local_process_sandbox_factory(
-    profile: SandboxProfile,
-    workspace: Path,
-    state_dir: Path,
-) -> LocalProcessSandbox:
-    """Choose the canonical local-process launcher for one session binding.
-
-    为一个会话绑定选择规范本地进程启动器.
-
-    ``off`` preserves the existing owned-process bridge. Enabled profiles use
-    the platform's child adapter on Linux, macOS, or Windows W3; unsupported
-    platform/profile combinations fail closed. The controller is never
-    re-executed inside a sandbox namespace.
-
-    ``off`` 保留既有的受管进程桥接器.每个启用的 profile 都通过 Linux Bubblewrap、
-    macOS Seatbelt 或 Windows W3 child adapter 创建边界;不支持的平台/profile
-    组合失败关闭.controller 不会重新执行到沙箱中.
-    """
-
-    if not profile.enabled:
-        return ProcessTreeLocalProcessSandbox()
-    platform = _runtime_platform()
-    if platform.startswith("linux"):
-        return LinuxBubblewrapLocalProcessSandbox(profile, workspace, state_dir)
-    if platform == "darwin":
-        from neuro_code.infrastructure.sandbox.macos_local_process import (
-            MacOSSeatbeltLocalProcessSandbox,
-        )
-
-        return MacOSSeatbeltLocalProcessSandbox(profile, workspace, state_dir)
-    if platform.startswith("win"):
-        return WindowsNativeLocalProcessSandbox(profile, workspace, state_dir)
-    raise SandboxError(f"sandbox profile {profile.value!r} is not enforceable on {platform}")
-
-
-def _runtime_platform() -> str:
-    return sys.platform
-
-
-def _default_session_store_factory(path: Path) -> SessionStore:
-    return SqliteSessionStore(path)
-
-
-def _default_background_supervisor_factory() -> BackgroundTaskSupervisor:
-    return LocalBackgroundTaskManager()
-
-
-def _default_instruction_discovery_factory() -> InstructionDiscovery:
-    return FilesystemInstructionDiscovery()
-
-
-def _default_skill_discovery_factory() -> SkillDiscovery:
-    return FilesystemSkillDiscovery()
-
-
-def _default_workspace_change_observer_factory() -> WorkspaceChangeObserver:
-    return FilesystemWorkspaceChangeObserver()
-
-
-class CompositionTaskDagWritableWorkerFactory(TaskDagWritableWorkerFactory):
-    """Create one fresh Writable application owner per parallel DAG node."""
-
-    __slots__ = ("_composition", "_parent_binding", "_timeout_seconds")
-
-    def __init__(
-        self,
-        composition: ApplicationComposition,
-        parent_binding: ConversationBinding,
-        timeout_seconds: float,
-    ) -> None:
-        self._composition = composition
-        self._parent_binding = parent_binding
-        self._timeout_seconds = timeout_seconds
-
-    def create(self) -> TaskDagWritableService:
-        return self._composition.create_writable_subagent_service(
-            parent_binding=self._parent_binding,
-            timeout_seconds=self._timeout_seconds,
-        )
+from neuro_code.shared.errors import ConfigurationError
 
 
 class ApplicationComposition:
@@ -521,12 +387,12 @@ class ApplicationComposition:
     ) -> ApplicationComposition:
         background_tasks = background_supervisor_factory()
         try:
-            from neuro_code.configuration.app import (
-                load_config,
+            from neuro_code.application.ports.configuration import (
                 override_provider,
                 override_sandbox,
                 pin_resumed_sandbox,
             )
+            from neuro_code.bootstrap.configuration import load_config
 
             config = load_config(settings.cwd)
             config = override_sandbox(config, settings.sandbox)
@@ -717,7 +583,7 @@ class ApplicationComposition:
                 local_process_sandbox=local_process_sandbox,
                 workspace_root=selected_config.cwd,
                 additional_workspace_roots=tuple(additional_workspace_roots),
-                redaction_values=selected_config.redaction_values(),
+                redaction_values=selected_config.redaction_values(os.environ),
             )
             task_scope = self.background_tasks.open_scope(
                 local_process_sandbox=local_process_sandbox,
@@ -845,9 +711,9 @@ class ApplicationComposition:
                         WebFetchTool(
                             WebFetchService(
                                 LocalWebFetcher(
-                                    redaction_values=selected_config.redaction_values(),
+                                    redaction_values=selected_config.redaction_values(os.environ),
                                 ),
-                                redaction_values=selected_config.redaction_values(),
+                                redaction_values=selected_config.redaction_values(os.environ),
                             )
                         )
                     )
@@ -859,7 +725,7 @@ class ApplicationComposition:
                             WebSearchService(
                                 selected_config,
                                 search_resolver,
-                                redaction_values=selected_config.redaction_values(),
+                                redaction_values=selected_config.redaction_values(os.environ),
                             )
                         )
                     )
@@ -890,7 +756,7 @@ class ApplicationComposition:
             compaction_persistence = ContextCompactionApplicationService(
                 self.store,
                 provider,
-                redaction_values=selected_config.redaction_values(),
+                redaction_values=selected_config.redaction_values(os.environ),
             )
             compaction_gate = ContextCompactionRuntimeGate(
                 ContextCompactionTriggerService(compaction_persistence)
@@ -973,7 +839,7 @@ class ApplicationComposition:
                     protected_environment_variables=(
                         selected_config.protected_environment_variables
                     ),
-                    redaction_values=selected_config.redaction_values(),
+                    redaction_values=selected_config.redaction_values(os.environ),
                     background_tasks=task_scope if enable_background_tasks else None,
                     instruction_tracker=tracker,
                     skill_tracker=skill_tracker,
@@ -981,7 +847,7 @@ class ApplicationComposition:
                     client_terminal=client_terminal,
                     output_artifact_store=FileToolOutputArtifactStore(
                         selected_config.state_dir / "tool-output",
-                        redaction_values=selected_config.redaction_values(),
+                        redaction_values=selected_config.redaction_values(os.environ),
                     ),
                     workspace_change_journal=workspace_change_journal,
                     user_interaction=user_interaction,
@@ -1086,7 +952,7 @@ class ApplicationComposition:
             raise ConfigurationError("session sandbox profile does not match the active profile")
 
         if summary.provider in self.config.providers:
-            from neuro_code.configuration.app import override_provider
+            from neuro_code.application.ports.configuration import override_provider
 
             selected = override_provider(
                 self.config,
@@ -1142,7 +1008,7 @@ class ApplicationComposition:
         selected_config = config or self.config
         reader = FileToolOutputArtifactStore(
             selected_config.state_dir / "tool-output",
-            redaction_values=selected_config.redaction_values(),
+            redaction_values=selected_config.redaction_values(os.environ),
         )
         return SessionToolOutputArtifactApplicationService(
             self.store,
@@ -1324,7 +1190,7 @@ class ApplicationComposition:
             parent_binding=parent_binding,
             global_policy=self.subagent_global_policy(),
             relay_store=cast(ParentContextRelayStore, self.store),
-            redaction_values=self.config.redaction_values(),
+            redaction_values=self.config.redaction_values(os.environ),
             timeout_seconds=timeout_seconds,
         )
 
@@ -1357,7 +1223,7 @@ class ApplicationComposition:
             dependency_relay_store=cast(TaskDagDependencyResultRelayStore, self.store),
             recovery_claim_store=cast(TaskDagRecoveryClaimStore, self.store),
             writable_worker_factory=writable_worker_factory,
-            redaction_values=self.config.redaction_values(),
+            redaction_values=self.config.redaction_values(os.environ),
         )
 
     async def create_leader_service(
@@ -1413,7 +1279,7 @@ class ApplicationComposition:
                 parent_binding=parent_binding,
                 leader_binding=leader_binding,
                 session_store=self.store,
-                redaction_values=leader_config.redaction_values(),
+                redaction_values=leader_config.redaction_values(os.environ),
             )
         except BaseException:
             await asyncio.shield(leader_binding.close())
@@ -1472,7 +1338,7 @@ class ApplicationComposition:
                 parent_binding=parent_binding,
                 planner_binding=planner_binding,
                 session_store=self.store,
-                redaction_values=planner_config.redaction_values(),
+                redaction_values=planner_config.redaction_values(os.environ),
             )
         except BaseException:
             await asyncio.shield(planner_binding.close())
@@ -1529,7 +1395,7 @@ class ApplicationComposition:
                 parent_binding=parent_binding,
                 planner_binding=planner_binding,
                 session_store=self.store,
-                redaction_values=planner_config.redaction_values(),
+                redaction_values=planner_config.redaction_values(os.environ),
             )
         except BaseException:
             await asyncio.shield(planner_binding.close())
@@ -1584,7 +1450,7 @@ class ApplicationComposition:
             planner_factory=planner_factory,
             leader_factory=leader_factory,
             replanner_factory=replanner_factory,
-            redaction_values=self.config.redaction_values(),
+            redaction_values=self.config.redaction_values(os.environ),
         )
 
     async def create_ultracode_delegation_service(
@@ -1683,7 +1549,7 @@ class ApplicationComposition:
 
         return ReadOnlySubagentApplicationService(
             self.create_read_only_subagent_service(timeout_seconds=timeout_seconds),
-            redaction_values=self.config.redaction_values(),
+            redaction_values=self.config.redaction_values(os.environ),
             max_result_bytes=max_result_bytes,
         )
 

@@ -8,7 +8,7 @@ from neuro_code.application.acp.contracts import MAX_MCP_SERVERS
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _MCP_CONFIG_PATH = _PROJECT_ROOT / "src" / "neuro_code" / "interfaces" / "acp" / "mcp_config.py"
-_ACP_PATH = _PROJECT_ROOT / "src" / "neuro_code" / "acp.py"
+_ACP_PATH = _PROJECT_ROOT / "src" / "neuro_code" / "interfaces" / "acp" / "agent.py"
 
 _MOVED_SYMBOLS = (
     "McpServer",
@@ -57,18 +57,18 @@ def _defined_names(tree: ast.AST) -> set[str]:
     return names
 
 
-def test_mcp_config_is_canonical_and_legacy_aliases_preserve_identity() -> None:
-    legacy = importlib.import_module("neuro_code.acp")
+def test_mcp_config_is_canonical_and_agent_aliases_preserve_identity() -> None:
+    agent = importlib.import_module("neuro_code.interfaces.acp.agent")
     canonical = importlib.import_module("neuro_code.interfaces.acp.mcp_config")
 
     for name in _MOVED_SYMBOLS:
-        assert getattr(legacy, name) is getattr(canonical, name)
+        assert getattr(agent, name) is getattr(canonical, name)
 
     for name in _MOVED_SYMBOLS[1:5]:
         assert getattr(canonical, name).__module__ == canonical.__name__
 
     assert canonical.MAX_MCP_SERVERS is MAX_MCP_SERVERS
-    assert legacy.MAX_MCP_SERVERS is MAX_MCP_SERVERS
+    assert agent.MAX_MCP_SERVERS is MAX_MCP_SERVERS
 
 
 def test_mcp_config_has_no_reverse_or_concrete_dependency() -> None:
@@ -83,7 +83,7 @@ def test_mcp_config_has_no_reverse_or_concrete_dependency() -> None:
     assert "neuro_code.interfaces.acp.serialization" in imported_modules
 
 
-def test_mcp_configuration_definitions_are_absent_from_legacy_module() -> None:
+def test_mcp_configuration_definitions_are_absent_from_agent_module() -> None:
     canonical_tree = ast.parse(
         _MCP_CONFIG_PATH.read_text(encoding="utf-8"), filename=str(_MCP_CONFIG_PATH)
     )

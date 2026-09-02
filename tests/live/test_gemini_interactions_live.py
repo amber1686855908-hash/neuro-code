@@ -7,13 +7,13 @@ from typing import Any
 
 import pytest
 
+from neuro_code.application.ports.configuration import ProviderProfile
 from neuro_code.application.ports.model import ModelCapability, ModelProvider
 from neuro_code.application.ports.web_search import (
     MAX_TOTAL_RESULT_BYTES,
     HostedWebSearchEvent,
     WebSearchRequest,
 )
-from neuro_code.configuration.app import ProviderProfile
 from neuro_code.domain.conversation.context import ModelContext
 from neuro_code.domain.conversation.events import ModelCompleted, ModelEvent
 from neuro_code.domain.conversation.messages import Message, Role

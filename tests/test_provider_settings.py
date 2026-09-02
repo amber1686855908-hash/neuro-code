@@ -6,16 +6,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from neuro_code.application.ports.configuration import ProviderProfile
 from neuro_code.application.ports.model import CapabilityStatus, ModelCapability, ModelCapabilitySet
 from neuro_code.application.ports.provider_settings import (
     ManagedProviderProfile,
     ManagedProxyPolicy,
 )
-from neuro_code.configuration.app import ProviderProfile
-from neuro_code.configuration.managed_provider_settings import (
+from neuro_code.domain.background_tasks import BackgroundTaskWakePolicy
+from neuro_code.infrastructure.providers.managed_provider_settings import (
     load_managed_provider_settings as canonical_load_managed_provider_settings,
 )
-from neuro_code.domain.background_tasks import BackgroundTaskWakePolicy
 from neuro_code.infrastructure.providers.openai_responses import OpenAIResponsesProvider
 from neuro_code.infrastructure.providers.provider_settings import JsonProviderSettingsStore
 from neuro_code.shared.errors import ConfigurationError
@@ -32,7 +32,7 @@ class JsonProviderSettingsStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(importlib.util.find_spec("neuro_code.config"))
         self.assertEqual(
             canonical_load_managed_provider_settings.__module__,
-            "neuro_code.configuration.managed_provider_settings",
+            "neuro_code.infrastructure.providers.managed_provider_settings",
         )
 
     @staticmethod

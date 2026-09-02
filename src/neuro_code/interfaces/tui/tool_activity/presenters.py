@@ -10,6 +10,7 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from neuro_code.interfaces.tui.text import ui_text
 from neuro_code.interfaces.tui.tool_activity.models import (
     ToolActivityPeekPresentation,
     ToolCallSnapshot,
@@ -22,7 +23,6 @@ from neuro_code.interfaces.tui.tool_activity.renderers import (
     safe_tool_text,
 )
 from neuro_code.shared.ui_language import UiLanguage
-from neuro_code.tui_text import ui_text
 
 TOOL_PEEK_LOGICAL_LINE_BUDGET = 10
 _INSPECTOR_INPUT_CHARACTER_BUDGET = 64 * 1024

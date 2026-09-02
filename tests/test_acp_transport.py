@@ -347,14 +347,12 @@ class AcpTransportTests(unittest.IsolatedAsyncioTestCase):
 
         agent_factory.assert_not_called()
 
-    async def test_canonical_symbols_are_identity_stable_for_legacy_imports(self) -> None:
-        import neuro_code.acp as legacy
-
-        self.assertIs(legacy._build_acp_router, transport._build_acp_router)
-        self.assertIs(legacy._AcpSdkConnection, transport._AcpSdkConnection)
-        self.assertIs(legacy._WebSocketWriter, transport._WebSocketWriter)
-        self.assertIs(legacy.stdio_streams, transport.stdio_streams)
-        self.assertIs(legacy.ACP_STDIO_BUFFER_LIMIT_BYTES, transport.ACP_STDIO_BUFFER_LIMIT_BYTES)
+    async def test_canonical_symbols_are_owned_by_the_transport_module(self) -> None:
+        self.assertEqual(transport._build_acp_router.__module__, transport.__name__)
+        self.assertEqual(transport._AcpSdkConnection.__module__, transport.__name__)
+        self.assertEqual(transport._WebSocketWriter.__module__, transport.__name__)
+        self.assertEqual(transport.serve_stdio.__module__, transport.__name__)
+        self.assertEqual(transport.serve_websocket.__module__, transport.__name__)
 
 
 if __name__ == "__main__":

@@ -15,12 +15,12 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Label, TextArea
 
 from neuro_code.interfaces.tui.clipboard import ClipboardWriteResult
+from neuro_code.interfaces.tui.text import ui_text
 from neuro_code.interfaces.tui.tool_activity.models import (
     ToolInspectorPresentation,
     ToolInspectorTab,
 )
 from neuro_code.shared.ui_language import UiLanguage
-from neuro_code.tui_text import ui_text
 
 
 class ToolInspectorScreen(ModalScreen[None]):

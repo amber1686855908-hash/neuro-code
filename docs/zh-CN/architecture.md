@@ -53,57 +53,26 @@ shared owner，同时不改变语言值或持久化行为。
 原 `neuro_code.permissions` 模块也已移除；权限策略只从
 `neuro_code.application.permissions.policy` 提供。
 
-阶段 2B 将 `neuro_code.bootstrap.entrypoints` 建立为 canonical 的 CLI/TUI 启动入口，console
-scripts 和 `python -m neuro_code` 都直接使用它。它只在相应命令实际需要时选择应用组合、SQLite
-会话存储、历史会话导入器、TUI 设置/目录/偏好端口和工作区身份行为。`neuro_code.cli` 保留参数
-解析、分发、渲染和退出码处理；其注入式 `run` 函数由 canonical bootstrap entrypoint 调用。导入
-CLI 不会加载 bootstrap、adapters 或 providers，也不会创建资源。
+第一版发布前的 Architecture Completion 让三个入站适配器都拥有明确的 canonical 路径。
+`neuro_code.interfaces.cli.app` 负责 CLI 参数解析、分发、展示和退出码；
+`interfaces.cli.sessions` 通过窄的 `SessionCliServices` contract 负责已解析的 `sessions` 执行边界。
+`neuro_code.interfaces.tui.app`、`commands`、`text` 和 `theme` 负责 TUI；队列式
+`TuiUserInteraction` 仍是用户交互端口的入站适配器。`neuro_code.interfaces.acp.agent` 负责 ACP
+协议 Agent，并把 content、event projection、client I/O、MCP declaration conversion、transport
+和 per-session runtime state 委托给明确的 ACP 子模块。根级的
+`neuro_code.cli`、`neuro_code.tui`、`neuro_code.acp`、`neuro_code.tui_commands`、
+`neuro_code.tui_text` 和 `neuro_code.tui_theme` 实现模块已删除；不存在继续拥有实现权威的兼容 wrapper。
 
-已解析的 `sessions` command execution boundary 现在由
-`neuro_code.interfaces.cli.sessions` 作为 canonical owner。其
-`run_sessions_command` entrypoint 只依赖窄的 `SessionCliServices` contract，取得配置、会话
-存储、有界 tool-output artifact service 和已打开的 application。它拥有既有的 list、search、rename、
-compact、artifacts 与 recovery operation，以及这些 operation 的 validation、output、bounds 和
-cleanup behavior。Parser grammar 与顶层 dispatch 仍保留在 `neuro_code.cli`；其 private
-`_sessions_command` name 是指向 canonical entrypoint 的 identity-preserving alias。Canonical command
-复用 `neuro_code.interfaces.cli.serialization`。这只是 execution-boundary extraction：
-`neuro_code.cli` 还不是完整的 compatibility facade，其余 command 仍保留原位置。
-
-阶段 2C 保持 `neuro_code.acp` 原位置，作为 ACP/JSON-RPC 入站适配器，但只向它提供
-`application.acp` 契约和 ACP 专用应用服务。该服务暴露绑定创建和安全恢复准备、会话别名与列表、
-工作区校验、协议元数据以及按会话惰性创建的 MCP 工具上下文。`bootstrap.entrypoints` 将
-`ApplicationComposition`、会话存储、工作区身份校验和具体 stdio MCP 工具集合适配到这些契约，
-随后启动 server。`serve_acp` 只接受所得的 `AcpApplicationService`，不再适配
-`ApplicationComposition` 调用方。ACP 不再导入 MCP 或工作区实现，也不再直接读取组合根配置或存储；导入 ACP 不会
-加载 bootstrap、MCP adapter、SQLite 存储或 providers。
-
-ACP prompt/content 校验与转换由 `neuro_code.interfaces.acp.content` 作为 canonical owner，持久
-history 和实时 event projection 则由 `neuro_code.interfaces.acp.updates` 作为 canonical owner；
-`neuro_code.interfaces.acp.client_io` 现在作为 capability-gated client filesystem 与 terminal
-adapter 的 canonical owner，同时拥有 adapter-local bounds 和 terminal task lifecycle state。
-`neuro_code.acp` 以 private compatibility alias 导入相同的 symbol。
-`neuro_code.interfaces.acp.transport` 现在作为 ACP SDK connection adapter、stdio framing、
-WebSocket newline-JSON bridge、transport-local bounds 以及外层 transport close/shutdown lifecycle
-的 canonical owner。Transport 接收已经构造好的 Agent 或 Agent factory；它不构造 session，也不执行
-capability negotiation。`neuro_code.acp` 保留 service-to-Agent public wrapper，并以 private
-compatibility alias 导入 transport symbol。
-`neuro_code.interfaces.acp.session.AcpSessionRuntime` 现在作为 per-session 可变 interface state、
-resource reference、runtime lock、prompt/cancel/approval presentation state、identity transition 和
-aggregate cleanup 的 canonical owner。`NeuroCodeAcpAgent` 继续拥有 protocol connection attachment、
-capability、registry、
-publication、外层 lifecycle routing、extension dispatch、live MCP orchestration 和 protocol-agent
-semantics；
-`SessionTurnService`/`ConversationRunner` 继续拥有实际 turn 与 recovery authority。
-`neuro_code.interfaces.acp.mcp_config` 现在作为从 ACP MCP declaration 到 application MCP
-configuration contract 的无状态有界转换 canonical owner。`neuro_code.acp` 提供 protected-environment
-集合并保留 caller、capability negotiation、session registry、publication 与外层 lifecycle routing、
-permission request coordination、live MCP 以及 service-to-Agent compatibility wrapper。因此
-`neuro_code.acp` 仍是混合适配器，而不是 facade。详见 [ADR 0145](adr/0145-acp-prompt-content-boundary.md)、
-[ADR 0146](adr/0146-acp-update-and-event-projection-boundary.md)、
-[ADR 0147](adr/0147-acp-client-io-adapter-boundary.md)、
-[ADR 0148](adr/0148-acp-mcp-configuration-boundary.md) 以及
+进程与资源 wiring 已与入站行为分离。console scripts 和 `python -m neuro_code` 调用
+`neuro_code.bootstrap.entrypoints` 中的惰性 launcher；具体 CLI/TUI service 选择位于
+`bootstrap.cli`，ACP workspace/MCP composition adapter 位于 `bootstrap.acp`，默认 concrete
+factory 选择位于 `bootstrap.factories`，唯一共享资源图仍由 `bootstrap.composition` 拥有。
+导入 interface 模块不会装配 bootstrap 或 concrete infrastructure。详见
+[ADR 0145](adr/0145-acp-prompt-content-boundary.md)、[ADR 0146](adr/0146-acp-update-and-event-projection-boundary.md)、
+[ADR 0147](adr/0147-acp-client-io-adapter-boundary.md)、[ADR 0148](adr/0148-acp-mcp-configuration-boundary.md)、
 [ADR 0150](adr/0150-acp-session-runtime-ownership-boundary.md) 和
-[ADR 0151](adr/0151-acp-transport-boundary.md)。
+[ADR 0151](adr/0151-acp-transport-boundary.md) 以及
+[ADR 0153](adr/0153-architecture-completion.md)。
 
 Agent harness 行为现阶段位于 `neuro_code.application.runtime` 的明确 canonical 子模块：
 `background_task_reminders`、`agent`、`conversation` 以及循环、上下文、工具和终结模块。
@@ -158,30 +127,36 @@ identity 的兼容导出。执行记录写入、schema、事务、Runtime、Prov
 明确的 canonical 子模块获得。`neuro_code.application.runtime.__init__` 现阶段保持最小，
 不提供 aggregate API；内部生产代码直接导入 canonical 子模块。
 
-`neuro_code.configuration.app` 负责 `AppConfig` 和 `ProviderProfile`、TOML 与 CC Switch
-配置、环境覆盖、路由、managed overlay、sandbox 策略、stored credential 注入以及 HTTP
-proxy policy。`neuro_code.configuration.managed_provider_settings` 中的同步 managed JSON
-reader 负责 schema、protocol 和 dialect 检查、文件大小限制、metadata/credentials 合并、
-结构校验以及 `ManagedProviderSettings` 构造。managed provider 值对象和持久化契约的
+`neuro_code.application.ports.configuration` 负责不可变的 `AppConfig` 和 `ProviderProfile`
+契约、校验以及显式输入的 proxy policy；它不会读取进程环境、探测可选包或解析文件系统路径。
+`neuro_code.bootstrap.configuration` 中的 loader 负责 TOML、CC Switch、环境覆盖、路由、
+managed overlay、路径解析、sandbox 选择和 stored credential 注入。具体环境凭据和可选 HTTP
+能力由 `neuro_code.infrastructure.providers.binding` 在创建 Provider 适配器前解析。
+`neuro_code.infrastructure.providers.managed_provider_settings` 中的同步 managed JSON reader
+负责 schema、protocol 和 dialect 检查、文件大小限制、metadata/credentials 合并、结构校验以及
+`ManagedProviderSettings` 构造。legacy dialect 推断位于
+`neuro_code.application.ports.provider_dialects`。managed provider 值对象和持久化契约的
 canonical owner 是
 `neuro_code.application.ports.provider_settings`；原
 `neuro_code.domain.provider_settings` facade 已移除。这样配置和基础设施消费者
 都通过 application port 边界工作，同时不改变校验或持久化行为。
 `JsonProviderSettingsStore` 由 `neuro_code.infrastructure.providers.provider_settings` 负责，
 包括异步持久化、原子写入和 POSIX 私有权限。它通过私有绑定使用 canonical reader。
-导入 provider-settings adapter。原 `neuro_code.config` facade 已移除，调用方应直接使用
-`neuro_code.configuration.app`；该边界中的 `ProviderProfile` 和 `AppConfig` 取代已移除的
-`ProviderConfig` alias。当前 active temporary allowlist 为空。唯一剩余的 raw forbidden edge
+顶层 `neuro_code.configuration` package 与 `neuro_code.config` compatibility import 均不存在；
+该边界中的 `ProviderProfile` 和 `AppConfig` 取代已移除的 `ProviderConfig` alias。当前 active
+temporary allowlist 为空。唯一剩余的 raw forbidden edge
 是 canonical package-executable entrypoint：
 `neuro_code.__main__ -> neuro_code.bootstrap.entrypoints`；它不属于待清除的兼容债务。
 
-`bootstrap.composition` 中的 `ApplicationComposition` 会解析配置与供应商 override、执行
-会话沙箱预检、初始化 SQLite、创建供应商/工具/权限管理器和会话作用域后台任务注册表，并持有
-监督器关闭责任。阶段 2A 只改变其结构归属，初始化和失败清理顺序保持不变。CLI、TUI 和 ACP
-继续共享同一服务和带类型运行时事件流。
+`bootstrap.composition` 中的 `ApplicationComposition` 仍是共享资源图的唯一 owner：它解析已加载的
+配置与供应商 override、执行会话沙箱预检、初始化 SQLite、创建供应商/工具/权限管理器和会话作用域
+后台任务注册表，并持有监督器关闭责任。`bootstrap.factories` 只负责默认 concrete factory 选择，
+`bootstrap.cli` 和 `bootstrap.acp` 将这些选择适配到入站服务。初始化和失败清理顺序保持不变，
+CLI、TUI 和 ACP 继续共享同一服务和带类型运行时事件流。
 
 完整依赖规则、兼容迁移策略和 allowlist 纪律见
-[ADR 0049](adr/0049-progressive-architecture-boundaries.md)。
+[ADR 0049](adr/0049-progressive-architecture-boundaries.md) 和
+[ADR 0153](adr/0153-architecture-completion.md)。
 
 ## 运行时事件模型
 
@@ -472,9 +447,9 @@ framing、dispatch、Schema 与 normalization。适配器声明
 和 `session/close`。SDK 0.11 把 fork、resume 和 close 置于
 `use_unstable_protocol` 门后；其生成 Schema 已包含稳定 delete 模型，但 Agent router
 漏掉了该路由，因此 canonical transport 只把生成的 delete request 加到官方 `MessageRouter`；
-SDK stream、`Connection`、dispatcher、Schema、framing 与错误规范化保持不变。旧的
-`neuro_code.acp` server function 继续作为 service-to-Agent 的薄 wrapper，并保留既有 private
-transport alias 供兼容调用方使用。
+SDK stream、`Connection`、dispatcher、Schema、framing 与错误规范化保持不变。canonical 的
+`neuro_code.interfaces.acp.agent` server function 继续作为 service-to-Agent 的薄 wrapper，并保留
+既有 private transport alias 供受支持的进程内调用方使用。
 
 每条 ACP 连接固定绑定到规范化后的启动工作区。每个成功 session 拥有稳定随机 ACP ID、
 一个 `AgentConversation`、一个后台任务 scope、一个活动 prompt 槽位，以及独立审批/

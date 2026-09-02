@@ -5,10 +5,10 @@ ACP 客户端拥有的文件系统和终端适配器.
 This module is the canonical interface-layer owner for the bounded ACP client
 I/O ports. It adapts the ACP SDK client to the existing application ports while
 keeping capability negotiation, session publication, tool registration, and
-session cleanup in ``neuro_code.acp``.
+session cleanup in ``neuro_code.interfaces.acp.agent``.
 本模块是有界 ACP 客户端 I/O port 的规范 interface-layer 所有者. 它把 ACP SDK
 client 适配到既有 application port,同时将能力协商、session 发布、工具注册和
-session 清理保留在 ``neuro_code.acp``.
+session 清理保留在 ``neuro_code.interfaces.acp.agent``.
 """
 
 from __future__ import annotations

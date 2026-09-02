@@ -9,8 +9,9 @@ from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING
 
+from neuro_code.application.ports.configuration import AppConfig, ProviderProfile
 from neuro_code.application.ports.model import ModelCapabilitySet, ModelProvider
-from neuro_code.configuration.app import AppConfig, ProviderProfile
+from neuro_code.infrastructure.providers.binding import resolve_provider_binding
 from neuro_code.shared.errors import ConfigurationError
 
 if TYPE_CHECKING:
@@ -64,8 +65,9 @@ def create_provider(
 
     根据已验证的配置档案构建一个具体 Provider."""
 
-    api_key = config.api_key()
-    http_policy = config.http_client_policy()
+    binding = resolve_provider_binding(config)
+    api_key = binding.api_key
+    http_policy = binding.http_policy
     capabilities = _runtime_capabilities(config)
     if config.protocol == "openai-chat":
         from neuro_code.infrastructure.providers.openai_compatible import (

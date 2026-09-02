@@ -9,6 +9,7 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Protocol
 
+from neuro_code.interfaces.tui.text import ui_text
 from neuro_code.interfaces.tui.tool_activity.models import (
     ToolCallSnapshot,
     ToolPeekLine,
@@ -16,7 +17,6 @@ from neuro_code.interfaces.tui.tool_activity.models import (
 )
 from neuro_code.shared.redaction import redact_sensitive_text
 from neuro_code.shared.ui_language import UiLanguage
-from neuro_code.tui_text import ui_text
 
 _ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _LINE_CHARACTER_BUDGET = 180

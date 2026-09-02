@@ -14,6 +14,7 @@ from neuro_code.application.permissions.policy import (
     PermissionManager,
     PermissionRule,
 )
+from neuro_code.application.ports.configuration import AppConfig
 from neuro_code.application.ports.lsp import (
     LanguageServerProfile,
     LspError,
@@ -21,7 +22,6 @@ from neuro_code.application.ports.lsp import (
     LspOperation,
     LspRequest,
 )
-from neuro_code.configuration.app import AppConfig
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.infrastructure.lsp.manager import LanguageServerManager
 from neuro_code.infrastructure.lsp.positions import PositionEncoding

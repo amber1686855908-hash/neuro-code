@@ -26,7 +26,7 @@ from neuro_code.application.ports.windows_sandbox import (
     WindowsSandboxSetupSnapshot,
     WindowsSandboxSetupState,
 )
-from neuro_code.bootstrap.composition import _default_local_process_sandbox_factory
+from neuro_code.bootstrap.factories import _default_local_process_sandbox_factory
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.terminal.models import TerminalSize
 from neuro_code.infrastructure.sandbox.windows_native_local_process import (
@@ -676,11 +676,11 @@ class WindowsNativeRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
             root.mkdir()
             with (
                 mock.patch(
-                    "neuro_code.bootstrap.composition._runtime_platform",
+                    "neuro_code.bootstrap.factories._runtime_platform",
                     return_value="win32",
                 ),
                 mock.patch(
-                    "neuro_code.bootstrap.composition.WindowsNativeLocalProcessSandbox"
+                    "neuro_code.bootstrap.factories.WindowsNativeLocalProcessSandbox"
                 ) as adapter,
             ):
                 result = _default_local_process_sandbox_factory(

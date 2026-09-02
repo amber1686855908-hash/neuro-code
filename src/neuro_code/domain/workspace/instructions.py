@@ -13,8 +13,9 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from enum import StrEnum
-from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
+
+from neuro_code.domain.workspace.paths import normalize_relative_path
 
 if TYPE_CHECKING:
     from neuro_code.domain.conversation.messages import Message
@@ -211,13 +212,6 @@ def compute_instruction_fingerprint(files: tuple[InstructionFile, ...]) -> str:
         hasher.update(instruction_file.content.encode("utf-8"))
         hasher.update(b"\x00")
     return hasher.hexdigest()
-
-
-def normalize_relative_path(path: PurePosixPath) -> str:
-    """Return a normalized POSIX-style relative path string.
-
-    返回规范化的 POSIX 风格相对路径字符串."""
-    return str(path)
 
 
 __all__ = [
