@@ -2557,7 +2557,17 @@ def test_sessions_execution_boundary_is_canonical_and_identity_preserving() -> N
 
     cli = importlib.import_module("neuro_code.interfaces.cli.app")
     sessions = importlib.import_module("neuro_code.interfaces.cli.sessions")
-    assert cli._sessions_command is sessions.run_sessions_command
+    assert not hasattr(cli, "_sessions_command")
+    assert sessions.run_sessions_command.__module__ == "neuro_code.interfaces.cli.sessions"
+
+
+def test_cli_facade_preserves_public_entrypoints_and_canonical_owners() -> None:
+    cli = importlib.import_module("neuro_code.interfaces.cli.app")
+    parser = importlib.import_module("neuro_code.interfaces.cli.parser")
+    dispatch = importlib.import_module("neuro_code.interfaces.cli.dispatch")
+
+    assert cli.build_parser is parser.build_parser
+    assert cli.run is dispatch.run
 
 
 def test_importing_acp_does_not_load_bootstrap_or_selected_concrete_dependencies() -> None:

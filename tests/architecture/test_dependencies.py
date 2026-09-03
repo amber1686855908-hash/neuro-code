@@ -213,6 +213,50 @@ _TUI_CANONICAL_CLASS_OWNERS = {
     "RuntimeControllerMixin": "neuro_code.interfaces.tui.controllers.runtime",
 }
 
+_CLI_CANONICAL_FUNCTION_OWNERS = {
+    "_add_acp_arguments": "neuro_code.interfaces.cli.parser",
+    "_add_run_arguments": "neuro_code.interfaces.cli.parser",
+    "_subagent_steps": "neuro_code.interfaces.cli.parser",
+    "_application_settings": "neuro_code.interfaces.cli.settings",
+    "_execution_control_mode": "neuro_code.interfaces.cli.settings",
+    "_normalize_rule": "neuro_code.interfaces.cli.settings",
+    "_rules": "neuro_code.interfaces.cli.settings",
+    "_completion_script": "neuro_code.interfaces.cli.inspection",
+    "_instruction_lines": "neuro_code.interfaces.cli.inspection",
+    "_plain_config": "neuro_code.interfaces.cli.inspection",
+    "_provider_rows": "neuro_code.interfaces.cli.inspection",
+    "_skill_lines": "neuro_code.interfaces.cli.inspection",
+    "_version_payload": "neuro_code.interfaces.cli.inspection",
+    "_run_acp": "neuro_code.interfaces.cli.dispatch",
+    "build_parser": "neuro_code.interfaces.cli.parser",
+    "run": "neuro_code.interfaces.cli.dispatch",
+    "run_agent": "neuro_code.interfaces.cli.agent",
+    "run_completions_command": "neuro_code.interfaces.cli.inspection",
+    "run_inspect_command": "neuro_code.interfaces.cli.inspection",
+    "run_providers_command": "neuro_code.interfaces.cli.inspection",
+    "run_version_command": "neuro_code.interfaces.cli.inspection",
+    "export_session": "neuro_code.interfaces.cli.session_io",
+    "import_session": "neuro_code.interfaces.cli.session_io",
+    "run_subagent": "neuro_code.interfaces.cli.subagents",
+    "run_subagent_lifecycle": "neuro_code.interfaces.cli.subagents",
+    "run_sessions_command": "neuro_code.interfaces.cli.sessions",
+}
+
+_CLI_COMMAND_MODULES = frozenset(
+    {
+        "neuro_code.interfaces.cli.agent",
+        "neuro_code.interfaces.cli.contracts",
+        "neuro_code.interfaces.cli.dispatch",
+        "neuro_code.interfaces.cli.inspection",
+        "neuro_code.interfaces.cli.interaction",
+        "neuro_code.interfaces.cli.parser",
+        "neuro_code.interfaces.cli.session_io",
+        "neuro_code.interfaces.cli.sessions",
+        "neuro_code.interfaces.cli.settings",
+        "neuro_code.interfaces.cli.subagents",
+    }
+)
+
 _BOOTSTRAP_COMPOSITION_MIXIN_OWNERS = {
     "neuro_code.bootstrap.composition_bindings": (
         "CompositionBindingMixin",
@@ -366,6 +410,73 @@ def test_tui_controllers_do_not_import_the_app_module() -> None:
             continue
         imports = _internal_imports(path, source=module, known_modules=known_modules)
         assert "neuro_code.interfaces.tui.app" not in imports
+
+
+def test_cli_canonical_function_ownership_is_unique() -> None:
+    modules = _source_modules()
+    definitions: dict[str, list[str]] = {}
+    for module, path in modules.items():
+        if not module.startswith("neuro_code.interfaces.cli"):
+            continue
+        for name in _top_level_function_names(path):
+            definitions.setdefault(name, []).append(module)
+
+    for name, expected_module in _CLI_CANONICAL_FUNCTION_OWNERS.items():
+        assert definitions.get(name) == [expected_module]
+
+
+def test_cli_app_is_only_a_facade() -> None:
+    modules = _source_modules()
+    app_path = modules["neuro_code.interfaces.cli.app"]
+    assert _top_level_classes(app_path) == set()
+    assert _top_level_function_names(app_path) == set()
+
+
+def test_cli_parser_registration_is_owned_by_parser_module() -> None:
+    modules = _source_modules()
+    cli_modules = {
+        module
+        for module in modules
+        if module.startswith("neuro_code.interfaces.cli.")
+        and module
+        not in {
+            "neuro_code.interfaces.cli.parser",
+            "neuro_code.interfaces.cli.dispatch",
+        }
+    }
+    for module in cli_modules:
+        tree = ast.parse(modules[module].read_text(encoding="utf-8"), filename=str(modules[module]))
+        registrations = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"add_argument", "add_parser", "add_subparsers", "parse_args"}
+        ]
+        assert not registrations, f"CLI parser construction/parsing leaked into {module}"
+
+    dispatch_tree = ast.parse(
+        modules["neuro_code.interfaces.cli.dispatch"].read_text(encoding="utf-8"),
+        filename=str(modules["neuro_code.interfaces.cli.dispatch"]),
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "parse_args"
+        for node in ast.walk(dispatch_tree)
+    )
+
+
+def test_cli_command_modules_do_not_import_the_facade() -> None:
+    modules = _source_modules()
+    known_modules = frozenset(modules)
+    for module in _CLI_COMMAND_MODULES:
+        imports = _runtime_internal_imports(
+            modules[module],
+            source=module,
+            known_modules=known_modules,
+        )
+        assert "neuro_code.interfaces.cli.app" not in imports, module
 
 
 def test_bootstrap_composition_has_disjoint_canonical_owners() -> None:
@@ -2066,10 +2177,79 @@ def test_canonical_runtime_consumers_use_explicit_submodules() -> None:
             "neuro_code.interfaces.tui.widgets",
         },
         "neuro_code.interfaces.cli.app": {
+            "neuro_code.interfaces.cli.dispatch",
+            "neuro_code.interfaces.cli.parser",
+        },
+        "neuro_code.interfaces.cli.agent": {
+            "neuro_code.application.runtime.agent",
+            "neuro_code.application.sessions.service",
+            "neuro_code.application.sessions.turns",
+            "neuro_code.interfaces.cli.contracts",
+            "neuro_code.interfaces.cli.interaction",
+            "neuro_code.interfaces.cli.serialization",
+            "neuro_code.interfaces.cli.settings",
+            "neuro_code.shared.errors",
+        },
+        "neuro_code.interfaces.cli.contracts": {
+            "neuro_code.application.ports.configuration",
+            "neuro_code.application.ports.storage",
+            "neuro_code.application.settings",
+            "neuro_code.application.tools.service",
+            "neuro_code.domain.sessions",
+            "neuro_code.domain.workspace.instructions",
+            "neuro_code.domain.workspace.skills",
+        },
+        "neuro_code.interfaces.cli.dispatch": {
+            "neuro_code.interfaces.cli.agent",
+            "neuro_code.interfaces.cli.contracts",
+            "neuro_code.interfaces.cli.inspection",
+            "neuro_code.interfaces.cli.parser",
+            "neuro_code.interfaces.cli.session_io",
+            "neuro_code.interfaces.cli.sessions",
+            "neuro_code.interfaces.cli.settings",
+            "neuro_code.interfaces.cli.subagents",
+            "neuro_code.shared.errors",
+        },
+        "neuro_code.interfaces.cli.inspection": {
+            "neuro_code.application.ports.configuration",
+            "neuro_code.interfaces.cli.contracts",
+            "neuro_code.shared.errors",
+        },
+        "neuro_code.interfaces.cli.interaction": {
+            "neuro_code.application.ports.user_interaction",
+        },
+        "neuro_code.interfaces.cli.parser": {
+            "neuro_code.application.execution_policy",
+            "neuro_code.application.ports.tools",
+            "neuro_code.application.runtime.supervision",
+            "neuro_code.application.sessions.subagent_lifecycle",
+            "neuro_code.application.workflows.subagent",
+            "neuro_code.domain.conversation.reasoning",
+            "neuro_code.domain.sandbox.models",
+        },
+        "neuro_code.interfaces.cli.session_io": {
             "neuro_code.application.sessions.lifecycle",
             "neuro_code.application.sessions.service",
-            "neuro_code.application.tools.service",
-            "neuro_code.interfaces.cli.sessions",
+            "neuro_code.interfaces.cli.contracts",
+            "neuro_code.interfaces.cli.serialization",
+        },
+        "neuro_code.interfaces.cli.settings": {
+            "neuro_code.application.execution_policy",
+            "neuro_code.application.permissions.policy",
+            "neuro_code.application.runtime.supervision",
+            "neuro_code.application.settings",
+            "neuro_code.domain.conversation.reasoning",
+            "neuro_code.interfaces.cli.parser",
+            "neuro_code.shared.errors",
+        },
+        "neuro_code.interfaces.cli.subagents": {
+            "neuro_code.application.sessions.subagent_lifecycle",
+            "neuro_code.application.settings",
+            "neuro_code.application.workflows.subagent",
+            "neuro_code.interfaces.cli.contracts",
+            "neuro_code.interfaces.cli.serialization",
+            "neuro_code.interfaces.cli.settings",
+            "neuro_code.shared.errors",
         },
         "neuro_code.interfaces.cli.serialization": {
             "neuro_code.application.sessions.catalog",

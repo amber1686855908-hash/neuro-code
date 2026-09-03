@@ -54,8 +54,14 @@ shared owner，同时不改变语言值或持久化行为。
 `neuro_code.application.permissions.policy` 提供。
 
 第一版发布前的 Architecture Completion 让三个入站适配器都拥有明确的 canonical 路径。
-`neuro_code.interfaces.cli.app` 负责 CLI 参数解析、分发、展示和退出码；
-`interfaces.cli.sessions` 通过窄的 `SessionCliServices` contract 负责已解析的 `sessions` 执行边界。
+`neuro_code.interfaces.cli.app` 是保留既有 parser 和 runner 导入点的薄 public facade。
+`interfaces.cli.parser` 负责完整 CLI grammar 与 defaults；`interfaces.cli.settings` 负责将已解析选项
+转换为 application settings 和权限规则；`interfaces.cli.dispatch` 负责顶层路由以及 exit-code/error mapping；
+`interfaces.cli.agent`、`interfaces.cli.subagents` 与 `interfaces.cli.session_io` 分别负责无头 Agent、子代理和
+session 导入/导出 command family。只读的 version、inspect、completion 与 provider presentation 由
+`interfaces.cli.inspection` 负责；`interfaces.cli.sessions` 通过窄的 `SessionCliServices` contract 负责已解析的
+`sessions` 执行边界。`interfaces.cli.contracts` 与 `interfaces.cli.interaction` 分别负责共享 CLI contract 和
+终端 stdin adapter；`interfaces.cli.serialization` 继续是有界 projection 的 canonical owner。
 `neuro_code.interfaces.tui.app` 只负责 Textual app lifecycle、high-level wiring 和 app-owned state。
 TUI contract 与本地 state 位于 `interfaces.tui.contracts`、`interfaces.tui.interaction` 和
 `interfaces.tui.state`；widgets 与 modal surface 位于 `interfaces.tui.widgets` 和

@@ -327,7 +327,7 @@ class UserInteractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(text_response.text, "because it is safer")
 
     async def test_cli_noninteractive_adapter_fails_closed(self) -> None:
-        from neuro_code.interfaces.cli.app import CliUserInteraction
+        from neuro_code.interfaces.cli.interaction import CliUserInteraction
 
         with self.assertRaises(InteractionUnavailable):
             await CliUserInteraction(interactive=False).request(
