@@ -92,7 +92,13 @@ scripts and `python -m neuro_code` call the lazy launcher in
 `neuro_code.bootstrap.entrypoints`. Concrete CLI/TUI service selection lives in
 `bootstrap.cli`, ACP workspace/MCP composition adapters live in
 `bootstrap.acp`, default concrete factory choices live in `bootstrap.factories`,
-and the single shared resource graph remains in `bootstrap.composition`.
+and the public `ApplicationComposition` facade and shared-state assembly remain
+in `bootstrap.composition`. Its cohesive composition owners are
+`composition_lifecycle` (process resources and shutdown), `composition_bindings`
+(per-conversation binding construction), `composition_services` (application
+facades), `composition_subagents` and `composition_workflows`
+(subagent/workflow factories), and `composition_discovery` (instruction and
+skill discovery).
 Importing an interface module does not assemble bootstrap or concrete
 infrastructure. See [ADR 0145](adr/0145-acp-prompt-content-boundary.md),
 [ADR 0146](adr/0146-acp-update-and-event-projection-boundary.md),
@@ -228,15 +234,20 @@ is the canonical package-executable entrypoint,
 `neuro_code.__main__ -> neuro_code.bootstrap.entrypoints`; it is not
 compatibility debt.
 
-`ApplicationComposition` in `bootstrap.composition` remains the single owner of
-the shared resource graph: it resolves the loaded configuration and overrides,
-performs session-sandbox preflight, initializes SQLite, creates
-providers/tools/permission managers and conversation-scoped background-task
-registries, and owns supervisor shutdown. `bootstrap.factories` owns only the
-default concrete factory choices, while `bootstrap.cli` and `bootstrap.acp`
-adapt those choices to their inbound services. Initialization and
-failure-cleanup ordering is unchanged; CLI, TUI, and ACP continue to share the
-same services and typed runtime event stream.
+`ApplicationComposition` in `bootstrap.composition` remains the public
+composition root and owns the shared state graph as one explicit aggregate.
+`composition_lifecycle` owns configuration/session-store/background acquisition,
+initialization, and shutdown ordering; `composition_bindings` owns per-binding
+provider/tool/permission/runtime/LSP assembly; `composition_services` owns
+application service facades; `composition_subagents` and
+`composition_workflows` own the subagent and workflow factory families; and
+`composition_discovery` owns instruction/skill discovery. These are
+method-owning mixins over the same root instance, not additional runtime
+objects or a service locator. `bootstrap.factories` owns only the default
+concrete factory choices, while `bootstrap.cli` and `bootstrap.acp` adapt those
+choices to their inbound services. Initialization and failure-cleanup ordering
+is unchanged; CLI, TUI, and ACP continue to share the same services and typed
+runtime event stream.
 
 See [ADR 0049](adr/0049-progressive-architecture-boundaries.md) and
 [ADR 0153](adr/0153-architecture-completion.md) for the complete dependency

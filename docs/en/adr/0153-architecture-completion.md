@@ -72,8 +72,16 @@ Bootstrap has one explicit composition split:
 - `bootstrap.cli` selects concrete CLI/TUI services.
 - `bootstrap.acp` contains ACP workspace and MCP composition adapters.
 - `bootstrap.factories` owns default concrete factory selection.
-- `bootstrap.composition` remains the single owner of the shared resource
-  graph, lifecycle ordering, and failure cleanup.
+- `bootstrap.composition` remains the public composition root and owns shared
+  state assembly. `bootstrap.composition_lifecycle` owns process-resource
+  acquisition, initialization, shutdown ordering, and failure unwind;
+  `bootstrap.composition_bindings` owns per-conversation binding construction;
+  `bootstrap.composition_services` owns application service facades;
+  `bootstrap.composition_subagents` and `bootstrap.composition_workflows` own
+  the subagent/workflow factory families; and
+  `bootstrap.composition_discovery` owns instruction and skill discovery. These
+  are method-owning mixins over the same root instance, not a service locator or
+  additional runtime state owner.
 
 Architecture tests enforce the source-tree boundary and scan production imports
 for the forbidden directions `interfaces -> infrastructure/bootstrap`,

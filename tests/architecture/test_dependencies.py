@@ -213,6 +213,87 @@ _TUI_CANONICAL_CLASS_OWNERS = {
     "RuntimeControllerMixin": "neuro_code.interfaces.tui.controllers.runtime",
 }
 
+_BOOTSTRAP_COMPOSITION_MIXIN_OWNERS = {
+    "neuro_code.bootstrap.composition_bindings": (
+        "CompositionBindingMixin",
+        frozenset(
+            {
+                "create_local_process_sandbox",
+                "create_binding",
+                "config_for_session_resume",
+            }
+        ),
+    ),
+    "neuro_code.bootstrap.composition_services": (
+        "CompositionServicesMixin",
+        frozenset(
+            {
+                "create_worktree_service",
+                "create_workspace_checkpoint_service",
+                "create_result_adoption_service",
+                "create_tool_output_artifact_service",
+                "bind_provider_controller",
+                "bind_session_selection_controller",
+                "bind_plan_execution_controller",
+                "bind_plan_scheduling_controller",
+                "bind_queued_plan_execution_controller",
+                "session_service",
+                "session_summary_queries",
+            }
+        ),
+    ),
+    "neuro_code.bootstrap.composition_subagents": (
+        "CompositionSubagentMixin",
+        frozenset(
+            {
+                "subagent_global_policy",
+                "create_read_only_subagent_service",
+                "create_writable_subagent_service",
+                "create_subagent_scheduler",
+                "create_read_only_subagent_application_service",
+                "create_subagent_relationship_query_service",
+                "create_subagent_relationship_lifecycle_service",
+                "bind_subagent_executor",
+            }
+        ),
+    ),
+    "neuro_code.bootstrap.composition_workflows": (
+        "CompositionWorkflowMixin",
+        frozenset(
+            {
+                "create_task_dag_service",
+                "create_leader_service",
+                "create_model_planning_service",
+                "create_task_dag_replan_service",
+                "create_agent_swarm_service",
+                "create_ultracode_delegation_service",
+            }
+        ),
+    ),
+    "neuro_code.bootstrap.composition_discovery": (
+        "CompositionDiscoveryMixin",
+        frozenset(
+            {
+                "instruction_result",
+                "skill_result",
+                "default_instruction_discovery",
+                "default_skill_discovery",
+                "rediscover_instructions",
+                "rediscover_skills",
+            }
+        ),
+    ),
+    "neuro_code.bootstrap.composition_lifecycle": (
+        "CompositionLifecycleMixin",
+        frozenset({"open", "close"}),
+    ),
+}
+
+_BOOTSTRAP_COMPOSITION_PRIVATE_HELPER_OWNERS = {
+    "_without_main_inline_web_search": "neuro_code.bootstrap.composition_bindings",
+    "_without_main_inline_web_fetch": "neuro_code.bootstrap.composition_bindings",
+}
+
 
 def _top_level_classes(path: Path) -> set[str]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -230,6 +311,13 @@ def _class_method_names(path: Path) -> set[str]:
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
             )
     return names
+
+
+def _top_level_function_names(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return {
+        node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
 
 
 def test_tui_canonical_class_ownership_is_unique() -> None:
@@ -278,6 +366,101 @@ def test_tui_controllers_do_not_import_the_app_module() -> None:
             continue
         imports = _internal_imports(path, source=module, known_modules=known_modules)
         assert "neuro_code.interfaces.tui.app" not in imports
+
+
+def test_bootstrap_composition_has_disjoint_canonical_owners() -> None:
+    modules = _source_modules()
+    known_modules = frozenset(modules)
+    root_path = modules["neuro_code.bootstrap.composition"]
+    root_tree = ast.parse(root_path.read_text(encoding="utf-8"), filename=str(root_path))
+    root_classes = [node for node in root_tree.body if isinstance(node, ast.ClassDef)]
+    assert [node.name for node in root_classes] == ["ApplicationComposition"]
+    assert _class_method_names(root_path) == {"__init__"}
+    assert _top_level_function_names(root_path) == set()
+
+    contract_path = modules["neuro_code.bootstrap.composition_contracts"]
+    contract_tree = ast.parse(
+        contract_path.read_text(encoding="utf-8"), filename=str(contract_path)
+    )
+    contract_class = next(
+        node
+        for node in contract_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "CompositionRootMixin"
+    )
+    assert not any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) for node in contract_class.body
+    )
+    assert not _runtime_internal_imports(
+        contract_path,
+        source="neuro_code.bootstrap.composition_contracts",
+        known_modules=known_modules,
+    )
+
+    method_owners: dict[str, list[str]] = {}
+    for module, (class_name, expected_methods) in _BOOTSTRAP_COMPOSITION_MIXIN_OWNERS.items():
+        path = modules[module]
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
+        expected_classes = {class_name}
+        if module == "neuro_code.bootstrap.composition_workflows":
+            expected_classes.add("CompositionTaskDagWritableWorkerFactory")
+        assert set(classes) == expected_classes
+        actual_methods = {
+            node.name
+            for node in classes[class_name].body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        assert actual_methods == expected_methods
+        for method in actual_methods:
+            method_owners.setdefault(method, []).append(module)
+
+        assert "neuro_code.bootstrap.composition" not in _runtime_internal_imports(
+            path,
+            source=module,
+            known_modules=known_modules,
+        )
+
+    assert not {method: owners for method, owners in method_owners.items() if len(owners) > 1}
+    assert _top_level_function_names(modules["neuro_code.bootstrap.composition_bindings"]) == set(
+        _BOOTSTRAP_COMPOSITION_PRIVATE_HELPER_OWNERS
+    )
+    helper_owners: dict[str, list[str]] = {}
+    for module, path in modules.items():
+        for name in _top_level_function_names(path):
+            if name in _BOOTSTRAP_COMPOSITION_PRIVATE_HELPER_OWNERS:
+                helper_owners.setdefault(name, []).append(module)
+    assert helper_owners == {
+        name: [owner] for name, owner in _BOOTSTRAP_COMPOSITION_PRIVATE_HELPER_OWNERS.items()
+    }
+
+    workflow_factory = ast.parse(
+        modules["neuro_code.bootstrap.composition_workflows"].read_text(encoding="utf-8")
+    )
+    factory = next(
+        node
+        for node in workflow_factory.body
+        if isinstance(node, ast.ClassDef) and node.name == "CompositionTaskDagWritableWorkerFactory"
+    )
+    assert {
+        node.name
+        for node in factory.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    } == {"__init__", "create"}
+
+    canonical_class_names = {
+        "ApplicationComposition",
+        "CompositionTaskDagWritableWorkerFactory",
+    }
+    class_owners: dict[str, list[str]] = {}
+    for module, path in modules.items():
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name in canonical_class_names:
+                class_owners.setdefault(node.name, []).append(module)
+    assert class_owners == {
+        "ApplicationComposition": ["neuro_code.bootstrap.composition"],
+        "CompositionTaskDagWritableWorkerFactory": ["neuro_code.bootstrap.composition_workflows"],
+    }
 
 
 def _resolve_import_base(node: ast.ImportFrom, *, package: str) -> str | None:
@@ -1760,20 +1943,23 @@ def test_canonical_runtime_consumers_use_explicit_submodules() -> None:
             "neuro_code.application.providers.contracts",
         },
         "neuro_code.bootstrap.composition": {
-            "neuro_code.application.runtime.agent",
-            "neuro_code.application.providers.service",
+            "neuro_code.application.ports.background_tasks",
+            "neuro_code.application.ports.configuration",
+            "neuro_code.application.ports.instructions",
+            "neuro_code.application.ports.skills",
+            "neuro_code.application.ports.storage",
+            "neuro_code.application.sessions",
             "neuro_code.application.sessions.summary",
-            "neuro_code.application.sessions.conversation",
-            "neuro_code.application.sessions.binding",
-            "neuro_code.application.sessions.selection",
-            "neuro_code.application.sessions.subagent_queries",
-            "neuro_code.application.memory.instruction_tracker",
-            "neuro_code.application.memory.skill_tracker",
-            "neuro_code.application.tools.service",
-            "neuro_code.application.workflows.plan_execution",
-            "neuro_code.application.workflows.plan_scheduling",
-            "neuro_code.application.workflows.session_task_execution",
-            "neuro_code.application.workflows.subagent",
+            "neuro_code.application.settings",
+            "neuro_code.bootstrap.composition_bindings",
+            "neuro_code.bootstrap.composition_discovery",
+            "neuro_code.bootstrap.composition_lifecycle",
+            "neuro_code.bootstrap.composition_services",
+            "neuro_code.bootstrap.composition_subagents",
+            "neuro_code.bootstrap.composition_workflows",
+            "neuro_code.bootstrap.factories",
+            "neuro_code.infrastructure.lsp.manager",
+            "neuro_code.infrastructure.workspace.paths",
         },
         "neuro_code.bootstrap.cli": {
             "neuro_code.application.permissions.broker",

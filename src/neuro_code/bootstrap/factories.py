@@ -7,9 +7,7 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Callable
-from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from neuro_code.application.ports.background_tasks import BackgroundTaskSupervisor
 from neuro_code.application.ports.configuration import AppConfig
@@ -19,10 +17,6 @@ from neuro_code.application.ports.sandbox import LocalProcessSandbox
 from neuro_code.application.ports.skills import SkillDiscovery
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.workspace_changes import WorkspaceChangeObserver
-from neuro_code.application.workflows.task_dag import (
-    TaskDagWritableService,
-    TaskDagWritableWorkerFactory,
-)
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.infrastructure.background_tasks import LocalBackgroundTaskManager
 from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
@@ -37,10 +31,6 @@ from neuro_code.infrastructure.workspace.instructions import FilesystemInstructi
 from neuro_code.infrastructure.workspace.skills import FilesystemSkillDiscovery
 from neuro_code.shared.errors import SandboxError
 
-if TYPE_CHECKING:
-    from neuro_code.application.sessions.binding import ConversationBinding
-    from neuro_code.bootstrap.composition import ApplicationComposition
-
 ProviderFactory = Callable[["AppConfig", bool], ModelProvider]
 LocalProcessSandboxFactory = Callable[[SandboxProfile, Path, Path], LocalProcessSandbox]
 SessionStoreFactory = Callable[[Path], SessionStore]
@@ -52,48 +42,6 @@ WorkspaceChangeObserverFactory = Callable[[], WorkspaceChangeObserver]
 
 def _default_provider_factory(config: AppConfig, failover: bool) -> ModelProvider:
     return create_routed_provider(config, failover=failover)
-
-
-def _without_main_inline_web_search(config: AppConfig) -> AppConfig:
-    """Disable only MAIN hosted search for explicit sidecar/disabled modes."""
-
-    route = config.main_route
-    names = {route.provider_profile, *route.fallback_profiles}
-    profiles = dict(config.providers)
-    for name in names:
-        profile = profiles.get(name)
-        if profile is None or not ({"web_search", "google_search"} & set(profile.builtin_tools)):
-            continue
-        profiles[name] = replace(
-            profile,
-            builtin_tools=tuple(
-                tool_name
-                for tool_name in profile.builtin_tools
-                if tool_name not in {"web_search", "google_search"}
-            ),
-        )
-    return replace(config, providers=profiles)
-
-
-def _without_main_inline_web_fetch(config: AppConfig) -> AppConfig:
-    """Disable only MAIN hosted fetch tools for local/disabled modes."""
-
-    route = config.main_route
-    names = {route.provider_profile, *route.fallback_profiles}
-    profiles = dict(config.providers)
-    for name in names:
-        profile = profiles.get(name)
-        if profile is None or not ({"web_fetch", "url_context"} & set(profile.builtin_tools)):
-            continue
-        profiles[name] = replace(
-            profile,
-            builtin_tools=tuple(
-                tool_name
-                for tool_name in profile.builtin_tools
-                if tool_name not in {"web_fetch", "url_context"}
-            ),
-        )
-    return replace(config, providers=profiles)
 
 
 def _default_local_process_sandbox_factory(
@@ -153,25 +101,3 @@ def _default_skill_discovery_factory() -> SkillDiscovery:
 
 def _default_workspace_change_observer_factory() -> WorkspaceChangeObserver:
     return FilesystemWorkspaceChangeObserver()
-
-
-class CompositionTaskDagWritableWorkerFactory(TaskDagWritableWorkerFactory):
-    """Create one fresh Writable application owner per parallel DAG node."""
-
-    __slots__ = ("_composition", "_parent_binding", "_timeout_seconds")
-
-    def __init__(
-        self,
-        composition: ApplicationComposition,
-        parent_binding: ConversationBinding,
-        timeout_seconds: float,
-    ) -> None:
-        self._composition = composition
-        self._parent_binding = parent_binding
-        self._timeout_seconds = timeout_seconds
-
-    def create(self) -> TaskDagWritableService:
-        return self._composition.create_writable_subagent_service(
-            parent_binding=self._parent_binding,
-            timeout_seconds=self._timeout_seconds,
-        )
