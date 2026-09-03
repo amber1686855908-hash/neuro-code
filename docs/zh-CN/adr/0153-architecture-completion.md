@@ -24,8 +24,14 @@ package 根目录不再放置 production implementation module。源码根目录
 
 入站适配器的 canonical owner 如下：
 
-- `interfaces.cli.app` 负责 CLI parser、dispatch、展示和 exit-code handling；
-  `interfaces.cli.sessions` 负责已解析的 sessions command boundary。
+- `interfaces.cli.app` 是保留既有 parser 和 runner 导入点的薄 public facade。
+  `interfaces.cli.parser` 负责完整 CLI grammar 与 defaults；`interfaces.cli.settings` 负责已解析选项
+  转换和权限规则规范化；`interfaces.cli.dispatch` 负责顶层路由以及 exit-code/error mapping。
+  `interfaces.cli.agent`、`interfaces.cli.subagents` 与 `interfaces.cli.session_io` 分别负责无头 Agent、
+  子代理和 session 导入/导出 command family。`interfaces.cli.inspection` 负责只读 version、inspect、
+  completion 与 provider presentation；`interfaces.cli.sessions` 负责已解析的 sessions command boundary。
+  `interfaces.cli.contracts` 与 `interfaces.cli.interaction` 负责共享 CLI contract 和终端 stdin adapter，
+  `interfaces.cli.serialization` 继续负责有界 projection。
 - `interfaces.tui.app` 只负责 Textual lifecycle、high-level wiring 和 app-owned state。
   `interfaces.tui.contracts`、`interaction` 与 `state` 负责 TUI contract 和本地 model；
   `widgets` 与 `screens` 负责可复用的视觉 surface；`controllers` 按 reason to change 负责 turns、

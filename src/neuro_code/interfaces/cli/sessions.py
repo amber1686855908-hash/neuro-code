@@ -4,10 +4,12 @@ CLI sessions 命令已解析输入的规范执行边界.
 
 This module owns request validation, application-service selection, command
 execution, and presentation for the existing sessions command. Parser grammar
-and top-level dispatch remain in ``neuro_code.interfaces.cli.app``.
+and top-level dispatch live in ``neuro_code.interfaces.cli.parser`` and
+``neuro_code.interfaces.cli.dispatch``.
 
 本模块拥有既有 sessions 命令的请求校验、应用服务选择、命令执行和展示.
-Parser grammar 与顶层 dispatch 仍保留在 ``neuro_code.interfaces.cli.app``.
+Parser grammar 与顶层 dispatch 位于 ``neuro_code.interfaces.cli.parser`` 和
+``neuro_code.interfaces.cli.dispatch``.
 """
 
 from __future__ import annotations

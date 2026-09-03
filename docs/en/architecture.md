@@ -64,9 +64,20 @@ the former `neuro_code.permissions` module is removed; policy is available only
 from `neuro_code.application.permissions.policy`.
 
 The pre-v1 architecture completion makes the three inbound adapters explicit.
-`neuro_code.interfaces.cli.app` owns CLI parsing, dispatch, presentation, and
-exit-code handling; `interfaces.cli.sessions` owns the parsed `sessions`
-execution boundary through the narrow `SessionCliServices` contract.
+`neuro_code.interfaces.cli.app` is a thin public facade that preserves the
+established parser and runner import points. `interfaces.cli.parser` owns the
+complete CLI grammar and defaults; `interfaces.cli.settings` owns conversion
+of parsed options into application settings and permission rules;
+`interfaces.cli.dispatch` owns top-level routing and exit-code/error mapping;
+`interfaces.cli.agent`, `interfaces.cli.subagents`, and
+`interfaces.cli.session_io` own the headless-agent, subagent, and session
+import/export command families. Read-only version, inspect, completion, and
+provider presentation is owned by `interfaces.cli.inspection`, while
+`interfaces.cli.sessions` owns the parsed `sessions` execution boundary
+through the narrow `SessionCliServices` contract. `interfaces.cli.contracts`
+and `interfaces.cli.interaction` own the shared CLI contract and terminal
+stdin adapter; `interfaces.cli.serialization` remains the canonical bounded
+projection owner.
 `neuro_code.interfaces.tui.app` owns only the Textual app lifecycle, high-level
 wiring, and app-owned state. TUI contracts and local state live in
 `interfaces.tui.contracts`, `interfaces.tui.interaction`, and

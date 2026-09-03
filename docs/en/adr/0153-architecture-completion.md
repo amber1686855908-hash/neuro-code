@@ -29,8 +29,18 @@ tree contains only `__init__.py`, `__main__.py`, and the architectural packages:
 
 The inbound adapters have these canonical owners:
 
-- `interfaces.cli.app` owns CLI parsing, dispatch, presentation, and exit-code
-  handling; `interfaces.cli.sessions` owns the parsed sessions command boundary.
+- `interfaces.cli.app` is a thin public facade preserving the established
+  parser and runner import points. `interfaces.cli.parser` owns the complete
+  CLI grammar and defaults; `interfaces.cli.settings` owns parsed-option
+  conversion and permission-rule normalization; `interfaces.cli.dispatch`
+  owns top-level routing and exit-code/error mapping. `interfaces.cli.agent`,
+  `interfaces.cli.subagents`, and `interfaces.cli.session_io` own the
+  headless-agent, subagent, and session import/export command families.
+  `interfaces.cli.inspection` owns read-only version, inspect, completion, and
+  provider presentation; `interfaces.cli.sessions` owns the parsed sessions
+  command boundary. `interfaces.cli.contracts` and `interfaces.cli.interaction`
+  own shared CLI contracts and the terminal stdin adapter, while
+  `interfaces.cli.serialization` remains the bounded projection owner.
 - `interfaces.tui.app` owns only the Textual lifecycle, high-level wiring, and
   app-owned state. `interfaces.tui.contracts`, `interaction`, and `state` own
   TUI contracts and local models; `widgets` and `screens` own reusable visual

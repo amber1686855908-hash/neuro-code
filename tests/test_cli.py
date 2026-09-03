@@ -77,13 +77,8 @@ from neuro_code.infrastructure.persistence.output_artifacts import FileToolOutpu
 from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
 from neuro_code.infrastructure.providers.catalog_cache import PersistentProviderCatalog
 from neuro_code.infrastructure.providers.provider_settings import JsonProviderSettingsStore
+from neuro_code.interfaces.cli.agent import run_agent as _run_agent
 from neuro_code.interfaces.cli.app import (
-    _application_settings,
-    _execution_control_mode,
-    _normalize_rule,
-    _run_agent,
-    _run_subagent,
-    _run_subagent_lifecycle,
     build_parser,
     run,
 )
@@ -95,6 +90,17 @@ from neuro_code.interfaces.cli.serialization import (
     serialize_subagent_result,
 )
 from neuro_code.interfaces.cli.sessions import run_sessions_command
+from neuro_code.interfaces.cli.settings import (
+    _application_settings,
+    _execution_control_mode,
+    _normalize_rule,
+)
+from neuro_code.interfaces.cli.subagents import (
+    run_subagent as _run_subagent,
+)
+from neuro_code.interfaces.cli.subagents import (
+    run_subagent_lifecycle as _run_subagent_lifecycle,
+)
 from neuro_code.shared.errors import ConfigurationError, ProviderError
 from neuro_code.shared.ui_language import UiLanguage
 
