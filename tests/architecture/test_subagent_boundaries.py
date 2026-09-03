@@ -5,7 +5,7 @@ from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_ROOT = _PROJECT_ROOT / "src" / "neuro_code"
-_COMPOSITION_PATH = _SOURCE_ROOT / "bootstrap" / "composition.py"
+_COMPOSITION_PATH = _SOURCE_ROOT / "bootstrap" / "composition_subagents.py"
 
 
 def _called_symbol(function: ast.expr) -> str | None:

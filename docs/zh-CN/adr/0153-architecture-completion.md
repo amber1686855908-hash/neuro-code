@@ -58,7 +58,13 @@ Bootstrap 采用明确的 composition 拆分：
 - `bootstrap.cli` 负责具体 CLI/TUI service 选择。
 - `bootstrap.acp` 负责 ACP workspace 与 MCP composition adapter。
 - `bootstrap.factories` 负责默认 concrete factory 选择。
-- `bootstrap.composition` 仍是共享 resource graph、生命周期顺序和失败清理的唯一 owner。
+- `bootstrap.composition` 仍是公共组合根并负责共享 state assembly。
+  `bootstrap.composition_lifecycle` 负责进程资源获取、初始化、关闭顺序和失败 unwind；
+  `bootstrap.composition_bindings` 负责会话 binding 构造；
+  `bootstrap.composition_services` 负责 application service facade；
+  `bootstrap.composition_subagents` 与 `bootstrap.composition_workflows` 负责子代理/工作流 factory
+  family；`bootstrap.composition_discovery` 负责指令和技能发现。这些是同一个 root instance 上的
+  method-owning mixin，不是 service locator，也不拥有额外 runtime state。
 
 Architecture tests 强制执行源码树边界，并扫描 production import，禁止
 `interfaces -> infrastructure/bootstrap`、`application -> infrastructure/interfaces/bootstrap`、

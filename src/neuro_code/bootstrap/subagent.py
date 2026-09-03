@@ -38,7 +38,7 @@ from neuro_code.shared.errors import ConfigurationError
 
 if TYPE_CHECKING:
     from neuro_code.application.ports.configuration import AppConfig
-    from neuro_code.bootstrap.composition import ApplicationComposition
+    from neuro_code.bootstrap.composition_contracts import CompositionRootMixin
 
 
 READ_ONLY_SUBAGENT_TOOL_NAMES = (
@@ -102,7 +102,7 @@ class CompositionReadOnlySubagentRuntimeFactory(IsolatedSubagentRuntimeFactory):
 
     __slots__ = ("_composition",)
 
-    def __init__(self, composition: ApplicationComposition) -> None:
+    def __init__(self, composition: CompositionRootMixin) -> None:
         self._composition = composition
 
     def requested_capabilities(
@@ -232,7 +232,7 @@ class CompositionWritableSubagentRuntimeFactory(WritableSubagentRuntimeFactory):
 
     __slots__ = ("_composition",)
 
-    def __init__(self, composition: ApplicationComposition) -> None:
+    def __init__(self, composition: CompositionRootMixin) -> None:
         self._composition = composition
 
     async def create_session(

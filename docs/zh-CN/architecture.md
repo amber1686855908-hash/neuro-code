@@ -74,7 +74,11 @@ transport 和 per-session runtime state 分别由明确的 ACP 子模块作为 c
 进程与资源 wiring 已与入站行为分离。console scripts 和 `python -m neuro_code` 调用
 `neuro_code.bootstrap.entrypoints` 中的惰性 launcher；具体 CLI/TUI service 选择位于
 `bootstrap.cli`，ACP workspace/MCP composition adapter 位于 `bootstrap.acp`，默认 concrete
-factory 选择位于 `bootstrap.factories`，唯一共享资源图仍由 `bootstrap.composition` 拥有。
+factory 选择位于 `bootstrap.factories`。公共 `ApplicationComposition` facade 和共享 state assembly
+仍位于 `bootstrap.composition`；具体 composition owner 分别是 `composition_lifecycle`（进程资源和关闭）、
+`composition_bindings`（会话 binding 构造）、`composition_services`（应用 facade）、
+`composition_subagents` 与 `composition_workflows`（子代理/工作流 factory）以及
+`composition_discovery`（指令和技能发现）。
 导入 interface 模块不会装配 bootstrap 或 concrete infrastructure。详见
 [ADR 0145](adr/0145-acp-prompt-content-boundary.md)、[ADR 0146](adr/0146-acp-update-and-event-projection-boundary.md)、
 [ADR 0147](adr/0147-acp-client-io-adapter-boundary.md)、[ADR 0148](adr/0148-acp-mcp-configuration-boundary.md)、
@@ -156,10 +160,13 @@ temporary allowlist 为空。唯一剩余的 raw forbidden edge
 是 canonical package-executable entrypoint：
 `neuro_code.__main__ -> neuro_code.bootstrap.entrypoints`；它不属于待清除的兼容债务。
 
-`bootstrap.composition` 中的 `ApplicationComposition` 仍是共享资源图的唯一 owner：它解析已加载的
-配置与供应商 override、执行会话沙箱预检、初始化 SQLite、创建供应商/工具/权限管理器和会话作用域
-后台任务注册表，并持有监督器关闭责任。`bootstrap.factories` 只负责默认 concrete factory 选择，
-`bootstrap.cli` 和 `bootstrap.acp` 将这些选择适配到入站服务。初始化和失败清理顺序保持不变，
+`bootstrap.composition` 中的 `ApplicationComposition` 仍是公共组合根，并以一个显式 aggregate
+持有共享 state graph。`composition_lifecycle` 负责配置/session store/background 的获取、初始化和关闭顺序；
+`composition_bindings` 负责每个 binding 的 provider/tool/permission/runtime/LSP 组装；
+`composition_services` 负责 application service facade；`composition_subagents` 与 `composition_workflows`
+负责子代理和工作流 factory family；`composition_discovery` 负责指令/技能发现。这些是同一个 root instance
+上的 method-owning mixin，不是额外的 runtime object，也不是 service locator。`bootstrap.factories` 只负责默认
+concrete factory 选择，`bootstrap.cli` 和 `bootstrap.acp` 将这些选择适配到入站服务。初始化和失败清理顺序保持不变，
 CLI、TUI 和 ACP 继续共享同一服务和带类型运行时事件流。
 
 完整依赖规则、兼容迁移策略和 allowlist 纪律见
