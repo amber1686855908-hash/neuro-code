@@ -3,10 +3,12 @@
 ACP 传输和帧处理的规范边界.
 
 This module owns only the ACP SDK connection, stdio framing, and WebSocket
-framing/lifecycle adapters.  The injected agent remains the owner of ACP
-protocol semantics, capabilities, session state, and application orchestration.
+framing/lifecycle adapters.  The injected agent facade and its focused
+controllers own ACP protocol semantics, capabilities, session state, and
+application orchestration.
 本模块只负责 ACP SDK connection、stdio framing 以及 WebSocket framing/lifecycle
-适配. 注入的 Agent 仍负责 ACP 协议语义、能力、会话状态和 application 编排.
+适配. 注入的 Agent facade 及其专用控制器负责 ACP 协议语义、能力、会话状态和
+application 编排.
 """
 
 from __future__ import annotations

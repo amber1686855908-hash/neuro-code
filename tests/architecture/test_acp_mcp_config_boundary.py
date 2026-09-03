@@ -8,6 +8,7 @@ from neuro_code.application.acp.contracts import MAX_MCP_SERVERS
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _MCP_CONFIG_PATH = _PROJECT_ROOT / "src" / "neuro_code" / "interfaces" / "acp" / "mcp_config.py"
+_MCP_PATH = _PROJECT_ROOT / "src" / "neuro_code" / "interfaces" / "acp" / "mcp.py"
 _ACP_PATH = _PROJECT_ROOT / "src" / "neuro_code" / "interfaces" / "acp" / "agent.py"
 
 _MOVED_SYMBOLS = (
@@ -93,10 +94,18 @@ def test_mcp_configuration_definitions_are_absent_from_agent_module() -> None:
     assert not _defined_names(legacy_tree).intersection(_MOVED_SYMBOLS)
 
 
-def test_agent_supplies_protected_environment_and_retains_live_mcp_ownership() -> None:
-    source = _ACP_PATH.read_text(encoding="utf-8")
+def test_live_mcp_ownership_is_canonical_and_agent_only_delegates() -> None:
+    agent_source = _ACP_PATH.read_text(encoding="utf-8")
+    mcp_source = _MCP_PATH.read_text(encoding="utf-8")
 
-    assert "self._service.protected_environment_variables" in source
-    assert "self._open_mcp_tools" in source
-    assert "self._mcp_sampling_handler" in source
-    assert "self._mcp_elicitation_handler" in source
+    assert "class AcpMcpController" in mcp_source
+    assert "self._service.protected_environment_variables" in mcp_source
+    assert "def open_tools" in mcp_source
+    assert "def sampling_handler" in mcp_source
+    assert "def elicitation_handler" in mcp_source
+    assert "def extension" in mcp_source
+    assert "self._mcp.open_tools" in agent_source
+    assert "self._mcp.sampling_handler" in agent_source
+    assert "self._mcp.elicitation_handler" in agent_source
+    assert "self._service.protected_environment_variables" not in agent_source
+    assert "class AcpMcpController" not in agent_source

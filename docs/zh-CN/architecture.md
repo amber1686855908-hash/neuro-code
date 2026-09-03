@@ -64,9 +64,10 @@ TUI contract 与本地 state 位于 `interfaces.tui.contracts`、`interfaces.tui
 plans/tasks、background wake、transcript、runtime chrome，以及 tool activity 的 event/Inspector/presentation。
 既有 `commands`、`text`、`theme` 和 `tool_activity` 模块继续各自拥有 canonical implementation。
 队列式 `TuiUserInteraction` 仍是用户交互端口的入站适配器。
-`neuro_code.interfaces.acp.agent` 负责 ACP
-协议 Agent，并把 content、event projection、client I/O、MCP declaration conversion、transport
-和 per-session runtime state 委托给明确的 ACP 子模块。根级的
+`neuro_code.interfaces.acp.agent` 负责 public ACP protocol facade 与 high-level wiring。
+连接协商、session registry state、session lifecycle、实时 MCP handling、私有 extension dispatch、
+prompt/permission execution、content、event projection、client I/O、MCP declaration conversion、
+transport 和 per-session runtime state 分别由明确的 ACP 子模块作为 canonical owner。根级的
 `neuro_code.cli`、`neuro_code.tui`、`neuro_code.acp`、`neuro_code.tui_commands`、
 `neuro_code.tui_text` 和 `neuro_code.tui_theme` 实现模块已删除；不存在继续拥有实现权威的兼容 wrapper。
 
@@ -508,8 +509,14 @@ scope，释放运行时绑定，同时保留持久历史与 alias。EOF 或连�
 sandbox 都不会暴露这些工具，直接调用也会失败关闭，因此客户端终端不能弱化显式本地沙箱。交互式
 输入/resize、游标流式读取和 PTY framing/背压仍未支持。
 适配器实现及其 foreground/background lifecycle state 由
-`neuro_code.interfaces.acp.client_io` 作为 canonical owner；capability negotiation 与 session ownership
-仍保留在顶层 ACP adapter。详见 [ADR 0147](adr/0147-acp-client-io-adapter-boundary.md)。
+`neuro_code.interfaces.acp.client_io` 作为 canonical owner；连接协商由
+`neuro_code.interfaces.acp.negotiation` 负责，已发布 session identity/registry state 由
+`neuro_code.interfaces.acp.session_registry` 负责，session 创建/close/shutdown 编排由
+`neuro_code.interfaces.acp.session_lifecycle` 负责。实时 MCP callback/projection 位于
+`neuro_code.interfaces.acp.mcp`，私有 method dispatch 位于
+`neuro_code.interfaces.acp.extensions`，prompt/permission execution 位于
+`neuro_code.interfaces.acp.prompt`。顶层 `neuro_code.interfaces.acp.agent` 只保留 public Agent
+facade 与 high-level wiring。详见 [ADR 0147](adr/0147-acp-client-io-adapter-boundary.md)。
 
 非空 `mcpServers` 接受 ACP stdio、Streamable HTTP（`http`）和 legacy SSE（`sse`）
 结构；ACP 传输 server 会被确定性拒绝。每个 server 都必须在 session 发布前完成初始化，
@@ -525,7 +532,8 @@ session 时可以重新提供相同的临时 MCP 配置，但它不会作为历�
 service 接收 protected-environment 集合；不会扫描环境状态，也不会从 bootstrap、infrastructure、
 providers 或 stores 获取 authority。配置转换不执行任何 I/O。`MAX_MCP_SERVERS` 因 MCP runtime adapter
 也消费该共享 server-count bound，仍由 application contract 拥有；URL 与 serialized-configuration
-bound 可以被 live ACP projection 复用，但 live callback 或 MCP lifecycle code 不迁移。详见
+bound 可以被 live ACP projection 复用。实时 callback 与 MCP lifecycle 由
+`neuro_code.interfaces.acp.mcp` 单独拥有，因此 configuration conversion 保持无状态。详见
 [ADR 0148](adr/0148-acp-mcp-configuration-boundary.md)。
 
 官方 `mcp>=1.28.1,<2` SDK 持有 MCP Schema、`ClientSession`、版本协商、JSON-RPC 调度
@@ -583,9 +591,11 @@ reasoning、供应商保留上下文、任意参数、
 update 数、单字段和序列化总字节。
 
 历史投影与实时 `AgentEvent` allowlist 现在由 `neuro_code.interfaces.acp.updates` 实现。顶层
-ACP adapter 仍保留调用这些 projection 所需的 session-bound wiring、lifecycle、client capability
-和 MCP 职责；canonical transport 拥有 SDK connection 与 wire framing。本次提取是结构性变更，
-保留既有 ACP wire behavior；不增加 event kind，也不移动权限 authority。
+ACP Agent facade 只保留 public protocol method 与 high-level wiring；session-bound lifecycle、
+client capability negotiation、MCP handling、private extension dispatch 和 prompt/permission
+execution 分别由专用 ACP controller 所有。canonical transport 拥有 SDK connection 与 wire
+framing。本次提取是结构性变更，保留既有 ACP wire behavior；不增加 event kind，也不移动权限
+authority。
 
 事件投影采用显式白名单：
 

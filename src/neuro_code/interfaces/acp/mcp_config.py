@@ -18,7 +18,6 @@ from collections.abc import Sequence
 from typing import Any
 from urllib.parse import urlsplit
 
-from acp.exceptions import RequestError
 from acp.schema import AcpMcpServer, HttpMcpServer, McpServerStdio, SseMcpServer
 
 from neuro_code.application.acp.contracts import (
@@ -27,6 +26,7 @@ from neuro_code.application.acp.contracts import (
     AcpMcpServerConfig,
     AcpMcpStdioServerConfig,
 )
+from neuro_code.interfaces.acp.errors import invalid_params as _invalid_params
 from neuro_code.interfaces.acp.serialization import serialized_size_bytes
 
 MAX_MCP_SERVER_NAME_BYTES = 128
@@ -65,13 +65,6 @@ _RESERVED_MCP_HTTP_HEADERS = frozenset(
 )
 
 McpServer = HttpMcpServer | SseMcpServer | AcpMcpServer | McpServerStdio
-
-
-def _invalid_params(reason: str, details: str | None = None) -> RequestError:
-    data = {"reason": reason}
-    if details is not None:
-        data["details"] = details
-    return RequestError.invalid_params(data)
 
 
 def _mcp_string(
