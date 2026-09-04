@@ -354,6 +354,7 @@ class AgentRuntime:
         ultracode_execution_id: str | None = None,
         cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
         turn_source: TurnSource = TurnSource.USER,
+        verification_required: bool = False,
     ) -> AgentRunResult:
         """Run one agent turn through the canonical main loop.
 
@@ -374,6 +375,7 @@ class AgentRuntime:
             ultracode_execution_id=ultracode_execution_id,
             cancellation_policy=cancellation_policy,
             turn_source=turn_source,
+            verification_required=verification_required,
         )
 
     async def trigger_context_compaction(

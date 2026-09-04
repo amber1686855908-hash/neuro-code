@@ -1774,6 +1774,7 @@ def test_canonical_runtime_modules_are_independently_importable() -> None:
         "neuro_code.application.runtime.event_recorder",
         "neuro_code.application.runtime.model_step",
         "neuro_code.application.runtime.tool_pipeline",
+        "neuro_code.application.runtime.verification",
         "neuro_code.application.memory.instruction_tracker",
         "neuro_code.application.memory.skill_tracker",
         "neuro_code.application.memory.compaction",
@@ -2157,6 +2158,15 @@ def test_canonical_runtime_public_types_keep_module_paths_and_metadata() -> None
         "neuro_code.application.runtime.tool_pipeline": (
             "ToolExecutor",
             "ToolObservationBuilder",
+        ),
+        "neuro_code.application.runtime.verification": (
+            "VerificationEvidence",
+            "VerificationFreshness",
+            "VerificationObservation",
+            "VerificationOutcome",
+            "VerificationReport",
+            "VerificationState",
+            "VerificationTracker",
         ),
         "neuro_code.application.sessions.conversation": ("AgentConversation",),
     }
