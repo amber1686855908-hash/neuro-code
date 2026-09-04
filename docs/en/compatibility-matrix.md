@@ -11,6 +11,7 @@ all 23 jobs. The final branch update is evidence-only documentation.
 
 | Capability | Target | Status | Evidence / notes |
 |---|---|---|---|
+| Ultracode objective-size boundary | M5 | compatible | The single domain-owned `MAX_SWARM_OBJECTIVE_BYTES` contract is 4 KiB measured as UTF-8 bytes. Agent Swarm request validation and the Ultracode marker policy share it; an oversized marker-bearing prompt selects `MAIN_MAX` before the durable branch claim. This is pre-decision routing, not fallback, and recovery does not reclassify an existing durable decision. See [ADR 0141](adr/0141-automatic-ultracode-delegation.md) |
 | Package and CLI composition root | M1 | partial | The normal package includes Textual and publishes equivalent `neuro` and `neuro-code` console scripts; `neuro code` is the explicit TUI alias, all three use the launch directory as the workspace, and globally installed tools require no per-use venv activation. CLI, TUI, and ACP share an interface-neutral `ApplicationComposition`; standalone native installers remain pending |
 | `version` and JSON version output | M1 | partial | Independent package metadata implemented |
 | Effective configuration inspection | M1 | partial | `neuro-code inspect`; secret-redacted Python view implemented |

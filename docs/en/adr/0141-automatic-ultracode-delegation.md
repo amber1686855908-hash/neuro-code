@@ -46,6 +46,14 @@ effort; `SessionTurnService` checks the controller's current effort at each
 user turn, so runtime `max` ↔ `ultracode` switching does not rebuild the
 service or leave a stale entry seam.
 
+The bounded Swarm objective contract has one canonical domain-owned boundary,
+`MAX_SWARM_OBJECTIVE_BYTES`, currently 4 KiB measured as UTF-8 bytes. Swarm
+request validation and this routing policy use the same boundary. A
+marker-bearing Ultracode prompt over that limit selects `MAIN_MAX` before the
+durable Ultracode branch claim, rather than entering a Swarm request that must
+reject it. This is a pre-decision routing rule, not fallback after a claimed
+branch fails; recovery continues to reuse any existing durable decision.
+
 ## Durable identity and lifecycle
 
 Session schema 28 adds the insert-once
