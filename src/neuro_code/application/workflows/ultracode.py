@@ -32,6 +32,7 @@ from neuro_code.application.runtime.agent import AgentRunResult, EventSink
 from neuro_code.application.runtime.process_liveness import owner_is_alive
 from neuro_code.application.sessions.turns import RunTurnRequest
 from neuro_code.domain.agent_swarm import (
+    MAX_SWARM_OBJECTIVE_BYTES,
     AgentSwarmResult,
     AgentSwarmRun,
     AgentSwarmRunState,
@@ -164,8 +165,14 @@ class UltracodeDelegationPolicy:
             "拆分",
             "独立任务",
         )
-        if any(marker in bounded for marker in parallel_markers):
+        if any(marker in bounded for marker in parallel_markers) and (
+            len(prompt.encode("utf-8")) <= MAX_SWARM_OBJECTIVE_BYTES
+        ):
             return UltracodeDelegationDecision.BOUNDED_SWARM
+        # The bounded Swarm objective contract is shared with AgentSwarm
+        # validation. Keep larger valid Ultracode prompts on MAIN_MAX at
+        # decision time so they never enter a downstream request that rejects
+        # them.
         return UltracodeDelegationDecision.MAIN_MAX
 
 

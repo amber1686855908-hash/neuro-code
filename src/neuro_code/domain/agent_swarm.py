@@ -17,6 +17,7 @@ from enum import StrEnum
 from neuro_code.domain.task_dag import TaskDag
 
 MAX_SWARM_RUN_ID_BYTES = 128
+MAX_SWARM_OBJECTIVE_BYTES = 4 * 1024
 MAX_SWARM_OBJECTIVE_FINGERPRINT_BYTES = 64
 MAX_SWARM_RESULT_BYTES = 16 * 1024
 
@@ -353,6 +354,7 @@ SwarmRunResult = AgentSwarmResult
 
 
 __all__ = [
+    "MAX_SWARM_OBJECTIVE_BYTES",
     "MAX_SWARM_OBJECTIVE_FINGERPRINT_BYTES",
     "MAX_SWARM_RESULT_BYTES",
     "MAX_SWARM_RUN_ID_BYTES",

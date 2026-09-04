@@ -36,6 +36,7 @@ from neuro_code.application.workflows.task_dag_replan import (
     TaskDagReplanResult,
 )
 from neuro_code.domain.agent_swarm import (
+    MAX_SWARM_OBJECTIVE_BYTES,
     MAX_SWARM_RESULT_BYTES,
     AgentSwarmResult,
     AgentSwarmRun,
@@ -64,7 +65,7 @@ def _validate_objective(value: str) -> None:
         not isinstance(value, str)
         or not value.strip()
         or "\x00" in value
-        or len(value.encode("utf-8")) > 4 * 1024
+        or len(value.encode("utf-8")) > MAX_SWARM_OBJECTIVE_BYTES
         or any(ord(character) < 32 and character not in "\n\t\r" for character in value)
     ):
         raise ValueError("swarm objective is invalid")

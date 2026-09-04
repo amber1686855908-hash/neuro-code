@@ -2286,6 +2286,13 @@ user turn, so a long-lived service can switch `max` → `ultracode` → `max` �
 `ultracode` without service recreation; ordinary efforts never call the
 delegate.
 
+The bounded Swarm objective has one canonical domain-owned boundary,
+`MAX_SWARM_OBJECTIVE_BYTES`, currently 4 KiB measured in UTF-8 bytes. Swarm
+request validation and the Ultracode marker policy share this definition.
+Marker-bearing prompts over the boundary select `MAIN_MAX` before the durable
+Ultracode branch claim. This is a pre-decision bound, not a post-claim
+fallback, and recovery continues to reuse an existing durable decision.
+
 Session schema 28 added the insert-once
 `orchestration_ultracode_executions` projection; current schema 29 retains it.
 Its immutable identity binds

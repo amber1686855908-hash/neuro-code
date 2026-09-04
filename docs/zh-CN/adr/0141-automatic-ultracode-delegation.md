@@ -36,6 +36,12 @@ MCP、DAG definition、retry、merge、checkpoint 行为或 provider credential�
 检查 controller 当前 effort，因此运行时 `max` ↔ `ultracode` 切换不需要重建 service，也不会留下
 过期的 entry seam。
 
+有界 Swarm objective contract 只有一个由 domain 拥有的 canonical 边界：
+`MAX_SWARM_OBJECTIVE_BYTES`，当前为按 UTF-8 字节计算的 4 KiB。Swarm request validation 与该
+routing policy 使用同一个边界。超过该边界且包含 marker 的 Ultracode prompt 会在 durable
+Ultracode branch claim 之前选择 `MAIN_MAX`，不会进入必然拒绝它的 Swarm request。这是决策前的
+routing rule，不是 branch claim 后失败时的 fallback；恢复仍会复用已有的 durable decision。
+
 ## Durable identity 与生命周期
 
 Session schema 28 增加 insert-once 的

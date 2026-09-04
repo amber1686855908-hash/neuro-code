@@ -10,6 +10,7 @@
 
 | 能力 | 目标 | 状态 | 证据 / 备注 |
 |---|---|---|---|
+| Ultracode objective-size boundary | M5 | compatible | 唯一的 domain-owned `MAX_SWARM_OBJECTIVE_BYTES` contract 为按 UTF-8 字节计算的 4 KiB。Agent Swarm request validation 与 Ultracode marker policy 共用它；超过边界且包含 marker 的 prompt 会在 durable branch claim 之前选择 `MAIN_MAX`。这是决策前 routing，不是 fallback，恢复不会重新分类已有的 durable decision。详见 [ADR 0141](adr/0141-automatic-ultracode-delegation.md) |
 | 软件包与 CLI 组合根 | M1 | partial | 普通软件包已包含 Textual，并发布等价的 `neuro` 和 `neuro-code` 控制台脚本；`neuro code` 是显式 TUI 别名，三者都把启动目录作为工作区，全局工具安装后无需每次激活虚拟环境。CLI、TUI 和 ACP 共享与界面无关的 `ApplicationComposition`；独立原生安装程序仍待实现 |
 | `version` 与 JSON 版本输出 | M1 | partial | 已实现独立软件包元数据 |
 | 生效配置检查 | M1 | partial | `neuro-code inspect`；已实现隐藏密钥的 Python 视图 |

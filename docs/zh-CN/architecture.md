@@ -2066,6 +2066,12 @@ worker 或 Swarm。
 在每个用户回合读取 controller 当前 effort，因此同一个长生命周期 service 可以在
 `max` → `ultracode` → `max` → `ultracode` 之间切换而无需重建；普通 effort 永远不会调用 delegate。
 
+有界 Swarm objective 只有一个由 domain 拥有的 canonical 边界：
+`MAX_SWARM_OBJECTIVE_BYTES`，当前为按 UTF-8 字节计算的 4 KiB。Swarm request validation 与
+Ultracode marker policy 共用这一边界定义。超过边界且包含 marker 的 prompt 会在 durable
+Ultracode branch claim 之前选择 `MAIN_MAX`。这是决策前的上限，不是 claim 后的 fallback，恢复仍会
+复用已有的 durable decision。
+
 Session schema 28 增加 insert-once 的 `orchestration_ultracode_executions` projection；当前 schema 29 保留该 projection。不可变
 identity 绑定实际 parent session、精确 parent turn、input/context fingerprint、provider/model/context
 provenance、一个 decision 与一个下游 identity。`BEGIN IMMEDIATE`、process-liveness ownership

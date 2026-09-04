@@ -43,6 +43,7 @@ from neuro_code.application.workflows.ultracode import (
 )
 from neuro_code.bootstrap.composition import ApplicationComposition
 from neuro_code.domain.agent_swarm import (
+    MAX_SWARM_OBJECTIVE_BYTES,
     AgentSwarmResult,
     AgentSwarmRun,
     AgentSwarmRunState,
@@ -1979,8 +1980,43 @@ def test_policy_is_local_deterministic_and_bounded() -> None:
     assert (
         policy.decide("拆分多个文件并行研究独立任务") is UltracodeDelegationDecision.BOUNDED_SWARM
     )
+    marker = "拆分多个文件并行研究独立任务"
+    within_limit = marker + ("x" * (MAX_SWARM_OBJECTIVE_BYTES - len(marker.encode("utf-8"))))
+    assert len(within_limit.encode("utf-8")) == MAX_SWARM_OBJECTIVE_BYTES
+    assert policy.decide(within_limit) is UltracodeDelegationDecision.BOUNDED_SWARM
+    assert policy.decide(within_limit + "x") is UltracodeDelegationDecision.MAIN_MAX
     with pytest.raises(ValueError, match="prompt is invalid"):
         policy.decide("\x00")
+
+
+@pytest.mark.asyncio
+async def test_oversized_decomposable_prompt_claims_main_before_swarm() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        cwd = Path(directory)
+        store = await _store(cwd)
+        runner = _ParentRunner(store, cwd)
+        binding = _binding(runner, cwd)
+        marker = "拆分多个文件并行研究独立任务"
+        prompt = marker + ("x" * (MAX_SWARM_OBJECTIVE_BYTES - len(marker.encode("utf-8")))) + "x"
+        swarm_calls = 0
+
+        async def swarm_factory() -> Any:
+            nonlocal swarm_calls
+            swarm_calls += 1
+            raise AssertionError("an oversized objective must not construct a Swarm")
+
+        request = RunTurnRequest(prompt, turn_id="oversized-main-turn")
+        result = await _service(store, binding, swarm_factory).run_turn(request)
+
+        assert result.response == "main answer"
+        assert runner.run_calls == 1
+        assert swarm_calls == 0
+        execution = await store.get_ultracode_execution(
+            ultracode_execution_id(runner.session_id or "", "oversized-main-turn")
+        )
+        assert execution is not None
+        assert execution.decision is UltracodeDelegationDecision.MAIN_MAX
+        assert execution.downstream_id == "oversized-main-turn"
 
 
 def test_result_identity_is_exact_and_not_text_based() -> None:

@@ -35,6 +35,7 @@ from neuro_code.application.workflows.task_dag_replan import (
     TaskDagReplanResult,
 )
 from neuro_code.domain.agent_swarm import (
+    MAX_SWARM_OBJECTIVE_BYTES,
     MAX_SWARM_RESULT_BYTES,
     AgentSwarmResult,
     AgentSwarmRun,
@@ -582,6 +583,16 @@ def test_swarm_request_rejects_unbounded_or_unsafe_identity(
 ) -> None:
     with pytest.raises(ValueError, match=message):
         RunAgentSwarmRequest(run_id, objective)
+
+
+def test_swarm_request_uses_utf8_objective_byte_boundary() -> None:
+    suffix = "界"
+    exact = "x" * (MAX_SWARM_OBJECTIVE_BYTES - len(suffix.encode("utf-8"))) + suffix
+    assert len(exact.encode("utf-8")) == MAX_SWARM_OBJECTIVE_BYTES
+    RunAgentSwarmRequest("boundary-run", exact)
+
+    with pytest.raises(ValueError, match="objective"):
+        RunAgentSwarmRequest("boundary-run", exact + "x")
 
 
 @pytest.mark.asyncio
