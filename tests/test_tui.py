@@ -2266,6 +2266,51 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             await app._discard_pending_assistant()
             self.assertFalse(app._model_loading)
 
+    async def test_ultracode_orchestration_activity_is_localized_in_english(self) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)):
+            app._begin_pending_assistant()
+            await app._handle_event(
+                AgentEvent.create(
+                    1,
+                    AgentEventKind.ULTRACODE_DELEGATION_PROGRESS,
+                    {"decision": "BOUNDED_SWARM", "state": "running"},
+                )
+            )
+
+            activity = app.query_one("#turn-activity", Static)
+            self.assertIn("Orchestrating", str(activity.renderable))
+
+    async def test_ultracode_orchestration_activity_is_localized_in_simplified_chinese(
+        self,
+    ) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            language=UiLanguage.SIMPLIFIED_CHINESE,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)):
+            app._begin_pending_assistant()
+            await app._handle_event(
+                AgentEvent.create(
+                    1,
+                    AgentEventKind.ULTRACODE_DELEGATION_PROGRESS,
+                    {"decision": "MAIN_MAX", "state": "running"},
+                )
+            )
+
+            activity = app.query_one("#turn-activity", Static)
+            self.assertIn("正在进行任务编排", str(activity.renderable))
+
     async def test_settings_switches_and_persists_the_interface_language(self) -> None:
         preferences = UiPreferencesFixture()
         app = NeuroCodeApp(
