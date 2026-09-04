@@ -192,8 +192,8 @@ _TUI_CANONICAL_CLASS_OWNERS = {
     "LanguageSettingsScreen": "neuro_code.interfaces.tui.screens.settings",
     "NetworkProxySettingsScreen": "neuro_code.interfaces.tui.screens.settings",
     "BackgroundWakeSettingsScreen": "neuro_code.interfaces.tui.screens.settings",
-    "ProviderSettingsScreen": "neuro_code.interfaces.tui.screens.provider",
-    "ProviderSetupApp": "neuro_code.interfaces.tui.screens.provider",
+    "ProviderSettingsScreen": "neuro_code.interfaces.tui.screens.provider_screen",
+    "ProviderSetupApp": "neuro_code.interfaces.tui.screens.provider_setup",
     "ReasoningEffortScreen": "neuro_code.interfaces.tui.screens.selection",
     "PermissionApprovalScreen": "neuro_code.interfaces.tui.screens.selection",
     "ProviderSelectionScreen": "neuro_code.interfaces.tui.screens.selection",
@@ -375,6 +375,35 @@ def test_tui_canonical_class_ownership_is_unique() -> None:
 
     for name, expected_module in _TUI_CANONICAL_CLASS_OWNERS.items():
         assert definitions.get(name) == [expected_module]
+
+
+def test_provider_screen_facade_has_no_implementation_or_duplicate_mixins() -> None:
+    modules = _source_modules()
+    facade = modules["neuro_code.interfaces.tui.screens.provider"]
+    assert _top_level_classes(facade) == set()
+    assert _top_level_function_names(facade) == set()
+
+    implementation_modules = {
+        "neuro_code.interfaces.tui.screens.provider_screen",
+        "neuro_code.interfaces.tui.screens.provider_interaction",
+        "neuro_code.interfaces.tui.screens.provider_draft",
+        "neuro_code.interfaces.tui.screens.provider_catalog",
+        "neuro_code.interfaces.tui.screens.provider_persistence",
+    }
+    method_owners: dict[str, list[str]] = {}
+    for module in implementation_modules:
+        tree = ast.parse(modules[module].read_text(encoding="utf-8"), filename=str(modules[module]))
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            if node.name != "ProviderSettingsScreen" and not node.name.endswith("Mixin"):
+                continue
+            for child in node.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    method_owners.setdefault(child.name, []).append(module)
+
+    duplicates = {name: owners for name, owners in method_owners.items() if len(owners) > 1}
+    assert not duplicates
 
 
 def test_tui_app_and_controller_method_ownership_is_disjoint() -> None:
