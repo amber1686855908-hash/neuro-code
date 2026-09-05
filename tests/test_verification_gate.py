@@ -22,6 +22,10 @@ from neuro_code.application.runtime.finalization import (
     FinalizationResult,
     FinalizationStatus,
 )
+from neuro_code.application.runtime.model_step import (
+    MAX_BUFFERED_MODEL_STEP_TEXT_BYTES,
+    MAX_BUFFERED_MODEL_STEP_TEXT_CHUNKS,
+)
 from neuro_code.application.runtime.verification import VerificationState
 from neuro_code.domain.conversation.context import ModelContext
 from neuro_code.domain.conversation.events import (
@@ -298,6 +302,64 @@ async def test_non_gated_terminal_text_streams_without_a_finalizer(tmp_path: Pat
     assert result.response == "visible"
     assert _text_events(result.events) == ["visible"]
     assert not any(event.kind is AgentEventKind.FINALIZING_STARTED for event in result.events)
+
+
+@pytest.mark.asyncio
+async def test_gated_text_buffer_byte_overflow_fails_closed_without_partial_text(
+    tmp_path: Path,
+) -> None:
+    provider = _ScriptedProvider(
+        (
+            (
+                ModelTextDelta("x" * MAX_BUFFERED_MODEL_STEP_TEXT_BYTES),
+                ModelTextDelta("overflow"),
+                ModelCompleted("stop"),
+            ),
+        )
+    )
+    events: list[AgentEvent] = []
+
+    async def collect(event: AgentEvent) -> None:
+        events.append(event)
+
+    with pytest.raises(ProviderError, match="byte limit"):
+        await _runtime(
+            tmp_path,
+            provider,
+            _Tools(()),
+            _FixedWorkspaceObserver(changed=False),
+        ).run("bounded", sink=collect, verification_required=True)
+
+    assert _text_events(events) == []
+
+
+@pytest.mark.asyncio
+async def test_gated_text_buffer_chunk_overflow_fails_closed_without_partial_text(
+    tmp_path: Path,
+) -> None:
+    provider = _ScriptedProvider(
+        (
+            (
+                *(ModelTextDelta("x") for _ in range(MAX_BUFFERED_MODEL_STEP_TEXT_CHUNKS)),
+                ModelTextDelta("overflow"),
+                ModelCompleted("stop"),
+            ),
+        )
+    )
+    events: list[AgentEvent] = []
+
+    async def collect(event: AgentEvent) -> None:
+        events.append(event)
+
+    with pytest.raises(ProviderError, match="chunk limit"):
+        await _runtime(
+            tmp_path,
+            provider,
+            _Tools(()),
+            _FixedWorkspaceObserver(changed=False),
+        ).run("bounded", sink=collect, verification_required=True)
+
+    assert _text_events(events) == []
 
 
 @pytest.mark.asyncio
@@ -648,7 +710,9 @@ async def test_failure_before_turn_commit_never_replays_terminal_candidate(tmp_p
         )
 
     persisted_events = await store.load_events(session_id)
+    persisted_items = await store.load_session_items(session_id)
     assert "candidate must stay private" not in repr(persisted_events)
+    assert "committed final" not in repr(persisted_items)
     assert not any(
         event["kind"] == AgentEventKind.TURN_COMPLETED.value for event in persisted_events
     )
