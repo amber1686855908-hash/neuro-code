@@ -966,16 +966,11 @@ class AgentLoopRunner:
                 verification=verification,
             )
             final_message = Message(Role.ASSISTANT, finalization.response)
-            # A gated terminal response is only added to the shared transcript
-            # after the atomic completion write succeeds.  The completion
-            # snapshot still carries it to the storage owner, so a failed
-            # pre-commit path cannot replay a response that was never committed.
-            defer_final_message_commit = decision is None
-            if not defer_final_message_commit:
-                messages.append(final_message)
-                if persist_turn_context:
-                    context_items.append(final_message)
-            await emit(AgentEventKind.TEXT_DELTA, {"text": finalization.response})
+            # Every finalizer/fallback response crosses the same atomic
+            # completion boundary.  Keep it out of the shared transcript and
+            # public event sink until the response event and TURN_COMPLETED
+            # have been committed together.
+            defer_final_message_commit = True
             result_items = (
                 (*persistent_context_items(), final_message)
                 if persist_turn_context and defer_final_message_commit
@@ -1013,6 +1008,7 @@ class AgentLoopRunner:
                 completion_data,
                 result_items,
                 response_contract=response_contract,
+                committed_response=finalization.response,
             )
             if defer_final_message_commit:
                 messages.append(final_message)

@@ -19,6 +19,7 @@ import inspect
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from time import monotonic
+from typing import cast
 
 from neuro_code.application.memory.compaction_runtime import ContextCompactionTurnProjection
 from neuro_code.application.ports.storage import SessionStore
@@ -340,6 +341,7 @@ class TurnEventRecorder:
         compaction_item: DurableCompactionItem | None = None,
         *,
         response_contract: FinalResponseContract | None = None,
+        committed_response: str | None = None,
     ) -> None:
         """Persist one completed turn, optionally with its durable compaction.
 
@@ -372,11 +374,32 @@ class TurnEventRecorder:
             raise TypeError("response_contract must be a FinalResponseContract or None")
         if response_contract is not None and not response_contract.is_committed:
             raise ConfigurationError("TURN_COMPLETED requires a committed final response")
+        if committed_response is not None:
+            if not isinstance(committed_response, str):
+                raise TypeError("committed_response must be a string or None")
+            if response_contract is None or not response_contract.is_committed:
+                raise ConfigurationError(
+                    "a committed response event requires a committed response contract"
+                )
+            if response_contract.response != committed_response:
+                raise ConfigurationError(
+                    "committed response event does not match the response contract"
+                )
         completion_data = dict(data)
         if response_contract is not None:
             completion_data.update(response_contract.to_completion_metadata())
         if self._turn_id is not None:
             completion_data.setdefault("turn_id", self._turn_id)
+        committed_response_event = (
+            self._create_event(
+                AgentEventKind.TEXT_DELTA,
+                {"text": committed_response},
+            )
+            if committed_response is not None
+            else None
+        )
+        if committed_response_event is not None:
+            self._events.append(committed_response_event)
         task, task_event = self._prepare_task_terminal(SessionTaskStatus.COMPLETED)
         completed_event = self._create_event(AgentEventKind.TURN_COMPLETED, completion_data)
         self._events.append(completed_event)
@@ -392,10 +415,14 @@ class TurnEventRecorder:
         durable_result_items = _durable_session_items(result_items)
         if self._session_store is not None and self._session_id is not None:
             finalizer: Callable[..., Awaitable[None]]
+            finalizer_args: tuple[object, ...]
             if compaction_item is None:
-                finalizer = self._session_store.finalize_turn
+                finalizer = cast(
+                    Callable[..., Awaitable[None]],
+                    self._session_store.finalize_turn,
+                )
                 if callable(getattr(self._session_store, "start_turn_attempt", None)):
-                    await finalizer(
+                    finalizer_args = (
                         self._session_id,
                         completed_event,
                         durable_result_items,
@@ -405,16 +432,19 @@ class TurnEventRecorder:
                         task_event,
                     )
                 else:
-                    await finalizer(
+                    finalizer_args = (
                         self._session_id,
                         completed_event,
                         durable_result_items,
                         record,
                     )
             else:
-                finalizer = self._session_store.finalize_turn_with_compaction
+                finalizer = cast(
+                    Callable[..., Awaitable[None]],
+                    self._session_store.finalize_turn_with_compaction,
+                )
                 if callable(getattr(self._session_store, "start_turn_attempt", None)):
-                    await finalizer(
+                    finalizer_args = (
                         self._session_id,
                         completed_event,
                         durable_result_items,
@@ -425,13 +455,22 @@ class TurnEventRecorder:
                         task_event,
                     )
                 else:
-                    await finalizer(
+                    finalizer_args = (
                         self._session_id,
                         completed_event,
                         durable_result_items,
                         record,
                         compaction_item,
                     )
+            if committed_response_event is None:
+                await finalizer(*finalizer_args)
+            else:
+                await finalizer(
+                    *finalizer_args,
+                    committed_response_event=committed_response_event,
+                )
+        if committed_response_event is not None:
+            await self._deliver(committed_response_event)
         await self._deliver(completed_event)
 
     async def finalize_turn_from_compaction_projection(

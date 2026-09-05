@@ -95,6 +95,8 @@ class SessionStore(Protocol):
         turn_id: str | None = None,
         task: SessionTask | None = None,
         task_event: AgentEvent | None = None,
+        *,
+        committed_response_event: AgentEvent | None = None,
     ) -> None: ...
 
     async def finalize_turn_with_compaction(
@@ -107,6 +109,8 @@ class SessionStore(Protocol):
         turn_id: str | None = None,
         task: SessionTask | None = None,
         task_event: AgentEvent | None = None,
+        *,
+        committed_response_event: AgentEvent | None = None,
     ) -> None: ...
 
     async def finalize_turn_failure(

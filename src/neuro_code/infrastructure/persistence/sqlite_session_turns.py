@@ -287,6 +287,8 @@ class TurnsMixin(_SqliteSessionPersistenceContext):
         turn_id: str | None = None,
         task: SessionTask | None = None,
         task_event: AgentEvent | None = None,
+        *,
+        committed_response_event: AgentEvent | None = None,
     ) -> None:
         if not isinstance(event, AgentEvent):
             raise TypeError("event must be an AgentEvent")
@@ -303,6 +305,7 @@ class TurnsMixin(_SqliteSessionPersistenceContext):
                 raise TypeError("record must be a SessionExecutionRecord or None")
             if record.event_sequence != event.sequence:
                 raise SessionError("execution record sequence does not match completion event")
+        _validate_committed_response_event(committed_response_event, before_sequence=event.sequence)
         new_items = list(items)
 
         def finalize() -> None:
@@ -319,6 +322,7 @@ class TurnsMixin(_SqliteSessionPersistenceContext):
                     turn_id=turn_id,
                     task=task,
                     task_event=task_event,
+                    committed_response_event=committed_response_event,
                 )
                 connection.commit()
             except sqlite3.IntegrityError as error:
@@ -345,6 +349,8 @@ class TurnsMixin(_SqliteSessionPersistenceContext):
         turn_id: str | None = None,
         task: SessionTask | None = None,
         task_event: AgentEvent | None = None,
+        *,
+        committed_response_event: AgentEvent | None = None,
     ) -> None:
         """Atomically finalize a turn and persist one compaction item.
 
@@ -378,6 +384,7 @@ class TurnsMixin(_SqliteSessionPersistenceContext):
                 raise SessionError("execution record sequence does not match completion event")
         if not isinstance(compaction_item, DurableCompactionItem):
             raise TypeError("compaction_item must be a DurableCompactionItem")
+        _validate_committed_response_event(committed_response_event, before_sequence=event.sequence)
         new_items = list(items)
 
         def finalize() -> None:
@@ -394,6 +401,7 @@ class TurnsMixin(_SqliteSessionPersistenceContext):
                     turn_id=turn_id,
                     task=task,
                     task_event=task_event,
+                    committed_response_event=committed_response_event,
                 )
                 connection.commit()
             except sqlite3.IntegrityError as error:
@@ -998,6 +1006,30 @@ def _insert_event_row(
     )
 
 
+def _validate_committed_response_event(
+    event: AgentEvent | None,
+    *,
+    before_sequence: int,
+) -> None:
+    """Validate the staged final response event owned by turn completion."""
+
+    if event is None:
+        return
+    if not isinstance(event, AgentEvent):
+        raise TypeError("committed_response_event must be an AgentEvent or None")
+    if event.kind is not AgentEventKind.TEXT_DELTA:
+        raise SessionError("committed response event must be a TEXT_DELTA event")
+    if (
+        not isinstance(event.sequence, int)
+        or isinstance(event.sequence, bool)
+        or event.sequence <= 0
+        or event.sequence >= before_sequence
+    ):
+        raise SessionError("committed response event must precede the completion event")
+    if not isinstance(event.data.get("text"), str):
+        raise SessionError("committed response event text must be a string")
+
+
 def _persist_turn_attempt_acceptance(
     connection: sqlite3.Connection,
     *,
@@ -1248,6 +1280,7 @@ def _persist_finalized_turn(
     turn_id: str | None,
     task: SessionTask | None,
     task_event: AgentEvent | None,
+    committed_response_event: AgentEvent | None,
 ) -> None:
     """Write all owned turn-finalization projections on one open transaction.
 
@@ -1280,6 +1313,10 @@ def _persist_finalized_turn(
         )
     if turn_id is not None and event.data.get("turn_id") != turn_id:
         raise SessionError("completion event has a different turn identity")
+    _validate_committed_response_event(
+        committed_response_event,
+        before_sequence=event.sequence,
+    )
     _persist_task_terminal(
         connection,
         session_id=session_id,
@@ -1296,6 +1333,12 @@ def _persist_finalized_turn(
     payload = json.dumps(dict(event.data), ensure_ascii=False, separators=(",", ":"))
     items_payload = _serialize_session_items(items)
     title = str(row[1]) or fallback_session_title(items)
+    if committed_response_event is not None:
+        _insert_event_row(
+            connection,
+            session_id=session_id,
+            event=committed_response_event,
+        )
     _insert_event_row(connection, session_id=session_id, event=event, payload=payload)
     cursor = connection.execute(
         """

@@ -163,6 +163,40 @@ class FinalizingCliProvider:
         yield ModelCompleted("stop")
 
 
+class GatedCliProvider:
+    provider_name = "cli-gated-fixture"
+    model_name = "fixture-model"
+
+    def __init__(self) -> None:
+        self._normal_calls = 0
+
+    async def stream(
+        self,
+        context: ModelContext,
+        tools: Sequence[ToolDefinition],
+        *,
+        tool_policy: ModelToolPolicy = ModelToolPolicy.ALLOWED,
+    ) -> AsyncIterator[ModelEvent]:
+        del context, tools
+        if tool_policy is ModelToolPolicy.ALLOWED:
+            self._normal_calls += 1
+            if self._normal_calls == 1:
+                yield ModelToolCall(
+                    ToolCall(
+                        "edit",
+                        "search_replace",
+                        {"path": "note.txt", "old": "before", "new": "after"},
+                    )
+                )
+                yield ModelCompleted("tool_calls")
+                return
+            yield ModelTextDelta("PROVISIONAL_FALSE_SUCCESS_SENTINEL")
+            yield ModelCompleted("stop")
+            return
+        yield ModelTextDelta("safe committed response")
+        yield ModelCompleted("stop")
+
+
 class BackgroundTaskSupervisorFixture:
     def __init__(self) -> None:
         self.shutdown_calls = 0
@@ -1069,6 +1103,57 @@ api_key_env = "FIXTURE_KEY"
         self.assertEqual(exit_code, 0)
         self.assertEqual(errors, "")
         self.assertEqual(output.count("finalized fixture response"), 1)
+
+    def test_gated_response_hides_terminal_candidate_in_plain_json_and_jsonl(self) -> None:
+        for output_format in ("plain", "json", "jsonl"):
+            with (
+                self.subTest(output_format=output_format),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                (root / "note.txt").write_text("before", encoding="utf-8")
+                exit_code, output, errors = self._run_finalizing_agent(
+                    root,
+                    GatedCliProvider(),
+                    "-p",
+                    "edit note.txt",
+                    "--cwd",
+                    str(root),
+                    "--always-approve",
+                    "--output-format",
+                    output_format,
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(errors, "")
+            self.assertNotIn("PROVISIONAL_FALSE_SUCCESS_SENTINEL", output)
+            self.assertIn("safe committed response", output)
+            if output_format == "plain":
+                self.assertEqual(output, "safe committed response\n")
+            elif output_format == "json":
+                payload = json.loads(output)
+                self.assertEqual(payload["response"], "safe committed response")
+                text_records = [
+                    event
+                    for event in payload["events"]
+                    if event["kind"] == AgentEventKind.TEXT_DELTA.value
+                ]
+                self.assertEqual(
+                    [event["data"]["text"] for event in text_records],
+                    ["safe committed response"],
+                )
+            else:
+                records = [json.loads(line) for line in output.splitlines()]
+                text_records = [
+                    record
+                    for record in records
+                    if record["kind"] == AgentEventKind.TEXT_DELTA.value
+                ]
+                self.assertEqual(
+                    [record["data"]["text"] for record in text_records],
+                    ["safe committed response"],
+                )
+                self.assertEqual(records[-1]["kind"], AgentEventKind.TURN_COMPLETED.value)
 
     def test_json_output_contains_budget_limited_outcome_without_internal_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

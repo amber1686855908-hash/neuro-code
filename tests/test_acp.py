@@ -3946,6 +3946,44 @@ context_window_tokens = 131072
         self.assertEqual(permission.kind, "execute")
         self.assertNotIn("secret-value", repr(permission))
 
+    async def test_gated_completion_maps_only_the_committed_response(self) -> None:
+        client = AcpClientFixture()
+        mapper = updates_module._AcpEventMapper(
+            client=cast(Client, client),
+            session_id="gated-session",
+            context_window_tokens=100,
+            explicit_redactions=(),
+        )
+        events = (
+            AgentEvent.create(
+                1,
+                AgentEventKind.FINALIZING_STARTED,
+                {"execution_status": "completed", "recoverable": False},
+            ),
+            AgentEvent.create(
+                2,
+                AgentEventKind.TEXT_DELTA,
+                {"text": "safe committed response"},
+            ),
+            AgentEvent.create(
+                3,
+                AgentEventKind.TURN_COMPLETED,
+                {
+                    "response_committed": True,
+                    "response_source": "evidence_aware_finalizer",
+                    "verification_state": "incomplete",
+                    "verification_workspace_generation": 1,
+                },
+            ),
+        )
+        for event in events:
+            await mapper(event)
+
+        chunks = [update for _, update in client.updates if isinstance(update, AgentMessageChunk)]
+        self.assertEqual([chunk.content.text for chunk in chunks], ["safe committed response"])
+        self.assertNotIn("PROVISIONAL_FALSE_SUCCESS_SENTINEL", repr(client.updates))
+        self.assertEqual(mapper.stop_reason, "end_turn")
+
     async def test_event_mapping_has_stable_message_id_and_bounded_tool_fields(self) -> None:
         events = (
             AgentEvent.create(1, AgentEventKind.TEXT_DELTA, {"text": "one"}),
