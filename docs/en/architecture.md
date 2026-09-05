@@ -2948,10 +2948,32 @@ contract is rejected before the completion event or durable session items are
 created. Existing session schema and replay of committed history are unchanged.
 
 The normal model path, evidence-aware finalizer, runtime deterministic fallback,
-and external result replay have distinct response-source values. Ordinary
-`TEXT_DELTA` delivery remains unchanged in this contract-only slice; preventing
-false-success text from being delivered before verification is the separate
-VF-2b runtime truth gate.
+and external result replay have distinct response-source values. The follow-up
+VF-2b gate keeps ordinary no-mutation turns on the existing streaming path, but
+activates a bounded per-step text buffer once a turn has a workspace mutation,
+an explicit verification requirement, or recorded verification evidence. Text
+from a step that also has tool calls is released as intermediate output after
+the tool shape is known. A no-tool step is retained as a provisional candidate
+and replaced by the evidence-aware finalizer or the bounded deterministic
+fallback; only that committed response can reach `AgentRunResult`,
+`TURN_COMPLETED`, or replayable assistant history. `MODEL_OUTPUT_STARTED`
+continues to record provider output for recovery even while its text remains
+unpublished. No provider stream, CLI/TUI/ACP protocol, or session schema
+contract changes.
+
+## VF-2b verification-gated terminal model output
+
+`AgentLoopRunner` owns the gate integration and `ModelStepProcessor` owns the
+bounded step-local buffer. Reasoning, backend-tool progress, and tool lifecycle
+events continue to stream normally. Once active, a terminal no-tool model step
+creates only a provisional `FinalResponseContract`; it is never appended to the
+conversation or persisted. The existing `AgentFinalizer` receives a snapshot
+from the sole `VerificationTracker` owner. If finalization cannot produce a
+usable response, a runtime-owned deterministic fallback reports only bounded
+verification/workspace facts and is committed with the fallback source. A
+cancellation or failure before this commit follows the existing turn-failure
+recovery path and cannot replay the provisional candidate. This is a step-level
+truth boundary, not whole-turn buffering and not verification discovery.
 
 ## Cache-friendly model request projection and usage
 

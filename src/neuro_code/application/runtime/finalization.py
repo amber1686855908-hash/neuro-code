@@ -36,6 +36,7 @@ _MAX_EVIDENCE_ITEM_CHARS = 400
 _MAX_EVIDENCE_BLOCKER_CHARS = 400
 _MAX_STOP_REASON_CHARS = 160
 _MAX_TOOL_NAME_CHARS = 80
+_MAX_DETERMINISTIC_FALLBACK_CHARS = 2_048
 
 _TOOL_REJECTION_CONTENT = (
     "Tool calls are unavailable while preparing the final response. The requested "
@@ -251,6 +252,57 @@ class FinalizationResult:
             raise ValueError("completed must match finalization status")
         if self.stop_reason is not None and not isinstance(self.stop_reason, str):
             raise ValueError("stop_reason must be a string or None")
+
+
+def deterministic_fallback_result(evidence: FinalizationEvidence) -> FinalizationResult:
+    """Build a safe committed-response candidate from bounded runtime facts.
+
+    This path is used only when the bounded evidence-aware model request
+    cannot produce a usable response.  It deliberately does not reuse a
+    provisional model candidate and does not claim that work was completed or
+    verified beyond the supplied evidence.
+
+    在有界的证据感知模型请求无法生成可用响应时,根据有限运行时事实构建安全响应。
+    该路径不会复用临时模型候选,也不会超出已有证据声称工作已完成或已验证。
+    """
+
+    if not isinstance(evidence, FinalizationEvidence):
+        raise TypeError("evidence must be a FinalizationEvidence")
+    lines = [
+        "I could not produce a reliable final summary from the available evidence.",
+        f"Recorded verification state: {evidence.verification_state.value}.",
+    ]
+    if evidence.workspace_changes:
+        lines.append(
+            "Workspace changes were observed, but this response does not claim their final state."
+        )
+    if evidence.unverified_items:
+        lines.append("Unverified: " + "; ".join(evidence.unverified_items))
+    if evidence.blocker:
+        lines.append(f"Blocker: {evidence.blocker}")
+    response = _bounded_text(
+        "\n".join(lines),
+        limit=_MAX_DETERMINISTIC_FALLBACK_CHARS,
+    )
+    attempt = FinalizationAttempt(
+        1,
+        False,
+        None,
+        None,
+        None,
+        0,
+        0,
+    )
+    return FinalizationResult(
+        FinalizationStatus.EMPTY_RESPONSE,
+        response,
+        (attempt,),
+        None,
+        None,
+        0,
+        False,
+        None,
+    )
 
 
 class AgentFinalizer:
@@ -512,4 +564,5 @@ __all__ = [
     "FinalizationResult",
     "FinalizationStatus",
     "Finalizer",
+    "deterministic_fallback_result",
 ]

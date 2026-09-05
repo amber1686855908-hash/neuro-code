@@ -32,8 +32,41 @@ from neuro_code.domain.conversation.events import (
     ModelToolCall,
 )
 from neuro_code.domain.conversation.messages import ToolCall
+from neuro_code.shared.errors import ProviderError
 
 EventSink = Callable[[AgentEventKind, dict[str, object]], Awaitable[AgentEvent]]
+
+MAX_BUFFERED_MODEL_STEP_TEXT_BYTES = 256 * 1024
+MAX_BUFFERED_MODEL_STEP_TEXT_CHUNKS = 4096
+
+
+class _BoundedStepTextBuffer:
+    """Keep gated model text finite until the step's tool shape is known."""
+
+    __slots__ = ("_bytes", "_chunks", "_values")
+
+    def __init__(self) -> None:
+        self._bytes = 0
+        self._chunks = 0
+        self._values: list[str] = []
+
+    def append(self, value: str) -> None:
+        value_bytes = len(value.encode("utf-8"))
+        if self._chunks >= MAX_BUFFERED_MODEL_STEP_TEXT_CHUNKS:
+            raise ProviderError("gated model step text buffer exceeded its chunk limit")
+        if self._bytes + value_bytes > MAX_BUFFERED_MODEL_STEP_TEXT_BYTES:
+            raise ProviderError("gated model step text buffer exceeded its byte limit")
+        self._values.append(value)
+        self._chunks += 1
+        self._bytes += value_bytes
+
+    def values(self) -> tuple[str, ...]:
+        return tuple(self._values)
+
+    @staticmethod
+    def validate(value: str) -> None:
+        if len(value.encode("utf-8")) > MAX_BUFFERED_MODEL_STEP_TEXT_BYTES:
+            raise ProviderError("gated model step text buffer exceeded its byte limit")
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,12 +103,14 @@ class ModelStepProcessor:
         can_adopt_provider_origin: bool,
         on_imperfect: Callable[[], None],
         on_output_started: Callable[[str], Awaitable[None]] | None = None,
+        buffer_text: bool = False,
     ) -> ModelStepResult:
         """Consume one model stream, emitting normalized events as it goes.
 
         消费一次模型流,同时持续发出规范化事件."""
 
         step_text: list[str] = []
+        buffered_text = _BoundedStepTextBuffer() if buffer_text else None
         step_reasoning: list[str] = []
         tool_calls: list[ToolCall] = []
         completion: ModelCompleted | None = None
@@ -147,8 +182,11 @@ class ModelStepProcessor:
                 if model_event.text:
                     await mark_output_started("text")
                     on_imperfect()
-                step_text.append(model_event.text)
-                await emit(AgentEventKind.TEXT_DELTA, {"text": model_event.text})
+                if buffered_text is None:
+                    step_text.append(model_event.text)
+                    await emit(AgentEventKind.TEXT_DELTA, {"text": model_event.text})
+                else:
+                    buffered_text.append(model_event.text)
             elif isinstance(model_event, ModelReasoningDelta):
                 if model_event.text:
                     await mark_output_started("reasoning")
@@ -192,10 +230,12 @@ class ModelStepProcessor:
                 await mark_output_started("completed")
                 await complete_thinking()
                 on_imperfect()
+                if buffered_text is not None and model_event.response_text is not None:
+                    _BoundedStepTextBuffer.validate(model_event.response_text)
                 completion = model_event
 
         return ModelStepResult(
-            text=tuple(step_text),
+            text=buffered_text.values() if buffered_text is not None else tuple(step_text),
             reasoning=tuple(step_reasoning),
             tool_calls=tuple(tool_calls),
             completion=completion,
@@ -203,4 +243,9 @@ class ModelStepProcessor:
         )
 
 
-__all__ = ["ModelStepProcessor", "ModelStepResult"]
+__all__ = [
+    "MAX_BUFFERED_MODEL_STEP_TEXT_BYTES",
+    "MAX_BUFFERED_MODEL_STEP_TEXT_CHUNKS",
+    "ModelStepProcessor",
+    "ModelStepResult",
+]

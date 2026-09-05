@@ -1803,6 +1803,7 @@ def test_canonical_runtime_modules_are_the_only_runtime_implementations() -> Non
             "ResponseSource",
         },
         "neuro_code.application.runtime.model_step": {
+            "_BoundedStepTextBuffer",
             "ModelStepProcessor",
             "ModelStepResult",
         },

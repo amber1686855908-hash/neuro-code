@@ -105,6 +105,9 @@ class AgentRuntime:
         execution_control_mode: ExecutionControlMode = ExecutionControlMode.OBSERVE_ONLY,
         finalizer_factory: FinalizerFactory | None = None,
         finalizer_max_attempts: int = 2,
+        # Internal orchestration bindings may explicitly defer this gate until
+        # their verification integration is implemented.
+        final_output_gate_enabled: bool = True,
         compaction_runtime_gate: ContextCompactionRuntimeGate | None = None,
         provider_context_window: ProviderContextWindow | None = None,
         tool_hooks: Sequence[ToolPipelineHook] = (),
@@ -128,6 +131,8 @@ class AgentRuntime:
             or finalizer_max_attempts < 1
         ):
             raise ValueError("finalizer_max_attempts must be a positive integer")
+        if not isinstance(final_output_gate_enabled, bool):
+            raise TypeError("final_output_gate_enabled must be a bool")
         if compaction_runtime_gate is not None and not isinstance(
             compaction_runtime_gate,
             ContextCompactionRuntimeGate,
@@ -207,6 +212,7 @@ class AgentRuntime:
             finalizer_factory=self._finalizer_factory,
             finalizer_max_attempts=self._finalizer_max_attempts,
             tool_executor=self._tool_executor,
+            final_output_gate_enabled=final_output_gate_enabled,
             compaction_runtime_gate=self._compaction_runtime_gate,
             provider_context_window=provider_context_window,
         )

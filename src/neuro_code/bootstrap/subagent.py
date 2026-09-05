@@ -293,6 +293,7 @@ class CompositionWritableSubagentRuntimeFactory(WritableSubagentRuntimeFactory):
             additional_workspace_roots=workspace_binding.additional_roots,
             capabilities=capabilities.capabilities,
             enable_background_tasks=False,
+            final_output_gate_enabled=False,
             parent_context_relay=relay,
             dag_result_relay=request.dependency_result_relay,
         )

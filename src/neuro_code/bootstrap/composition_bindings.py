@@ -194,6 +194,9 @@ class CompositionBindingMixin(CompositionRootMixin):
         user_interaction: UserInteractionPort | None = None,
         parent_context_relay: ParentContextRelay | None = None,
         dag_result_relay: TaskDagDependencyResultRelay | None = None,
+        # Internal orchestration bindings opt out until their own verification
+        # integration is implemented; user-facing bindings keep the default.
+        final_output_gate_enabled: bool = True,
     ) -> ConversationBinding:
         if self._closed:
             raise RuntimeError("application composition is closed")
@@ -612,6 +615,7 @@ class CompositionBindingMixin(CompositionRootMixin):
                 execution_budget=selected_execution_budget,
                 reasoning_effort=reasoning_effort or self.settings.reasoning_effort,
                 execution_control_mode=self.settings.execution_control_mode,
+                final_output_gate_enabled=final_output_gate_enabled,
                 compaction_runtime_gate=compaction_gate,
                 provider_context_window=(
                     ProviderContextWindow(

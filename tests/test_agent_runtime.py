@@ -2909,6 +2909,10 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                         ModelTextDelta("Read, edited, and verified note.txt."),
                         ModelCompleted("stop"),
                     ),
+                    (
+                        ModelTextDelta("Read, edited, and verified note.txt."),
+                        ModelCompleted("stop"),
+                    ),
                 )
             )
             runtime = AgentRuntime(
