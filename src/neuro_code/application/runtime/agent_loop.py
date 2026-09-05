@@ -59,6 +59,7 @@ from neuro_code.application.runtime.finalization import (
     FinalizationResult,
     FinalizationStatus,
     Finalizer,
+    deterministic_fallback_result,
 )
 from neuro_code.application.runtime.model_step import ModelStepProcessor
 from neuro_code.application.runtime.supervision import (
@@ -202,6 +203,7 @@ class AgentLoopRunner:
         "_context_builder",
         "_execution_budget",
         "_execution_control_mode",
+        "_final_output_gate_enabled",
         "_finalizer_factory",
         "_finalizer_max_attempts",
         "_max_steps",
@@ -236,6 +238,7 @@ class AgentLoopRunner:
         tool_executor: ToolExecutor,
         compaction_runtime_gate: ContextCompactionRuntimeGate | None,
         provider_context_window: ProviderContextWindow | None,
+        final_output_gate_enabled: bool = True,
     ) -> None:
         self._provider = provider
         self._tools = tools
@@ -256,6 +259,8 @@ class AgentLoopRunner:
             ProviderContextWindow,
         ):
             raise TypeError("provider_context_window must be a ProviderContextWindow or None")
+        if not isinstance(final_output_gate_enabled, bool):
+            raise TypeError("final_output_gate_enabled must be a bool")
         self._execution_budget = execution_budget
         self._max_steps = execution_budget.max_model_calls
         self._segment_policy = ExecutionSegmentPolicy.from_budget(execution_budget)
@@ -263,6 +268,7 @@ class AgentLoopRunner:
         self._supervisor_factory = supervisor_factory
         self._supervision_observer = supervision_observer
         self._execution_control_mode = execution_control_mode
+        self._final_output_gate_enabled = final_output_gate_enabled
         self._finalizer_factory = finalizer_factory
         self._finalizer_max_attempts = finalizer_max_attempts
         self._tool_executor = tool_executor
@@ -822,11 +828,14 @@ class AgentLoopRunner:
                 )
 
         def finalization_evidence(
-            decision: SupervisorDecision,
+            decision: SupervisorDecision | None,
         ) -> FinalizationEvidence:
             verification = verification_tracker.report()
+            reason_code = (
+                decision.reason_code if decision is not None else SupervisorReasonCode.NONE
+            )
             return FinalizationEvidence(
-                decision.reason_code,
+                reason_code,
                 workspace_changes=tuple(workspace_evidence),
                 verification=verification.confirmed_items,
                 unverified_items=(
@@ -838,6 +847,8 @@ class AgentLoopRunner:
                 verification_workspace_generation=verification.workspace_generation,
                 blocker=(
                     f"Execution stopped because {decision.reason_code.value.replace('_', ' ')}."
+                    if decision is not None
+                    else None
                 ),
                 uncertainty=(
                     "The final response is limited to evidence already recorded in the conversation.",
@@ -882,13 +893,67 @@ class AgentLoopRunner:
             )
             return await complete_finalization_result(finalization, decision, step=step)
 
-        async def complete_finalization_result(
-            finalization: FinalizationResult,
-            decision: SupervisorDecision,
+        async def complete_gated_terminal_turn(
+            candidate: FinalResponseContract,
             *,
             step: int,
         ) -> AgentRunResult:
-            outcome = outcome_for_terminal_decision(decision)
+            """Replace a gated model candidate before any public/durable commit."""
+
+            if candidate.is_committed:
+                raise ConfigurationError("gated terminal candidate must remain provisional")
+            await emit(
+                AgentEventKind.FINALIZING_STARTED,
+                {
+                    "execution_status": AgentExecutionStatus.FINALIZING.value,
+                    "execution_reason": SupervisorReasonCode.NONE.value,
+                    "recoverable": False,
+                },
+            )
+            evidence = finalization_evidence(None)
+            try:
+                finalizer = self._finalizer_factory(
+                    self._provider,
+                    self._finalizer_max_attempts,
+                    self._tool_context.redaction_values,
+                )
+                finalization = await finalizer.finalize(
+                    projected_model_context(),
+                    evidence,
+                )
+                if (
+                    not isinstance(finalization, FinalizationResult)
+                    or not finalization.response.strip()
+                ):
+                    raise ValueError("finalizer returned an invalid response")
+                if finalization.status is not FinalizationStatus.COMPLETED:
+                    finalization = deterministic_fallback_result(evidence)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                LOGGER.debug(
+                    "verification-gated finalizer failed; using deterministic fallback "
+                    "error_type=%s",
+                    type(error).__name__,
+                )
+                finalization = deterministic_fallback_result(evidence)
+            return await complete_finalization_result(finalization, None, step=step)
+
+        async def complete_finalization_result(
+            finalization: FinalizationResult,
+            decision: SupervisorDecision | None,
+            *,
+            step: int,
+        ) -> AgentRunResult:
+            result_outcome = (
+                outcome_for_terminal_decision(decision) if decision is not None else None
+            )
+            completion_outcome = result_outcome or AgentExecutionOutcome(
+                AgentExecutionStatus.COMPLETED,
+                None,
+                finalized=False,
+                recoverable=False,
+            )
             verification = verification_tracker.report()
             response_source = (
                 ResponseSource.EVIDENCE_AWARE_FINALIZER
@@ -901,12 +966,22 @@ class AgentLoopRunner:
                 verification=verification,
             )
             final_message = Message(Role.ASSISTANT, finalization.response)
-            messages.append(final_message)
-            if persist_turn_context:
-                context_items.append(final_message)
+            # A gated terminal response is only added to the shared transcript
+            # after the atomic completion write succeeds.  The completion
+            # snapshot still carries it to the storage owner, so a failed
+            # pre-commit path cannot replay a response that was never committed.
+            defer_final_message_commit = decision is None
+            if not defer_final_message_commit:
+                messages.append(final_message)
+                if persist_turn_context:
+                    context_items.append(final_message)
             await emit(AgentEventKind.TEXT_DELTA, {"text": finalization.response})
             result_items = (
-                persistent_context_items() if persist_turn_context else turn_context_prefix
+                (*persistent_context_items(), final_message)
+                if persist_turn_context and defer_final_message_commit
+                else persistent_context_items()
+                if persist_turn_context
+                else turn_context_prefix
             )
             completion_data: dict[str, object] = {
                 "step": step,
@@ -914,12 +989,14 @@ class AgentLoopRunner:
                 "input_tokens": finalization.total_input_tokens,
                 "output_tokens": finalization.total_output_tokens,
                 "duration_seconds": monotonic() - turn_started_at,
-                "execution_status": outcome.status.value,
-                "execution_reason": outcome.reason_code.value
-                if outcome.reason_code is not None
-                else None,
-                "finalized": outcome.finalized,
-                "recoverable": outcome.recoverable,
+                "execution_status": completion_outcome.status.value,
+                "execution_reason": (
+                    completion_outcome.reason_code.value
+                    if completion_outcome.reason_code is not None
+                    else None
+                ),
+                "finalized": completion_outcome.finalized,
+                "recoverable": completion_outcome.recoverable,
                 "finalization_status": finalization.status.value,
                 "finalization_attempts": len(finalization.attempts),
                 "illegal_tool_calls": finalization.illegal_tool_calls,
@@ -932,11 +1009,15 @@ class AgentLoopRunner:
                     }
                 )
             await finalize_turn_completion(
-                outcome,
+                completion_outcome,
                 completion_data,
                 result_items,
                 response_contract=response_contract,
             )
+            if defer_final_message_commit:
+                messages.append(final_message)
+                if persist_turn_context:
+                    context_items.append(final_message)
             return AgentRunResult(
                 session_id,
                 finalization.response,
@@ -945,7 +1026,7 @@ class AgentLoopRunner:
                 tuple(events),
                 step,
                 self._context_builder.plan,
-                outcome,
+                result_outcome,
                 turn_id,
                 verification=verification,
                 response_contract=response_contract,
@@ -1125,6 +1206,10 @@ class AgentLoopRunner:
 
                 request_id = request_snapshot.request_id
                 current_step = step
+                gate_active = (
+                    self._final_output_gate_enabled
+                    and verification_tracker.report().final_output_gate_active
+                )
 
                 async def record_output_started(
                     output_kind: str,
@@ -1146,6 +1231,7 @@ class AgentLoopRunner:
                     can_adopt_provider_origin=can_adopt_provider_origin,
                     on_imperfect=lambda: setattr(recorder, "pristine_cancel_eligible", False),
                     on_output_started=record_output_started,
+                    buffer_text=gate_active,
                 )
                 step_text = step_result.text
                 step_reasoning = step_result.reasoning
@@ -1239,6 +1325,16 @@ class AgentLoopRunner:
                     if completion.response_text is not None
                     else "".join(step_text)
                 )
+                if gate_active and tool_calls:
+                    for text in step_text:
+                        await emit(AgentEventKind.TEXT_DELTA, {"text": text})
+                if gate_active and not tool_calls:
+                    terminal_candidate = FinalResponseContract.provisional(
+                        assistant_content,
+                        source=ResponseSource.NORMAL_MODEL,
+                        verification=verification_tracker.report(),
+                    )
+                    return await complete_gated_terminal_turn(terminal_candidate, step=step)
                 response_parts.append(assistant_content)
                 assistant_message = Message(
                     Role.ASSISTANT,

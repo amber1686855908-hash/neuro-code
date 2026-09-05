@@ -256,6 +256,23 @@ class VerificationReport:
         return latest.freshness_for(self.workspace_generation) if latest is not None else None
 
     @property
+    def final_output_gate_active(self) -> bool:
+        """Return whether terminal model output must await verification truth.
+
+        The gate is sticky for the lifetime of a report: a workspace mutation,
+        an explicit verification requirement, or any recorded evidence is
+        enough to activate it.  This is a derived projection of the existing
+        verification owner rather than a second runtime state machine.
+
+        返回终态模型输出是否必须等待验证事实。
+
+        在一个报告生命周期内, gate 一旦激活便保持激活: 工作区修改、显式验证要求或
+        已记录的任意证据均会触发它。这是现有验证所有者的派生投影,不是第二个运行时状态机。
+        """
+
+        return bool(self.workspace_generation > 0 or self.verification_required or self.evidence)
+
+    @property
     def confirmed_items(self) -> tuple[str, ...]:
         """Return only evidence that may be presented as successful validation."""
 

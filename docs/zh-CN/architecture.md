@@ -1608,8 +1608,22 @@ verification state 与工作区 generation metadata。它不拥有验证状态�
 或持久化会话条目创建前被拒绝。既有 session schema 与已提交历史的 replay 不变。
 
 普通模型路径、evidence-aware finalizer、Runtime deterministic fallback 以及 external result replay
-使用不同的 response-source 值。本契约切片不改变普通 `TEXT_DELTA` 投递；阻止验证前发送
-false-success 文本的独立 VF-2b runtime truth gate 仍待实现。
+使用不同的 response-source 值。后续 VF-2b gate 保持无工作区修改回合的既有流式路径；但当回合出现
+工作区修改、显式验证要求或已记录的验证证据后，会启用有界的逐步骤文本 buffer。包含 tool call 的
+步骤会在确认 tool shape 后按中间输出释放文本。无工具步骤只形成 provisional candidate，并由
+evidence-aware finalizer 或有界 deterministic fallback 替换；只有该 committed 响应可以进入
+`AgentRunResult`、`TURN_COMPLETED` 或可重放的 assistant 历史。即使文本尚未发布，
+`MODEL_OUTPUT_STARTED` 仍记录 Provider output 以支持恢复。Provider stream、CLI/TUI/ACP 协议和
+session schema 契约均不改变。
+
+## VF-2b：验证门控的终态模型输出
+
+`AgentLoopRunner` 拥有 gate 集成，`ModelStepProcessor` 拥有有界的步骤内 buffer。推理、backend-tool
+进度和 tool 生命周期事件继续正常流式投递。gate 激活后，无工具终态模型步骤只创建 provisional
+`FinalResponseContract`，绝不追加到对话或持久化。既有 `AgentFinalizer` 接收来自唯一
+`VerificationTracker` owner 的 snapshot；若无法生成可用响应，运行时自有的 deterministic fallback
+只根据有界的验证/工作区事实报告，并使用 fallback source 提交。提交前取消或失败沿用现有回合失败恢复
+路径，不能重放 provisional candidate。这是逐步骤的 truth boundary，不是整回合 buffer，也不执行验证发现。
 
 ## 面向 Prompt Cache 的模型请求投影与用量
 
