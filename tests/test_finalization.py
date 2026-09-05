@@ -13,6 +13,10 @@ from neuro_code.application.runtime.finalization import (
     FinalizationResult,
     FinalizationStatus,
 )
+from neuro_code.application.runtime.verification import (
+    VerificationEvidence,
+    VerificationState,
+)
 from neuro_code.domain.conversation.context import ModelContext
 from neuro_code.domain.conversation.events import (
     ModelCompleted,
@@ -438,3 +442,32 @@ class FinalizationTests(unittest.IsolatedAsyncioTestCase):
                 True,
                 "stop",
             )
+
+    def test_finalizer_does_not_present_failed_or_stale_verification_as_success(self) -> None:
+        provider = ScriptedFinalizerProvider(((ModelTextDelta("done"), ModelCompleted("stop")),))
+        finalizer = AgentFinalizer(provider)
+        evidence_value = VerificationEvidence.from_result(
+            tool_name="bash",
+            result_content="1 failed",
+            is_error=True,
+            scope=("bash:test",),
+            workspace_generation=0,
+        )
+        for state, workspace_generation, expected_freshness in (
+            (VerificationState.FAIL, 0, "current"),
+            (VerificationState.INCOMPLETE, 1, "stale"),
+        ):
+            with self.subTest(state=state):
+                prompt = finalizer._instruction(
+                    evidence(
+                        verification=("legacy success claim",),
+                        verification_state=state,
+                        verification_evidence=(evidence_value,),
+                        verification_workspace_generation=workspace_generation,
+                    )
+                )
+
+                self.assertIn(f"Verification state: {state.value}", prompt)
+                self.assertIn("Confirmed validation: none provided", prompt)
+                self.assertIn(f"failure ({expected_freshness})", prompt)
+                self.assertNotIn("legacy success claim", prompt)

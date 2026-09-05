@@ -1776,6 +1776,7 @@ def test_canonical_runtime_modules_are_the_only_runtime_implementations() -> Non
         "neuro_code.application.runtime.supervision",
         "neuro_code.application.runtime.tool_scheduler",
         "neuro_code.application.runtime.tool_pipeline",
+        "neuro_code.application.runtime.verification",
     }
     assert {
         module for module in modules if module.startswith("neuro_code.application.runtime.")
@@ -1808,6 +1809,15 @@ def test_canonical_runtime_modules_are_the_only_runtime_implementations() -> Non
         "neuro_code.application.runtime.tool_pipeline": {
             "ToolExecutor",
             "ToolObservationBuilder",
+        },
+        "neuro_code.application.runtime.verification": {
+            "VerificationEvidence",
+            "VerificationFreshness",
+            "VerificationObservation",
+            "VerificationOutcome",
+            "VerificationReport",
+            "VerificationState",
+            "VerificationTracker",
         },
     }
     for module, class_names in expected_classes.items():
@@ -2071,6 +2081,13 @@ def test_canonical_runtime_consumers_use_explicit_submodules() -> None:
         "neuro_code.application.runtime.agent_loop": {
             "neuro_code.application.sessions.lifecycle",
             "neuro_code.application.sessions.task_queries",
+            "neuro_code.application.runtime.verification",
+        },
+        "neuro_code.application.runtime.supervision": {
+            "neuro_code.application.runtime.verification",
+        },
+        "neuro_code.application.runtime.tool_pipeline": {
+            "neuro_code.application.runtime.verification",
         },
         "neuro_code.application.acp.service": {
             "neuro_code.application.sessions.catalog",

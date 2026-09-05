@@ -57,6 +57,7 @@ from neuro_code.application.runtime.supervision import (
     SupervisionMode,
     SupervisionTraceRecord,
 )
+from neuro_code.application.runtime.verification import VerificationState
 from neuro_code.application.sessions import (
     GetSessionTaskRequest,
     StartSessionRequest,
@@ -4549,6 +4550,46 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(secret, finalizer_instruction)
             self.assertNotIn("digest", finalizer_instruction)
             self.assertNotIn("tool result", finalizer_instruction.lower())
+
+    async def test_runtime_finalization_receives_typed_current_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tool = MetadataFixtureTool(
+                "bash",
+                ToolResult("2 passed", metadata={"exit_code": 0}),
+            )
+            provider = ScriptedProvider(
+                (
+                    (
+                        ModelToolCall(ToolCall("verify-1", "bash", {"command": "pytest -q"})),
+                        ModelCompleted("tool_calls"),
+                    ),
+                    (ModelTextDelta("safe"), ModelCompleted("stop")),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection((tool,)),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(mode=PermissionMode.BYPASS),
+                tool_context=ToolContext(Path(directory)),
+                supervisor_factory=observing_supervisor_factory(
+                    observation_budget(max_model_calls=1)
+                ),
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+            )
+
+            result = await runtime.run("run verification")
+
+            assert result.verification is not None
+            self.assertIs(result.verification.state, VerificationState.PASS)
+            finalizer_instruction = next(
+                message.content
+                for message in provider.calls[-1].messages
+                if message.role is Role.SYSTEM and message.content.startswith("You are producing")
+            )
+            self.assertIn("Verification state: pass", finalizer_instruction)
+            self.assertIn("success (current) via bash", finalizer_instruction)
+            self.assertIn("bash:test", finalizer_instruction)
 
     async def test_finalization_workspace_evidence_is_redacted_and_excludes_diffs_and_tool_output(
         self,

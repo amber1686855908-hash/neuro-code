@@ -63,6 +63,7 @@ from neuro_code.application.runtime.supervision import (
     ToolExecutionObservation,
     stable_metadata_fact,
 )
+from neuro_code.application.runtime.verification import build_verification_evidence
 from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
 from neuro_code.domain.conversation.messages import Message, Role, SessionItem, ToolCall
 from neuro_code.domain.execution import ProgressKind
@@ -198,6 +199,7 @@ class ToolObservationBuilder:
         plan_fingerprint_before: str | None,
         current_plan_fingerprint: str | None,
         tool_call_id: str,
+        verification_eligible: bool = True,
     ) -> ToolExecutionObservation:
         """Build a fail-open, redacted supervision record after a tool terminal path.
 
@@ -211,12 +213,25 @@ class ToolObservationBuilder:
             else None
         )
         external_state_token = self.background_state_token(tool_name, result.metadata)
+        verification = (
+            build_verification_evidence(
+                tool_name=tool_name,
+                arguments=arguments,
+                result_content=result.content,
+                is_error=result.is_error,
+                redaction_values=self._redaction_values,
+            )
+            if verification_eligible
+            else None
+        )
         if workspace_changed:
             progress_kind = ProgressKind.WORKSPACE
         elif plan_fingerprint is not None:
             progress_kind = ProgressKind.PLAN
         elif external_state_token is not None:
             progress_kind = ProgressKind.EXTERNAL_STATE
+        elif verification is not None:
+            progress_kind = ProgressKind.VERIFICATION
         elif not result.is_error and tool is not None and not tool.side_effecting:
             progress_kind = ProgressKind.EVIDENCE
         else:
@@ -235,6 +250,7 @@ class ToolObservationBuilder:
             path_context=None,
             redaction_values=self._redaction_values,
             tool_call_id=tool_call_id,
+            verification=verification,
         )
 
 
@@ -748,6 +764,7 @@ class ToolExecutor:
                 tool=tool,
                 change_report=change_report,
                 plan_fingerprint_before=plan_fingerprint_before,
+                verification_eligible=True,
             )
         except BaseException as error:
             if not resolved:
@@ -800,6 +817,7 @@ class ToolExecutor:
         tool: Tool | None,
         change_report: WorkspaceChangeReport | None,
         plan_fingerprint_before: str | None,
+        verification_eligible: bool = False,
     ) -> ToolExecutionObservation | None:
         """Build a fail-open, redacted supervision record after a tool terminal path.
 
@@ -820,6 +838,7 @@ class ToolExecutor:
                 plan_fingerprint_before=plan_fingerprint_before,
                 current_plan_fingerprint=current_plan_fingerprint,
                 tool_call_id=call.id,
+                verification_eligible=verification_eligible,
             )
         except Exception as error:
             LOGGER.debug(

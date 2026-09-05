@@ -23,6 +23,7 @@ from neuro_code.application.execution_policy import (
     NORMAL_EXECUTION_BUDGET,
     ExecutionBudgetPolicy,
 )
+from neuro_code.application.runtime.verification import VerificationEvidence
 from neuro_code.domain.execution import (
     AgentExecutionStatus,
     ExecutionBudget,
@@ -399,6 +400,7 @@ class ToolExecutionObservation:
     verification_token: str | None = None
     external_state_token: str | None = None
     progress_kind: ProgressKind = ProgressKind.NONE
+    verification: VerificationEvidence | None = None
 
     def __post_init__(self) -> None:
         _validate_tool_name(self.tool_name)
@@ -427,6 +429,14 @@ class ToolExecutionObservation:
                 _validate_sha256(value, field_name=field_name)
         if not isinstance(self.progress_kind, ProgressKind):
             raise ValueError("progress_kind must be canonical")
+        if self.verification is not None:
+            if not isinstance(self.verification, VerificationEvidence):
+                raise TypeError("verification must be a VerificationEvidence or None")
+            if self.verification.tool_name != self.tool_name:
+                raise ValueError("verification tool_name must match the observation tool_name")
+            expected_outcome = "failure" if self.is_error else "success"
+            if self.verification.outcome.value != expected_outcome:
+                raise ValueError("verification outcome must match observation is_error")
 
     @property
     def fingerprint(self) -> ToolInteractionFingerprint:
@@ -453,6 +463,8 @@ class ToolExecutionObservation:
         verification_token: str | None = None,
         external_state_token: str | None = None,
         progress_kind: ProgressKind = ProgressKind.NONE,
+        verification: VerificationEvidence | None = None,
+        verification_scope: Sequence[str] = (),
         path_context: PathNormalizationContext | None = None,
         redaction_values: Sequence[str] = (),
         tool_call_id: str | None = None,
@@ -489,6 +501,14 @@ class ToolExecutionObservation:
             external_state_token=external_state_token,
             redaction_values=redaction_values,
         )
+        if verification is None and progress_kind is ProgressKind.VERIFICATION:
+            verification = VerificationEvidence.from_result(
+                tool_name=tool_name,
+                result_content=result_content,
+                is_error=is_error,
+                scope=verification_scope,
+                redaction_values=redaction_values,
+            )
         return cls(
             tool_name=tool_name,
             action_digest=action_digest,
@@ -514,6 +534,7 @@ class ToolExecutionObservation:
                 redaction_values=redaction_values,
             ),
             progress_kind=progress_kind,
+            verification=verification,
         )
 
 

@@ -16,6 +16,12 @@ from enum import StrEnum
 from typing import Protocol
 
 from neuro_code.application.ports.model import ModelProvider, ModelToolPolicy
+from neuro_code.application.runtime.verification import (
+    VerificationEvidence,
+    VerificationFreshness,
+    VerificationOutcome,
+    VerificationState,
+)
 from neuro_code.domain.conversation.context import ModelContext
 from neuro_code.domain.conversation.events import ModelCompleted, ModelTextDelta, ModelToolCall
 from neuro_code.domain.conversation.messages import Message, Role, ToolCall
@@ -144,6 +150,9 @@ class FinalizationEvidence:
     unverified_items: tuple[str, ...] = field(default_factory=tuple)
     blocker: str | None = None
     uncertainty: tuple[str, ...] = field(default_factory=tuple)
+    verification_state: VerificationState = VerificationState.NOT_APPLICABLE
+    verification_evidence: tuple[VerificationEvidence, ...] = field(default_factory=tuple)
+    verification_workspace_generation: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.trigger, SupervisorReasonCode):
@@ -173,6 +182,18 @@ class FinalizationEvidence:
             "uncertainty",
             _bounded_evidence_items(self.uncertainty, field_name="uncertainty"),
         )
+        if not isinstance(self.verification_state, VerificationState):
+            raise TypeError("verification_state must be a VerificationState")
+        verification_evidence = tuple(self.verification_evidence)
+        if not all(isinstance(item, VerificationEvidence) for item in verification_evidence):
+            raise TypeError("verification_evidence must contain VerificationEvidence values")
+        object.__setattr__(self, "verification_evidence", verification_evidence[:4])
+        if (
+            not isinstance(self.verification_workspace_generation, int)
+            or isinstance(self.verification_workspace_generation, bool)
+            or self.verification_workspace_generation < 0
+        ):
+            raise ValueError("verification_workspace_generation must be non-negative")
         if self.blocker is not None and not isinstance(self.blocker, str):
             raise TypeError("blocker must be a string or None")
         if self.blocker is not None:
@@ -272,11 +293,45 @@ class AgentFinalizer:
             return f"{title}: none provided"
         return "\n".join((f"{title}:", *(f"- {item}" for item in safe_items)))
 
+    def _format_verification_evidence(
+        self,
+        evidence: Sequence[VerificationEvidence],
+        *,
+        workspace_generation: int,
+    ) -> str:
+        items: list[str] = []
+        for item in evidence[:4]:
+            freshness = item.freshness_for(workspace_generation)
+            scope = ", ".join(item.scope) if item.scope else "scope unspecified"
+            items.append(
+                "{} ({}) via {}; scope={}; summary={}".format(
+                    item.outcome.value,
+                    "current" if freshness is VerificationFreshness.CURRENT else "stale",
+                    self._safe_text(item.tool_name, limit=_MAX_TOOL_NAME_CHARS),
+                    self._safe_text(scope, limit=_MAX_EVIDENCE_ITEM_CHARS),
+                    self._safe_text(item.summary, limit=_MAX_EVIDENCE_ITEM_CHARS),
+                )
+            )
+        return self._format_evidence_category("Verification evidence", items)
+
     def _instruction(self, evidence: FinalizationEvidence) -> str:
         blocker = (
             self._safe_text(evidence.blocker, limit=_MAX_EVIDENCE_BLOCKER_CHARS)
             if evidence.blocker
             else "none provided"
+        )
+        latest_verification = (
+            evidence.verification_evidence[-1] if evidence.verification_evidence else None
+        )
+        can_confirm_legacy_verification = (
+            evidence.verification_state is VerificationState.NOT_APPLICABLE
+            and not evidence.verification_evidence
+        ) or (
+            evidence.verification_state is VerificationState.PASS
+            and latest_verification is not None
+            and latest_verification.outcome is VerificationOutcome.SUCCESS
+            and latest_verification.freshness_for(evidence.verification_workspace_generation)
+            is VerificationFreshness.CURRENT
         )
         sections = (
             "You are producing the final response for the user.",
@@ -284,11 +339,20 @@ class AgentFinalizer:
             "Use only the existing conversation and the confirmed evidence below.",
             "Do not claim an edit or validation happened unless the evidence explicitly confirms it.",
             "Clearly distinguish completed work, verified work, unverified work, blockers, and remaining uncertainty. If the work is partial, state that honestly.",
+            "If verification state is FAIL or INCOMPLETE, do not describe the work as verified or as tests passing.",
             self._format_evidence_category("Confirmed completed work", evidence.completed_items),
             self._format_evidence_category(
                 "Confirmed workspace changes", evidence.workspace_changes
             ),
-            self._format_evidence_category("Confirmed validation", evidence.verification),
+            f"Verification state: {evidence.verification_state.value}",
+            self._format_evidence_category(
+                "Confirmed validation",
+                evidence.verification if can_confirm_legacy_verification else (),
+            ),
+            self._format_verification_evidence(
+                evidence.verification_evidence,
+                workspace_generation=evidence.verification_workspace_generation,
+            ),
             self._format_evidence_category("Unverified work", evidence.unverified_items),
             f"Blocker: {blocker}",
             self._format_evidence_category("Remaining uncertainty", evidence.uncertainty),

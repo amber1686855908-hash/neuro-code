@@ -69,6 +69,10 @@ from neuro_code.application.runtime.tool_scheduler import (
     ToolBatchExecutionError,
     ToolScheduler,
 )
+from neuro_code.application.runtime.verification import (
+    VerificationReport,
+    VerificationTracker,
+)
 from neuro_code.application.sessions.lifecycle import (
     SessionLifecycleService,
     StartSessionRequest,
@@ -151,6 +155,7 @@ class AgentRunResult:
     plan: SessionPlan | None = None
     outcome: AgentExecutionOutcome | None = None
     turn_id: str | None = None
+    verification: VerificationReport | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,6 +264,7 @@ class AgentLoopRunner:
         ultracode_execution_id: str | None = None,
         cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
         turn_source: TurnSource = TurnSource.USER,
+        verification_required: bool = False,
     ) -> AgentRunResult:
         prompt_parts = tuple(content_parts)
         if ultracode_execution_id is not None and (
@@ -279,6 +285,8 @@ class AgentLoopRunner:
             raise ConfigurationError("a session task requires plan execution")
         if not isinstance(cancellation_policy, TurnCancellationPolicy):
             raise TypeError("cancellation_policy must be a TurnCancellationPolicy")
+        if not isinstance(verification_required, bool):
+            raise TypeError("verification_required must be a bool")
         # Until suspended-task resume exists, one run is exactly one logical
         # user task.  A future task coordinator must move this reset to task
         # creation so resuming another execution segment preserves the first
@@ -287,6 +295,9 @@ class AgentLoopRunner:
         # 必须把重置移到任务创建处,使恢复新的执行段时保留首次变更基线.
         if self._tool_context.workspace_change_journal is not None:
             self._tool_context.workspace_change_journal.begin_task()
+        verification_tracker = VerificationTracker(
+            verification_required=verification_required,
+        )
         turn_started_at = monotonic()
         context_items = list(initial_items)
         messages = [item for item in context_items if isinstance(item, Message)]
@@ -772,7 +783,6 @@ class AgentLoopRunner:
             )
 
         workspace_evidence: list[str] = []
-        verification_evidence: list[str] = []
 
         def record_workspace_evidence(report: WorkspaceChangeReport) -> None:
             for change in report.files:
@@ -784,11 +794,28 @@ class AgentLoopRunner:
                     f"{change.status} {path} (+{change.additions}/-{change.deletions})"
                 )
 
-        def record_verification_evidence(observation: ToolExecutionObservation) -> None:
-            if observation.progress_kind is ProgressKind.VERIFICATION:
-                verification_evidence.append(
-                    "A verification result was recorded before finalization."
-                )
+        def finalization_evidence(
+            decision: SupervisorDecision,
+        ) -> FinalizationEvidence:
+            verification = verification_tracker.report()
+            return FinalizationEvidence(
+                decision.reason_code,
+                workspace_changes=tuple(workspace_evidence),
+                verification=verification.confirmed_items,
+                unverified_items=(
+                    *verification.unverified_items,
+                    "No additional verification should be claimed without recorded evidence.",
+                ),
+                verification_state=verification.state,
+                verification_evidence=verification.evidence,
+                verification_workspace_generation=verification.workspace_generation,
+                blocker=(
+                    f"Execution stopped because {decision.reason_code.value.replace('_', ' ')}."
+                ),
+                uncertainty=(
+                    "The final response is limited to evidence already recorded in the conversation.",
+                ),
+            )
 
         async def complete_finalized_turn(
             decision: SupervisorDecision,
@@ -824,20 +851,7 @@ class AgentLoopRunner:
             )
             finalization = await finalizer.finalize(
                 projected_model_context(),
-                FinalizationEvidence(
-                    decision.reason_code,
-                    workspace_changes=tuple(workspace_evidence),
-                    verification=tuple(verification_evidence),
-                    unverified_items=(
-                        "No additional verification should be claimed without recorded evidence.",
-                    ),
-                    blocker=(
-                        f"Execution stopped because {decision.reason_code.value.replace('_', ' ')}."
-                    ),
-                    uncertainty=(
-                        "The final response is limited to evidence already recorded in the conversation.",
-                    ),
-                ),
+                finalization_evidence(decision),
             )
             return await complete_finalization_result(finalization, decision, step=step)
 
@@ -894,6 +908,7 @@ class AgentLoopRunner:
                 self._context_builder.plan,
                 outcome,
                 turn_id,
+                verification_tracker.report(),
             )
 
         response_parts: list[str] = []
@@ -1235,6 +1250,7 @@ class AgentLoopRunner:
                         step,
                         self._context_builder.plan,
                         turn_id=turn_id,
+                        verification=verification_tracker.report(),
                     )
 
                 tool_batch = tuple(call.name for call in tool_calls)
@@ -1265,6 +1281,8 @@ class AgentLoopRunner:
                     *,
                     model_step: int = step,
                 ) -> SupervisorDecision | None:
+                    verification_tracker.observe(observation)
+
                     def observe_tool(
                         current: AgentExecutionSupervisor,
                     ) -> SupervisorDecision:
@@ -1376,7 +1394,6 @@ class AgentLoopRunner:
                     if observation is None:
                         disable_supervision("tool_observation_unavailable")
                     else:
-                        record_verification_evidence(observation)
                         last_tool_decision = record_tool_outcome(observation)
                         if (
                             supervisor is not None
