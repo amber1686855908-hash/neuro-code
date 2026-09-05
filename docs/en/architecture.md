@@ -2930,6 +2930,29 @@ guidance message. Segment thresholds do not reset or replace the global turn
 budget and do not promise crash recovery or workspace rollback. See [ADR
 0107](adr/0107-bounded-long-task-runtime.md).
 
+## VF-2a provisional and committed final-response contract
+
+`neuro_code.application.runtime.final_response` is the canonical owner of the
+terminal response boundary. `FinalResponseContract` distinguishes a
+replaceable `PROVISIONAL` candidate from a `COMMITTED` response, records the
+response source, and projects the existing `VerificationReport` into bounded
+verification state and workspace-generation metadata. It does not own
+verification state and does not persist candidate text.
+
+`AgentRunResult.response` remains the committed user-visible response for
+backward compatibility; its typed `response_contract` must be committed and
+must match the response and verification projection. `TurnEventRecorder` adds
+the fixed-shape response metadata to `TURN_COMPLETED` only for a committed
+contract, before the existing atomic session-store finalization. A provisional
+contract is rejected before the completion event or durable session items are
+created. Existing session schema and replay of committed history are unchanged.
+
+The normal model path, evidence-aware finalizer, runtime deterministic fallback,
+and external result replay have distinct response-source values. Ordinary
+`TEXT_DELTA` delivery remains unchanged in this contract-only slice; preventing
+false-success text from being delivered before verification is the separate
+VF-2b runtime truth gate.
+
 ## Cache-friendly model request projection and usage
 
 `ContextBuilder` owns the stable early request prefix: the request-scoped

@@ -49,6 +49,7 @@ from neuro_code.application.ports.workspace_changes import (
 )
 from neuro_code.application.runtime.agent import AgentRuntime
 from neuro_code.application.runtime.context_builder import ContextBuilder
+from neuro_code.application.runtime.final_response import ResponseSource
 from neuro_code.application.runtime.finalization import AgentFinalizer
 from neuro_code.application.runtime.supervision import (
     AgentExecutionSupervisor,
@@ -4039,6 +4040,11 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(completed.kind, AgentEventKind.TURN_COMPLETED)
             self.assertEqual(completed.data["execution_status"], "budget_limited")
             self.assertEqual(completed.data["finalization_attempts"], 1)
+            self.assertEqual(
+                completed.data["response_source"],
+                ResponseSource.EVIDENCE_AWARE_FINALIZER.value,
+            )
+            self.assertEqual(completed.data["response_committed"], True)
             finalizing = [
                 event for event in result.events if event.kind is AgentEventKind.FINALIZING_STARTED
             ]
@@ -4141,6 +4147,16 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             result = await runtime.run("inspect", session_id=session_id, sink=observe)
 
             self.assertEqual(observations, [(True, True, len(result.items))])
+            assert result.response_contract is not None
+            self.assertTrue(result.response_contract.is_committed)
+            self.assertIs(result.response_contract.source, ResponseSource.NORMAL_MODEL)
+            completed = next(
+                event for event in result.events if event.kind is AgentEventKind.TURN_COMPLETED
+            )
+            self.assertEqual(completed.data["response_committed"], True)
+            self.assertEqual(completed.data["response_source"], "normal_model")
+            self.assertEqual(completed.data["verification_state"], "not_applicable")
+            self.assertEqual(completed.data["verification_workspace_generation"], 0)
 
     async def test_normal_completion_replaces_a_previous_recoverable_execution_record(
         self,

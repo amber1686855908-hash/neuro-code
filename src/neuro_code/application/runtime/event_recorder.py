@@ -22,6 +22,7 @@ from time import monotonic
 
 from neuro_code.application.memory.compaction_runtime import ContextCompactionTurnProjection
 from neuro_code.application.ports.storage import SessionStore
+from neuro_code.application.runtime.final_response import FinalResponseContract
 from neuro_code.domain.conversation.compaction import DurableCompactionItem
 from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
 from neuro_code.domain.conversation.messages import Message, SessionItem
@@ -337,6 +338,8 @@ class TurnEventRecorder:
         data: dict[str, object],
         result_items: Sequence[SessionItem],
         compaction_item: DurableCompactionItem | None = None,
+        *,
+        response_contract: FinalResponseContract | None = None,
     ) -> None:
         """Persist one completed turn, optionally with its durable compaction.
 
@@ -362,7 +365,16 @@ class TurnEventRecorder:
             self._session_store is None or self._session_id is None
         ):
             raise ConfigurationError("compaction finalization requires a persisted session")
+        if response_contract is not None and not isinstance(
+            response_contract,
+            FinalResponseContract,
+        ):
+            raise TypeError("response_contract must be a FinalResponseContract or None")
+        if response_contract is not None and not response_contract.is_committed:
+            raise ConfigurationError("TURN_COMPLETED requires a committed final response")
         completion_data = dict(data)
+        if response_contract is not None:
+            completion_data.update(response_contract.to_completion_metadata())
         if self._turn_id is not None:
             completion_data.setdefault("turn_id", self._turn_id)
         task, task_event = self._prepare_task_terminal(SessionTaskStatus.COMPLETED)
@@ -429,6 +441,7 @@ class TurnEventRecorder:
         result_items: Sequence[SessionItem],
         *,
         completed_outcome: AgentExecutionOutcome | None = None,
+        response_contract: FinalResponseContract | None = None,
     ) -> None:
         """Consume one explicit compaction projection at turn finalization.
 
@@ -458,6 +471,7 @@ class TurnEventRecorder:
                 data,
                 result_items,
                 projection.compaction_item,
+                response_contract=response_contract,
             )
             return
         if projection.outcome is None:
@@ -470,6 +484,7 @@ class TurnEventRecorder:
             projection.outcome,
             data,
             result_items,
+            response_contract=response_contract,
         )
 
     async def _deliver(self, event: AgentEvent) -> None:

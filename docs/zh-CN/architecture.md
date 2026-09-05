@@ -1594,6 +1594,23 @@ Runtime 门控现在会在允许的显式压缩操作外层真正执行有限的
 接收一次临时 checkpoint 指引。segment 阈值不重置或取代全局回合预算，也不承诺崩溃恢复或工作区回滚。
 详见 [ADR 0107](adr/0107-bounded-long-task-runtime.md)。
 
+## VF-2a：provisional 与 committed 最终响应契约
+
+`neuro_code.application.runtime.final_response` 是终态响应边界的 canonical owner。
+`FinalResponseContract` 区分仍可替换的 `PROVISIONAL` candidate 与
+`COMMITTED` 响应，记录 response source，并把现有 `VerificationReport` 投影为有界的
+verification state 与工作区 generation metadata。它不拥有验证状态，也不持久化 candidate 文本。
+
+为保持兼容，`AgentRunResult.response` 继续表示用户可见的 committed 响应；其类型化的
+`response_contract` 必须是 committed，并且必须与 response 及 verification projection 一致。
+`TurnEventRecorder` 只会为 committed contract 把固定形状的响应 metadata 加入
+`TURN_COMPLETED`，然后进入现有的 SessionStore 原子最终化。provisional contract 会在完成事件
+或持久化会话条目创建前被拒绝。既有 session schema 与已提交历史的 replay 不变。
+
+普通模型路径、evidence-aware finalizer、Runtime deterministic fallback 以及 external result replay
+使用不同的 response-source 值。本契约切片不改变普通 `TEXT_DELTA` 投递；阻止验证前发送
+false-success 文本的独立 VF-2b runtime truth gate 仍待实现。
+
 ## 面向 Prompt Cache 的模型请求投影与用量
 
 `ContextBuilder` 拥有稳定的请求前缀：请求范围 system 策略、确定顺序的工具定义，以及当前序列化后的
