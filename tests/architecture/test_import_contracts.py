@@ -1772,6 +1772,7 @@ def test_canonical_runtime_modules_are_independently_importable() -> None:
         "neuro_code.application.runtime.agent_loop",
         "neuro_code.application.runtime.context_builder",
         "neuro_code.application.runtime.event_recorder",
+        "neuro_code.application.runtime.final_response",
         "neuro_code.application.runtime.model_step",
         "neuro_code.application.runtime.tool_pipeline",
         "neuro_code.application.runtime.verification",
@@ -2151,6 +2152,11 @@ def test_canonical_runtime_public_types_keep_module_paths_and_metadata() -> None
         "neuro_code.application.runtime.agent_loop": ("AgentLoopRunner", "AgentRunResult"),
         "neuro_code.application.runtime.context_builder": ("ContextBuilder",),
         "neuro_code.application.runtime.event_recorder": ("TurnEventRecorder",),
+        "neuro_code.application.runtime.final_response": (
+            "FinalResponseContract",
+            "ResponseCommitState",
+            "ResponseSource",
+        ),
         "neuro_code.application.runtime.model_step": (
             "ModelStepProcessor",
             "ModelStepResult",

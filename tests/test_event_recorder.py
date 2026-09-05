@@ -12,6 +12,11 @@ from neuro_code.application.memory.compaction_runtime import (
     project_context_compaction_failure,
 )
 from neuro_code.application.runtime.event_recorder import TurnEventRecorder
+from neuro_code.application.runtime.final_response import (
+    FinalResponseContract,
+    ResponseSource,
+)
+from neuro_code.application.runtime.verification import VerificationReport, VerificationState
 from neuro_code.domain.conversation.compaction import DurableCompactionItem
 from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
 from neuro_code.domain.conversation.messages import Message, Role
@@ -221,6 +226,78 @@ class TurnEventRecorderTests(unittest.IsolatedAsyncioTestCase):
                 (),
                 completed_outcome=outcome,
             )
+
+    async def test_provisional_response_cannot_reach_turn_completion_or_storage(self) -> None:
+        events: list[AgentEvent] = []
+        recorder = TurnEventRecorder(
+            sink=None,
+            session_store=None,
+            session_id=None,
+            turn_source=TurnSource.USER,
+            turn_started_at=0.0,
+            persist_turn_context=True,
+            turn_context_prefix=(),
+            context_items=[],
+            events=events,
+            sequence=0,
+            session_task=None,
+            pristine_cancel_eligible=False,
+        )
+        outcome = AgentExecutionOutcome(
+            AgentExecutionStatus.COMPLETED,
+            None,
+            finalized=False,
+            recoverable=False,
+        )
+        candidate = FinalResponseContract.provisional(
+            "candidate",
+            source=ResponseSource.NORMAL_MODEL,
+            verification=VerificationReport(VerificationState.INCOMPLETE, (), 1, True),
+        )
+
+        with self.assertRaisesRegex(ConfigurationError, "committed final response"):
+            await recorder.finalize_turn_completion(
+                outcome,
+                {},
+                (),
+                response_contract=candidate,
+            )
+
+        self.assertEqual(events, [])
+
+    async def test_committed_response_metadata_is_persisted_on_completion_event(self) -> None:
+        recorder = self._recorder()
+        committed = FinalResponseContract.committed(
+            "done",
+            source=ResponseSource.DETERMINISTIC_FALLBACK,
+            verification=VerificationReport(VerificationState.FAIL, (), 4, True),
+        )
+        outcome = AgentExecutionOutcome(
+            AgentExecutionStatus.BUDGET_LIMITED,
+            SupervisorReasonCode.MODEL_STEP_LIMIT,
+            finalized=True,
+            recoverable=True,
+        )
+
+        await recorder.finalize_turn_completion(
+            outcome,
+            {"step": 1},
+            (),
+            response_contract=committed,
+        )
+
+        event = recorder._events[-1]
+        self.assertIs(event.kind, AgentEventKind.TURN_COMPLETED)
+        self.assertEqual(
+            event.data,
+            {
+                "step": 1,
+                "response_committed": True,
+                "response_source": "deterministic_fallback",
+                "verification_state": "fail",
+                "verification_workspace_generation": 4,
+            },
+        )
 
     async def test_legacy_task_finisher_maps_each_terminal_status(self) -> None:
         class TaskStore:

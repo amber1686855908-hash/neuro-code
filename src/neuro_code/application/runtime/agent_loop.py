@@ -50,9 +50,14 @@ from neuro_code.application.runtime.background_task_reminders import (
 )
 from neuro_code.application.runtime.context_builder import ContextBuilder
 from neuro_code.application.runtime.event_recorder import TurnEventRecorder
+from neuro_code.application.runtime.final_response import (
+    FinalResponseContract,
+    ResponseSource,
+)
 from neuro_code.application.runtime.finalization import (
     FinalizationEvidence,
     FinalizationResult,
+    FinalizationStatus,
     Finalizer,
 )
 from neuro_code.application.runtime.model_step import ModelStepProcessor
@@ -156,6 +161,28 @@ class AgentRunResult:
     outcome: AgentExecutionOutcome | None = None
     turn_id: str | None = None
     verification: VerificationReport | None = None
+    response_contract: FinalResponseContract | None = None
+
+    def __post_init__(self) -> None:
+        contract = self.response_contract
+        if contract is None:
+            contract = FinalResponseContract.committed(
+                self.response,
+                source=ResponseSource.NORMAL_MODEL,
+                verification=self.verification,
+            )
+            object.__setattr__(self, "response_contract", contract)
+        if not isinstance(contract, FinalResponseContract):
+            raise TypeError("response_contract must be a FinalResponseContract or None")
+        if not contract.is_committed:
+            raise ValueError("AgentRunResult requires a committed final response")
+        if contract.response != self.response:
+            raise ValueError("response_contract response must match AgentRunResult.response")
+        if self.verification is not None and (
+            contract.verification_state is not self.verification.state
+            or contract.verification_workspace_generation != self.verification.workspace_generation
+        ):
+            raise ValueError("response_contract verification projection is out of sync")
 
 
 @dataclass(frozen=True, slots=True)
@@ -862,6 +889,17 @@ class AgentLoopRunner:
             step: int,
         ) -> AgentRunResult:
             outcome = outcome_for_terminal_decision(decision)
+            verification = verification_tracker.report()
+            response_source = (
+                ResponseSource.EVIDENCE_AWARE_FINALIZER
+                if finalization.status is FinalizationStatus.COMPLETED
+                else ResponseSource.DETERMINISTIC_FALLBACK
+            )
+            response_contract = FinalResponseContract.committed(
+                finalization.response,
+                source=response_source,
+                verification=verification,
+            )
             final_message = Message(Role.ASSISTANT, finalization.response)
             messages.append(final_message)
             if persist_turn_context:
@@ -897,6 +935,7 @@ class AgentLoopRunner:
                 outcome,
                 completion_data,
                 result_items,
+                response_contract=response_contract,
             )
             return AgentRunResult(
                 session_id,
@@ -908,7 +947,8 @@ class AgentLoopRunner:
                 self._context_builder.plan,
                 outcome,
                 turn_id,
-                verification_tracker.report(),
+                verification=verification,
+                response_contract=response_contract,
             )
 
         response_parts: list[str] = []
@@ -1217,6 +1257,13 @@ class AgentLoopRunner:
                     result_items = (
                         persistent_context_items() if persist_turn_context else turn_context_prefix
                     )
+                    response = "".join(response_parts)
+                    verification = verification_tracker.report()
+                    response_contract = FinalResponseContract.committed(
+                        response,
+                        source=ResponseSource.NORMAL_MODEL,
+                        verification=verification,
+                    )
                     completion_data = {
                         "step": step,
                         "stop_reason": completion.stop_reason,
@@ -1228,7 +1275,7 @@ class AgentLoopRunner:
                         completion_data.update(
                             {
                                 "ultracode_execution_id": ultracode_execution_id,
-                                "response": "".join(response_parts),
+                                "response": response,
                             }
                         )
                     await finalize_turn_completion(
@@ -1240,17 +1287,19 @@ class AgentLoopRunner:
                         ),
                         completion_data,
                         result_items,
+                        response_contract=response_contract,
                     )
                     return AgentRunResult(
                         session_id,
-                        "".join(response_parts),
+                        response,
                         tuple(messages),
                         result_items,
                         tuple(events),
                         step,
                         self._context_builder.plan,
                         turn_id=turn_id,
-                        verification=verification_tracker.report(),
+                        verification=verification,
+                        response_contract=response_contract,
                     )
 
                 tool_batch = tuple(call.name for call in tool_calls)

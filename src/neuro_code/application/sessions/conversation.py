@@ -29,6 +29,10 @@ from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.ports.tools import Tool
 from neuro_code.application.ports.workspace import WorkspaceIdentity
 from neuro_code.application.runtime.agent import AgentRunResult, AgentRuntime, EventSink
+from neuro_code.application.runtime.final_response import (
+    FinalResponseContract,
+    ResponseSource,
+)
 from neuro_code.application.sessions.execution_queries import (
     LoadExecutionRecordRequest,
     SessionExecutionQueryService,
@@ -481,6 +485,10 @@ class AgentConversation:
             assistant_message = Message(Role.ASSISTANT, response)
             result_items = (*current_items, user_message, assistant_message)
             sequence = await self._store.next_event_sequence(session_id)
+            response_contract = FinalResponseContract.committed(
+                response,
+                source=ResponseSource.EXTERNAL_RESULT,
+            )
             event = AgentEvent.create(
                 sequence,
                 AgentEventKind.TURN_COMPLETED,
@@ -491,6 +499,7 @@ class AgentConversation:
                     "external_execution": True,
                     "response": response,
                     "step": 0,
+                    **response_contract.to_completion_metadata(),
                 },
             )
             outcome = AgentExecutionOutcome(
@@ -547,6 +556,10 @@ class AgentConversation:
         completion_event: AgentEvent | None = None,
         emit_completion: bool = False,
     ) -> AgentRunResult:
+        response_contract = FinalResponseContract.committed(
+            response,
+            source=ResponseSource.EXTERNAL_RESULT,
+        )
         delta = AgentEvent.create(0, AgentEventKind.TEXT_DELTA, {"text": response})
         events: list[AgentEvent] = [delta]
         if sink is not None:
@@ -563,7 +576,11 @@ class AgentConversation:
             replay_event = AgentEvent.create(
                 0,
                 AgentEventKind.TURN_COMPLETED,
-                {"turn_id": turn_id, "external_replay": True},
+                {
+                    "turn_id": turn_id,
+                    "external_replay": True,
+                    **response_contract.to_completion_metadata(),
+                },
             )
             events.append(replay_event)
             outcome = sink(replay_event)
@@ -585,6 +602,7 @@ class AgentConversation:
             self.plan,
             self._execution_record.outcome if self._execution_record is not None else None,
             turn_id,
+            response_contract=response_contract,
         )
 
     async def inspect_recovery(self) -> tuple[TurnRecoveryInspection, ...]:
