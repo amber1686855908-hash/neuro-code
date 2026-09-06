@@ -676,6 +676,7 @@ class VerificationTracker:
         known_ids = set(self._requirements.requirement_ids)
         if set(blocker.affected_requirement_ids) - known_ids:
             raise ValueError("verification blocker affects an unknown requirement ID")
+        current = replace(blocker, workspace_generation=self._workspace_generation)
         self._fact_sequence += 1
         reference = _reference_digest(
             "verification-blocker",
@@ -683,12 +684,12 @@ class VerificationTracker:
                 "sequence": self._fact_sequence,
                 "affected_requirement_ids": blocker.affected_requirement_ids,
                 "reason": blocker.reason.value,
-                "workspace_generation": blocker.workspace_generation,
-                "detail": blocker.detail,
+                "workspace_generation": current.workspace_generation,
+                "detail": current.detail,
             },
         )
-        fact = (blocker, reference)
-        for requirement_id in blocker.affected_requirement_ids:
+        fact = (current, reference)
+        for requirement_id in current.affected_requirement_ids:
             self._latest_blocker_by_requirement[requirement_id] = fact
 
     def observe(self, observation: VerificationObservation) -> None:

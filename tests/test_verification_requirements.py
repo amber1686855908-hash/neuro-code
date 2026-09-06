@@ -95,6 +95,15 @@ class RequirementModelTests(unittest.TestCase):
             {"planner-1", "user-1"},
         )
 
+    def test_snapshot_fingerprint_includes_effective_strength(self) -> None:
+        advisory = requirement("run the checks", strength=RequirementStrength.ADVISORY)
+        required = requirement("run the checks", strength=RequirementStrength.REQUIRED)
+
+        self.assertEqual(advisory.requirement_id, required.requirement_id)
+        advisory_snapshot = VerificationRequirementsSnapshot.from_requirements((advisory,))
+        required_snapshot = VerificationRequirementsSnapshot.from_requirements((required,))
+        self.assertNotEqual(advisory_snapshot.fingerprint, required_snapshot.fingerprint)
+
     def test_snapshot_is_bounded_and_round_trips_by_fingerprint(self) -> None:
         values = tuple(
             requirement(f"check {index}") for index in range(MAX_VERIFICATION_REQUIREMENTS)
@@ -130,6 +139,32 @@ class StructuredVerificationTrackerTests(unittest.TestCase):
 
         report = tracker.report()
         self.assertIs(report.state, VerificationState.INCOMPLETE)
+        self.assertEqual(
+            {item.state for item in report.requirement_evaluations},
+            {RequirementEvaluationState.NO_EVIDENCE},
+        )
+
+    def test_empty_snapshot_stays_structured_and_legacy_flag_is_deterministic(self) -> None:
+        structured = VerificationTracker(requirements=VerificationRequirementsSnapshot())
+        structured_report = structured.report()
+
+        self.assertIs(structured_report.state, VerificationState.NOT_APPLICABLE)
+        self.assertEqual(structured_report.requirement_evaluations, ())
+        self.assertIsNotNone(structured_report.requirements_fingerprint)
+        self.assertFalse(structured_report.final_output_gate_active)
+
+        gated = VerificationTracker(
+            requirements=VerificationRequirementsSnapshot(),
+            verification_required=True,
+        )
+        self.assertIs(gated.report().state, VerificationState.INCOMPLETE)
+        self.assertTrue(gated.report().final_output_gate_active)
+
+    def test_always_required_activates_gate_before_any_runtime_fact(self) -> None:
+        tracker = VerificationTracker(requirements=self.snapshot)
+
+        report = tracker.report()
+        self.assertTrue(report.final_output_gate_active)
         self.assertEqual(
             {item.state for item in report.requirement_evaluations},
             {RequirementEvaluationState.NO_EVIDENCE},
@@ -225,13 +260,13 @@ class StructuredVerificationTrackerTests(unittest.TestCase):
             self.assertIs(evaluation.state, RequirementEvaluationState.STALE)
             self.assertIs(report.state, VerificationState.INCOMPLETE)
 
-    def test_typed_blocker_is_current_but_old_blocker_is_not(self) -> None:
+    def test_tracker_owns_blocker_generation_and_old_blocker_is_not_current(self) -> None:
         tracker = VerificationTracker(requirements=self.snapshot)
         tracker.record_blocker(
             VerificationBlocker(
                 (self.r1.requirement_id,),
                 VerificationBlockReason.PERMISSION_DENIED,
-                0,
+                999,
                 "permission was denied",
             )
         )
@@ -242,6 +277,7 @@ class StructuredVerificationTrackerTests(unittest.TestCase):
             if item.requirement_id == self.r1.requirement_id
         )
         self.assertIs(evaluation.state, RequirementEvaluationState.BLOCKED)
+        self.assertEqual(evaluation.workspace_generation, 0)
         self.assertIs(report.state, VerificationState.INCOMPLETE)
 
         tracker.record_workspace_mutation()
@@ -251,6 +287,50 @@ class StructuredVerificationTrackerTests(unittest.TestCase):
             if item.requirement_id == self.r1.requirement_id
         )
         self.assertIs(evaluation.state, RequirementEvaluationState.NO_EVIDENCE)
+
+    def test_current_evidence_outranks_a_later_blocker(self) -> None:
+        for outcome, expected in (
+            (VerificationOutcome.SUCCESS, RequirementEvaluationState.SATISFIED),
+            (VerificationOutcome.FAILURE, RequirementEvaluationState.FAILED),
+        ):
+            tracker = VerificationTracker(requirements=self.snapshot)
+            tracker.record_verification(evidence((self.r1.requirement_id,), outcome=outcome))
+            tracker.record_blocker(
+                VerificationBlocker(
+                    (self.r1.requirement_id,),
+                    VerificationBlockReason.POLICY_RESTRICTION,
+                    0,
+                )
+            )
+
+            evaluation = next(
+                item
+                for item in tracker.report().requirement_evaluations
+                if item.requirement_id == self.r1.requirement_id
+            )
+            self.assertIs(evaluation.state, expected)
+
+    def test_current_evidence_replaces_an_earlier_blocker(self) -> None:
+        for outcome, expected in (
+            (VerificationOutcome.SUCCESS, RequirementEvaluationState.SATISFIED),
+            (VerificationOutcome.FAILURE, RequirementEvaluationState.FAILED),
+        ):
+            tracker = VerificationTracker(requirements=self.snapshot)
+            tracker.record_blocker(
+                VerificationBlocker(
+                    (self.r1.requirement_id,),
+                    VerificationBlockReason.USER_CONSTRAINT,
+                    0,
+                )
+            )
+            tracker.record_verification(evidence((self.r1.requirement_id,), outcome=outcome))
+
+            evaluation = next(
+                item
+                for item in tracker.report().requirement_evaluations
+                if item.requirement_id == self.r1.requirement_id
+            )
+            self.assertIs(evaluation.state, expected)
 
     def test_current_evidence_wins_over_blocker(self) -> None:
         tracker = VerificationTracker(requirements=self.snapshot)
