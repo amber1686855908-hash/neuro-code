@@ -81,6 +81,7 @@ class TurnEventRecorder:
         "_turn_id",
         "_turn_source",
         "_turn_started_at",
+        "completion_committed",
         "pristine_cancel_eligible",
         "session_task",
     )
@@ -115,6 +116,10 @@ class TurnEventRecorder:
         self._turn_id = turn_id
         self.session_task = session_task
         self.pristine_cancel_eligible = pristine_cancel_eligible
+        # Once the storage finalizer returns, a subsequent sink failure is a
+        # delivery problem, not a failed turn.  Keep this latch on the
+        # recorder so the outer AgentLoop cannot reclassify a committed turn.
+        self.completion_committed = False
 
     async def emit(
         self,
@@ -269,6 +274,12 @@ class TurnEventRecorder:
         await self.emit(event_kind, {"task": task.to_dict()})
 
     async def record_turn_failure(self, error: BaseException) -> None:
+        if self.completion_committed:
+            # The durable completion already owns the turn.  A broken or
+            # disconnected sink must not append TURN_FAILED, rewind the task,
+            # or cause a second finalization attempt.  The original delivery
+            # exception is still propagated by the AgentLoop caller.
+            return
         cancelled = isinstance(error, asyncio.CancelledError)
         pristine_rewound = cancelled and self.pristine_cancel_eligible
         task_status = SessionTaskStatus.CANCELLED if cancelled else SessionTaskStatus.FAILED
@@ -462,13 +473,13 @@ class TurnEventRecorder:
                         record,
                         compaction_item,
                     )
-            if committed_response_event is None:
-                await finalizer(*finalizer_args)
-            else:
-                await finalizer(
-                    *finalizer_args,
-                    committed_response_event=committed_response_event,
-                )
+            await self._commit_completion(
+                finalizer,
+                finalizer_args,
+                committed_response_event,
+            )
+        else:
+            self.completion_committed = True
         if committed_response_event is not None:
             await self._deliver(committed_response_event)
         await self._deliver(completed_event)
@@ -531,6 +542,38 @@ class TurnEventRecorder:
             outcome = self._sink(event)
             if inspect.isawaitable(outcome):
                 await outcome
+
+    async def _commit_completion(
+        self,
+        finalizer: Callable[..., Awaitable[None]],
+        finalizer_args: tuple[object, ...],
+        committed_response_event: AgentEvent | None,
+    ) -> None:
+        """Cross the durable completion boundary without losing cancellation state."""
+
+        if committed_response_event is None:
+            operation = finalizer(*finalizer_args)
+        else:
+            operation = finalizer(
+                *finalizer_args,
+                committed_response_event=committed_response_event,
+            )
+        if self._session_store is None or self._session_id is None:
+            await operation
+            self.completion_committed = True
+            return
+
+        persistence = asyncio.ensure_future(operation)
+        try:
+            await asyncio.shield(persistence)
+        except asyncio.CancelledError:
+            # A cancellation cannot interrupt the storage task halfway through
+            # its atomic transaction.  Wait for the result, mark the actual
+            # outcome, and then preserve the caller-visible cancellation.
+            await persistence
+            self.completion_committed = True
+            raise
+        self.completion_committed = True
 
 
 __all__ = ["TurnEventRecorder"]
