@@ -1818,7 +1818,11 @@ def test_canonical_runtime_modules_are_the_only_runtime_implementations() -> Non
             "ToolObservationBuilder",
         },
         "neuro_code.application.runtime.verification": {
+            "RequirementEvaluation",
+            "RequirementEvaluationState",
             "VerificationEvidence",
+            "VerificationBlockReason",
+            "VerificationBlocker",
             "VerificationFreshness",
             "VerificationObservation",
             "VerificationOutcome",

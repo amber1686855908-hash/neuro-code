@@ -845,6 +845,7 @@ class AgentLoopRunner:
                 verification_state=verification.state,
                 verification_evidence=verification.evidence,
                 verification_workspace_generation=verification.workspace_generation,
+                requirement_evaluations=verification.requirement_evaluations,
                 blocker=(
                     f"Execution stopped because {decision.reason_code.value.replace('_', ' ')}."
                     if decision is not None
