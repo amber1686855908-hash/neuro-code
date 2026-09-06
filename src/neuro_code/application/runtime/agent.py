@@ -49,6 +49,7 @@ from neuro_code.domain.execution import (
     ExecutionBudget,
     TurnCancellationPolicy,
     TurnSource,
+    VerificationRequirementsSnapshot,
 )
 from neuro_code.domain.plans import PlanComment, SessionPlan
 from neuro_code.domain.sandbox.models import SandboxProfile
@@ -361,6 +362,7 @@ class AgentRuntime:
         cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
         turn_source: TurnSource = TurnSource.USER,
         verification_required: bool = False,
+        verification_requirements: VerificationRequirementsSnapshot | None = None,
     ) -> AgentRunResult:
         """Run one agent turn through the canonical main loop.
 
@@ -382,6 +384,7 @@ class AgentRuntime:
             cancellation_policy=cancellation_policy,
             turn_source=turn_source,
             verification_required=verification_required,
+            verification_requirements=verification_requirements,
         )
 
     async def trigger_context_compaction(

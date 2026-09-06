@@ -67,6 +67,8 @@ from neuro_code.domain.execution import (
     TurnRecoveryAttempt,
     TurnRecoveryResolution,
     TurnSource,
+    VerificationRequirement,
+    VerificationRequirementsSnapshot,
 )
 from neuro_code.domain.result_adoption import (
     ResultAdoptionPlan,
@@ -1573,6 +1575,40 @@ def test_run_turn_request_rejects_noncanonical_values() -> None:
         RunTurnRequest("prompt", expected_session_id=" ")
     with pytest.raises(ValueError, match="turn_id"):
         RunTurnRequest("prompt", turn_id=" ")
+    with pytest.raises(ValueError, match="verification_requirements"):
+        RunTurnRequest("prompt", verification_requirements=cast(Any, object()))
+
+
+@pytest.mark.asyncio
+async def test_structured_ultracode_request_fails_before_session_or_execution_claim() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        cwd = Path(directory)
+        store = await _store(cwd)
+        runner = _ParentRunner(store, cwd)
+        binding = _binding(runner, cwd)
+        snapshot = VerificationRequirementsSnapshot.create(
+            (VerificationRequirement.create(criterion="run the relevant checks"),)
+        )
+        swarm_calls = 0
+
+        async def swarm_factory() -> Any:
+            nonlocal swarm_calls
+            swarm_calls += 1
+            raise AssertionError("structured requirements must fail before Swarm creation")
+
+        service = _service(store, binding, swarm_factory)
+        request = RunTurnRequest(
+            "research these independent tasks in parallel",
+            turn_id="structured-ultracode",
+            verification_requirements=snapshot,
+        )
+
+        with pytest.raises(ConfigurationError, match="structured verification requirements"):
+            await service.run_turn(request)
+
+        assert runner.session_id is None
+        assert await store.list_sessions() == []
+        assert swarm_calls == 0
 
 
 def test_ultracode_execution_rejects_invalid_or_incomplete_terminal_identity() -> None:

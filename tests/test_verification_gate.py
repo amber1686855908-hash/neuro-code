@@ -38,7 +38,11 @@ from neuro_code.domain.conversation.events import (
     ModelToolCall,
 )
 from neuro_code.domain.conversation.messages import ToolCall
-from neuro_code.domain.execution import TurnRecoveryResolution
+from neuro_code.domain.execution import (
+    TurnRecoveryResolution,
+    VerificationRequirement,
+    VerificationRequirementsSnapshot,
+)
 from neuro_code.domain.tools import ToolDefinition, ToolResult
 from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
 from neuro_code.shared.errors import ProviderError
@@ -304,6 +308,34 @@ async def test_non_gated_terminal_text_streams_without_a_finalizer(tmp_path: Pat
     assert result.response == "visible"
     assert _text_events(result.events) == ["visible"]
     assert not any(event.kind is AgentEventKind.FINALIZING_STARTED for event in result.events)
+
+
+@pytest.mark.asyncio
+async def test_structured_requirements_activate_the_gate_before_the_first_model_delta(
+    tmp_path: Path,
+) -> None:
+    snapshot = VerificationRequirementsSnapshot.create(
+        (VerificationRequirement.create(criterion="run the relevant checks"),)
+    )
+    finalizer = _RecordingFinalizer("structured safe response")
+    provider = _ScriptedProvider(((_terminal_candidate("tests passed")),))
+
+    result = await _runtime(
+        tmp_path,
+        provider,
+        _Tools(()),
+        _FixedWorkspaceObserver(changed=False),
+        finalizer=finalizer,
+    ).run("answer", verification_requirements=snapshot)
+
+    assert result.verification is not None
+    assert result.verification.requirements_fingerprint == snapshot.fingerprint
+    assert result.verification.requirement_evaluations[0].requirement_id == (
+        snapshot.requirements[0].requirement_id
+    )
+    assert finalizer.calls[0][1].verification_state is VerificationState.INCOMPLETE
+    assert _text_events(result.events) == ["structured safe response"]
+    assert "tests passed" not in repr(result.events)
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sqlite3
 import subprocess
@@ -33,6 +34,8 @@ from neuro_code.domain.execution import (
     TurnRecoveryStage,
     TurnRecoveryStatus,
     TurnSource,
+    VerificationRequirement,
+    VerificationRequirementsSnapshot,
 )
 from neuro_code.domain.plans import PlanStep, SessionPlan
 from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
@@ -1073,6 +1076,14 @@ class CrashRecoveryTests(unittest.IsolatedAsyncioTestCase):
         mismatched = (await self.store.load_turn_attempts(self.session_id))[0]
         self.assertTrue(mismatched.fact_conflict)
         update("input_fingerprint", attempt.input_fingerprint)
+        invalid_requirements = attempt.input.to_dict()
+        invalid_requirements["verification_requirements"] = {
+            "schema_version": 999,
+            "requirements": [],
+        }
+        update("input_json", json.dumps(invalid_requirements))
+        invalid_requirements_attempt = (await self.store.load_turn_attempts(self.session_id))[0]
+        self.assertTrue(invalid_requirements_attempt.fact_conflict)
         update("input_json", "")
         non_reconstructable = (await self.store.load_turn_attempts(self.session_id))[0]
         self.assertFalse(non_reconstructable.input_reconstructable)
@@ -1413,6 +1424,28 @@ class CrashRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(TurnInput.from_dict(original.to_dict()), original)
 
+        snapshot = VerificationRequirementsSnapshot.create(
+            (VerificationRequirement.create(criterion="run the relevant checks"),)
+        )
+        structured = TurnInput("structured input", verification_requirements=snapshot)
+        serialized = structured.to_dict()
+        self.assertEqual(serialized["verification_requirements"], snapshot.to_dict())
+        self.assertEqual(TurnInput.from_dict(serialized), structured)
+        legacy = TurnInput("legacy input")
+        self.assertNotIn("verification_requirements", legacy.to_dict())
+        self.assertEqual(TurnInput.from_dict(legacy.to_dict()), legacy)
+        self.assertNotEqual(structured.fingerprint, legacy.fingerprint)
+        with self.assertRaises(ValueError):
+            TurnInput.from_dict(
+                {
+                    **legacy.to_dict(),
+                    "verification_requirements": {
+                        "schema_version": 999,
+                        "requirements": [],
+                    },
+                }
+            )
+
         malformed = (
             None,
             {"prompt": "x", "content_parts": {}, "source": TurnSource.USER.value},
@@ -1637,6 +1670,27 @@ class CrashRecoveryTests(unittest.IsolatedAsyncioTestCase):
             attempt.turn_id,
         )
         self.assertEqual(retry.input.prompt, "retry me")
+
+    async def test_safe_retry_preserves_the_structured_requirement_snapshot(self) -> None:
+        snapshot = VerificationRequirementsSnapshot.create(
+            (VerificationRequirement.create(criterion="run the relevant checks"),)
+        )
+        input_value = TurnInput("retry structured input", verification_requirements=snapshot)
+        attempt = TurnRecoveryAttempt.create(
+            turn_id="turn-structured-retry",
+            session_id=self.session_id,
+            input=input_value,
+            accepted_at=datetime.now(UTC),
+        )
+        await self.store.start_turn_attempt(attempt)
+
+        retry = await TurnRecoveryService(self.store).require_safe_retry(
+            self.session_id,
+            attempt.turn_id,
+        )
+
+        self.assertEqual(retry.input.verification_requirements, snapshot)
+        self.assertEqual(retry.input.fingerprint, input_value.fingerprint)
 
     async def test_recovery_service_rejects_a_disappearing_attempt(self) -> None:
         class DisappearingStore:

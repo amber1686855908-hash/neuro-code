@@ -42,7 +42,12 @@ from neuro_code.domain.background_tasks.models import (
 from neuro_code.domain.conversation.interaction_mode import InteractionMode
 from neuro_code.domain.conversation.messages import ContentPart, SessionItem
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
-from neuro_code.domain.execution import SessionExecutionRecord, TurnCancellationPolicy, TurnSource
+from neuro_code.domain.execution import (
+    SessionExecutionRecord,
+    TurnCancellationPolicy,
+    TurnSource,
+    VerificationRequirementsSnapshot,
+)
 from neuro_code.domain.plans import PlanComment, SessionPlan
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.session_tasks import SessionTask
@@ -188,6 +193,7 @@ class ProfileConversationController:
         turn_source: TurnSource = TurnSource.USER,
         turn_id: str | None = None,
         ultracode_execution_id: str | None = None,
+        verification_requirements: VerificationRequirementsSnapshot | None = None,
     ) -> AgentRunResult:
         async with self._turn_lock:
             identity_kwargs: dict[str, Any] = {}
@@ -195,6 +201,8 @@ class ProfileConversationController:
                 identity_kwargs["turn_id"] = turn_id
             if ultracode_execution_id is not None:
                 identity_kwargs["ultracode_execution_id"] = ultracode_execution_id
+            if verification_requirements is not None:
+                identity_kwargs["verification_requirements"] = verification_requirements
             if not content_parts and (
                 cancellation_policy is TurnCancellationPolicy.RETAIN
                 and turn_source is TurnSource.USER

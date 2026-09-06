@@ -1642,6 +1642,23 @@ Required 失败产生顶层 `FAIL`；Required 的不完整、过期或 blocked �
 Legacy 回合继续使用 VF-1 的最新 evidence 语义。本切片不增加 request propagation、持久化 schema、发现、
 TestRunner、UI contract 或 UltraCode 集成；这些属于后续工作。
 
+## VF-3b：结构化要求传播
+
+`RunTurnRequest.verification_requirements` 是针对一个逻辑回合捕获的可选不可变
+`VerificationRequirementsSnapshot`。`None` 保持 Legacy 模式，而显式空 snapshot 仍与缺少声明可区分。
+`SessionTurnService`、会话 binding 和 `AgentRuntime` 将同一个 snapshot 传给 `AgentLoopRunner`；主循环在第一个
+模型步骤前使用该精确声明构造唯一的 `VerificationTracker`。任何层都不会根据 prompt、plan、policy、工作区、模型
+或 Provider 配置重新推导 requirements。
+
+`TurnInput` 在规范 JSON payload 中持久化结构化 snapshot，因此 safe retry 与崩溃恢复会保留相同的 requirement
+身份、strength、activation、provenance 和 fingerprint。缺少该字段仍兼容旧行并保持历史 fingerprint 形状；存在但
+损坏的 snapshot 会被视为无效恢复输入并失败关闭，不会退化为 Legacy 模式。不增加数据库列或 migration。保存的
+plan 执行不会合成 requirements。
+
+当前 UltraCode delegation 路径无法保持结构化 requirements 语义，因此结构化请求会在创建 parent session 或 durable
+execution claim 之前被拒绝。Legacy UltraCode 请求保持既有行为。Requirement discovery、acquisition、blocker producer
+和 UltraCode verification propagation 不属于本切片。
+
 ## 面向 Prompt Cache 的模型请求投影与用量
 
 `ContextBuilder` 拥有稳定的请求前缀：请求范围 system 策略、确定顺序的工具定义，以及当前序列化后的

@@ -116,6 +116,7 @@ from neuro_code.domain.execution import (
     TurnInput,
     TurnRecoveryAttempt,
     TurnSource,
+    VerificationRequirementsSnapshot,
 )
 from neuro_code.domain.plans import PlanStepStatus, SessionPlan
 from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
@@ -298,6 +299,7 @@ class AgentLoopRunner:
         cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
         turn_source: TurnSource = TurnSource.USER,
         verification_required: bool = False,
+        verification_requirements: VerificationRequirementsSnapshot | None = None,
     ) -> AgentRunResult:
         prompt_parts = tuple(content_parts)
         if ultracode_execution_id is not None and (
@@ -320,6 +322,13 @@ class AgentLoopRunner:
             raise TypeError("cancellation_policy must be a TurnCancellationPolicy")
         if not isinstance(verification_required, bool):
             raise TypeError("verification_required must be a bool")
+        if verification_requirements is not None and not isinstance(
+            verification_requirements,
+            VerificationRequirementsSnapshot,
+        ):
+            raise TypeError(
+                "verification_requirements must be a VerificationRequirementsSnapshot or None"
+            )
         # Until suspended-task resume exists, one run is exactly one logical
         # user task.  A future task coordinator must move this reset to task
         # creation so resuming another execution segment preserves the first
@@ -330,6 +339,7 @@ class AgentLoopRunner:
             self._tool_context.workspace_change_journal.begin_task()
         verification_tracker = VerificationTracker(
             verification_required=verification_required,
+            requirements=verification_requirements,
         )
         turn_started_at = monotonic()
         context_items = list(initial_items)
@@ -418,6 +428,7 @@ class AgentLoopRunner:
                 turn_source,
                 plan_execution_requested,
                 session_task.task_id if session_task is not None else plan_execution_task_id,
+                verification_requirements=verification_requirements,
             )
             attempt = TurnRecoveryAttempt.create(
                 turn_id=turn_id,

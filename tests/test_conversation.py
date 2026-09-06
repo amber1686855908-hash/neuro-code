@@ -7,6 +7,7 @@ import unittest
 from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import patch
 
 from neuro_code.application.memory.compaction import (
@@ -31,7 +32,7 @@ from neuro_code.application.memory.compaction_trigger import (
 from neuro_code.application.permissions.policy import PermissionManager
 from neuro_code.application.ports.model import ModelToolPolicy
 from neuro_code.application.ports.tools import ToolContext
-from neuro_code.application.runtime.agent import AgentRuntime
+from neuro_code.application.runtime.agent import AgentRunResult, AgentRuntime
 from neuro_code.application.sessions.conversation import (
     PLAN_EXECUTION_PROMPT,
     AgentConversation,
@@ -53,6 +54,10 @@ from neuro_code.domain.execution import (
     SessionExecutionRecord,
     SupervisorReasonCode,
     TurnCancellationPolicy,
+    TurnInput,
+    TurnRecoveryAttempt,
+    VerificationRequirement,
+    VerificationRequirementsSnapshot,
 )
 from neuro_code.domain.plans import PlanComment, PlanStep, PlanStepStatus, SessionPlan
 from neuro_code.domain.sandbox import SandboxProfile
@@ -1376,6 +1381,53 @@ class AgentConversationTests(unittest.IsolatedAsyncioTestCase):
                     (Role.USER, "second prompt"),
                 ],
             )
+
+    async def test_explicit_retry_propagates_the_persisted_requirement_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(
+                str(root),
+                "conversation-fixture",
+                "fixture-model",
+            )
+            snapshot = VerificationRequirementsSnapshot.create(
+                (VerificationRequirement.create(criterion="run the relevant checks"),)
+            )
+            input_value = TurnInput("retry structured input", verification_requirements=snapshot)
+            attempt = TurnRecoveryAttempt.create(
+                turn_id="turn-structured-conversation-retry",
+                session_id=session_id,
+                input=input_value,
+                accepted_at=datetime.now(UTC),
+            )
+            await store.start_turn_attempt(attempt)
+
+            class RecordingRuntime:
+                def __init__(self) -> None:
+                    self.calls: list[tuple[str, dict[str, Any]]] = []
+
+                async def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                    self.calls.append((prompt, kwargs))
+                    return AgentRunResult(session_id, "retried", (), (), (), 0)
+
+                def set_plan(self, _plan: SessionPlan | None) -> None:
+                    return None
+
+            runtime = RecordingRuntime()
+            conversation = AgentConversation(
+                runtime=cast(AgentRuntime, runtime),
+                store=store,
+                session_id=session_id,
+            )
+
+            result = await conversation.retry_recovery(attempt.turn_id)
+
+            self.assertEqual(result.response, "retried")
+            self.assertEqual(len(runtime.calls), 1)
+            self.assertEqual(runtime.calls[0][0], "retry structured input")
+            self.assertEqual(runtime.calls[0][1]["verification_requirements"], snapshot)
 
     async def test_failed_turn_keeps_the_session_available_for_retry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

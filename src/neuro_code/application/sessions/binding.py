@@ -31,7 +31,11 @@ from neuro_code.domain.background_tasks.models import BackgroundWakeState
 from neuro_code.domain.conversation.interaction_mode import InteractionMode
 from neuro_code.domain.conversation.messages import ContentPart, SessionItem
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
-from neuro_code.domain.execution import TurnCancellationPolicy, TurnSource
+from neuro_code.domain.execution import (
+    TurnCancellationPolicy,
+    TurnSource,
+    VerificationRequirementsSnapshot,
+)
 from neuro_code.domain.plans import PlanComment, SessionPlan
 from neuro_code.domain.session_tasks import SessionTask
 from neuro_code.domain.ultracode import UltracodeDelegationDecision
@@ -135,6 +139,7 @@ class ConversationRunner(Protocol):
         turn_source: TurnSource = TurnSource.USER,
         turn_id: str | None = None,
         ultracode_execution_id: str | None = None,
+        verification_requirements: VerificationRequirementsSnapshot | None = None,
     ) -> AgentRunResult: ...
 
     async def ensure_persisted_session(self) -> str: ...
