@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -37,6 +38,7 @@ from neuro_code.domain.conversation.events import (
     ModelToolCall,
 )
 from neuro_code.domain.conversation.messages import ToolCall
+from neuro_code.domain.execution import TurnRecoveryResolution
 from neuro_code.domain.tools import ToolDefinition, ToolResult
 from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
 from neuro_code.shared.errors import ProviderError
@@ -412,6 +414,227 @@ async def test_mutation_candidate_is_not_public_or_durable(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_finalizer_response_is_delivered_after_atomic_completion_commit(
+    tmp_path: Path,
+) -> None:
+    store = SqliteSessionStore(tmp_path / "sessions.db")
+    await store.initialize()
+    finalizer = _RecordingFinalizer("safe committed response")
+    provider = _ScriptedProvider(
+        (
+            (_mutation_call(), ModelCompleted("tool_calls")),
+            _terminal_candidate("PROVISIONAL_FALSE_SUCCESS_SENTINEL"),
+        )
+    )
+    runtime = _runtime(
+        tmp_path,
+        provider,
+        _Tools((_FixtureTool("mutate", ToolResult("changed"), side_effecting=True),)),
+        _FixedWorkspaceObserver(),
+        finalizer=finalizer,
+        session_store=store,
+    )
+    session_id = await store.create_session(str(tmp_path), "gate-scripted", "gate-model")
+    delivered: list[AgentEvent] = []
+
+    async def sink(event: AgentEvent) -> None:
+        delivered.append(event)
+        if event.kind is AgentEventKind.TEXT_DELTA:
+            assert event.data["text"] == "safe committed response"
+            persisted = await store.load_events(session_id)
+            kinds = [item["kind"] for item in persisted]
+            assert "PROVISIONAL_FALSE_SUCCESS_SENTINEL" not in repr(persisted)
+            assert AgentEventKind.TEXT_DELTA.value in kinds
+            assert kinds[-1] == AgentEventKind.TURN_COMPLETED.value
+
+    result = await runtime.run("change files", session_id=session_id, sink=sink)
+
+    assert result.response == "safe committed response"
+    assert [event.kind for event in delivered if event.kind is AgentEventKind.TEXT_DELTA] == [
+        AgentEventKind.TEXT_DELTA
+    ]
+    persisted_events = await store.load_events(session_id)
+    response_sequence = next(
+        item["sequence"]
+        for item in persisted_events
+        if item["kind"] == AgentEventKind.TEXT_DELTA.value
+    )
+    completed_sequence = next(
+        item["sequence"]
+        for item in persisted_events
+        if item["kind"] == AgentEventKind.TURN_COMPLETED.value
+    )
+    assert response_sequence < completed_sequence
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_kind", "delivered_kinds"),
+    [
+        (AgentEventKind.TEXT_DELTA, [AgentEventKind.TEXT_DELTA]),
+        (
+            AgentEventKind.TURN_COMPLETED,
+            [AgentEventKind.TEXT_DELTA, AgentEventKind.TURN_COMPLETED],
+        ),
+    ],
+)
+async def test_post_commit_sink_failure_does_not_reclassify_committed_turn(
+    tmp_path: Path,
+    failure_kind: AgentEventKind,
+    delivered_kinds: list[AgentEventKind],
+) -> None:
+    store = SqliteSessionStore(tmp_path / "sessions.db")
+    await store.initialize()
+    finalizer = _RecordingFinalizer("safe committed response")
+    provider = _ScriptedProvider(
+        (
+            (_mutation_call(), ModelCompleted("tool_calls")),
+            _terminal_candidate("PROVISIONAL_FALSE_SUCCESS_SENTINEL"),
+        )
+    )
+    runtime = _runtime(
+        tmp_path,
+        provider,
+        _Tools((_FixtureTool("mutate", ToolResult("changed"), side_effecting=True),)),
+        _FixedWorkspaceObserver(),
+        finalizer=finalizer,
+        session_store=store,
+    )
+    session_id = await store.create_session(str(tmp_path), "gate-scripted", "gate-model")
+    delivered: list[AgentEventKind] = []
+
+    async def sink(event: AgentEvent) -> None:
+        delivered.append(event.kind)
+        if event.kind is failure_kind:
+            raise RuntimeError("sink disconnected")
+
+    with pytest.raises(RuntimeError, match="sink disconnected"):
+        await runtime.run("change files", session_id=session_id, sink=sink)
+
+    persisted_events = await store.load_events(session_id)
+    persisted_items = await store.load_session_items(session_id)
+    terminal_delivered = [
+        kind
+        for kind in delivered
+        if kind in {AgentEventKind.TEXT_DELTA, AgentEventKind.TURN_COMPLETED}
+    ]
+    assert terminal_delivered == delivered_kinds
+    assert finalizer.calls
+    assert len(finalizer.calls) == 1
+    assert "PROVISIONAL_FALSE_SUCCESS_SENTINEL" not in repr(persisted_events)
+    assert "PROVISIONAL_FALSE_SUCCESS_SENTINEL" not in repr(persisted_items)
+    assert any(
+        event["kind"] == AgentEventKind.TEXT_DELTA.value
+        and event["data"].get("text") == "safe committed response"
+        for event in persisted_events
+    )
+    assert any(event["kind"] == AgentEventKind.TURN_COMPLETED.value for event in persisted_events)
+    assert not any(event["kind"] == AgentEventKind.TURN_FAILED.value for event in persisted_events)
+    attempts = await store.load_turn_attempts(session_id)
+    assert len(attempts) == 1
+    assert attempts[0].resolution is TurnRecoveryResolution.COMMITTED
+    assert await store.load_open_turn_attempts(session_id) == []
+
+
+@pytest.mark.asyncio
+async def test_post_commit_cancellation_does_not_persist_failure_or_retry_finalization(
+    tmp_path: Path,
+) -> None:
+    store = SqliteSessionStore(tmp_path / "sessions.db")
+    await store.initialize()
+    finalizer = _RecordingFinalizer("safe committed response")
+    provider = _ScriptedProvider(
+        (
+            (_mutation_call(), ModelCompleted("tool_calls")),
+            _terminal_candidate("PROVISIONAL_FALSE_SUCCESS_SENTINEL"),
+        )
+    )
+    runtime = _runtime(
+        tmp_path,
+        provider,
+        _Tools((_FixtureTool("mutate", ToolResult("changed"), side_effecting=True),)),
+        _FixedWorkspaceObserver(),
+        finalizer=finalizer,
+        session_store=store,
+    )
+    session_id = await store.create_session(str(tmp_path), "gate-scripted", "gate-model")
+    delivered: list[AgentEventKind] = []
+
+    async def sink(event: AgentEvent) -> None:
+        delivered.append(event.kind)
+        if event.kind is AgentEventKind.TURN_COMPLETED:
+            raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await runtime.run("change files", session_id=session_id, sink=sink)
+
+    persisted_events = await store.load_events(session_id)
+    assert [
+        kind
+        for kind in delivered
+        if kind in {AgentEventKind.TEXT_DELTA, AgentEventKind.TURN_COMPLETED}
+    ] == [AgentEventKind.TEXT_DELTA, AgentEventKind.TURN_COMPLETED]
+    assert finalizer.calls
+    assert len(finalizer.calls) == 1
+    assert not any(event["kind"] == AgentEventKind.TURN_FAILED.value for event in persisted_events)
+    assert any(event["kind"] == AgentEventKind.TURN_COMPLETED.value for event in persisted_events)
+    assert "PROVISIONAL_FALSE_SUCCESS_SENTINEL" not in repr(persisted_events)
+    attempts = await store.load_turn_attempts(session_id)
+    assert len(attempts) == 1
+    assert attempts[0].resolution is TurnRecoveryResolution.COMMITTED
+
+
+@pytest.mark.asyncio
+async def test_cancellation_after_storage_commit_does_not_reclassify_completion(
+    tmp_path: Path,
+) -> None:
+    store = SqliteSessionStore(tmp_path / "sessions.db")
+    await store.initialize()
+    finalizer = _RecordingFinalizer("safe committed response")
+    provider = _ScriptedProvider(
+        (
+            (_mutation_call(), ModelCompleted("tool_calls")),
+            _terminal_candidate("PROVISIONAL_FALSE_SUCCESS_SENTINEL"),
+        )
+    )
+    runtime = _runtime(
+        tmp_path,
+        provider,
+        _Tools((_FixtureTool("mutate", ToolResult("changed"), side_effecting=True),)),
+        _FixedWorkspaceObserver(),
+        finalizer=finalizer,
+        session_store=store,
+    )
+    session_id = await store.create_session(str(tmp_path), "gate-scripted", "gate-model")
+    original_finalize = store.finalize_turn
+    committed = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_finalize(*args: object, **kwargs: object) -> None:
+        await original_finalize(*args, **kwargs)
+        committed.set()
+        await release.wait()
+
+    with patch.object(store, "finalize_turn", new=delayed_finalize):
+        task = asyncio.create_task(runtime.run("change files", session_id=session_id))
+        await committed.wait()
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    persisted_events = await store.load_events(session_id)
+    assert finalizer.calls
+    assert len(finalizer.calls) == 1
+    assert any(event["kind"] == AgentEventKind.TURN_COMPLETED.value for event in persisted_events)
+    assert not any(event["kind"] == AgentEventKind.TURN_FAILED.value for event in persisted_events)
+    assert "PROVISIONAL_FALSE_SUCCESS_SENTINEL" not in repr(persisted_events)
+    attempts = await store.load_turn_attempts(session_id)
+    assert len(attempts) == 1
+    assert attempts[0].resolution is TurnRecoveryResolution.COMMITTED
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("verification_result", "expected_state"),
     [
@@ -651,6 +874,11 @@ async def test_cancellation_during_candidate_buffering_does_not_emit_candidate(
     assert not any(
         event["kind"] == AgentEventKind.TURN_COMPLETED.value for event in persisted_events
     )
+    attempts = await store.load_turn_attempts(session_id)
+    assert len(attempts) == 1
+    assert attempts[0].output_started is True
+    assert attempts[0].resolution is TurnRecoveryResolution.CANCELLED
+    assert "PROVISIONAL_FALSE_SUCCESS_SENTINEL" not in repr(attempts[0].safe_projection())
     assert any(event["kind"] == AgentEventKind.TURN_FAILED.value for event in persisted_events)
 
 
@@ -686,14 +914,10 @@ async def test_failure_before_turn_commit_never_replays_terminal_candidate(tmp_p
     provider = _ScriptedProvider(
         (
             (_mutation_call(), ModelCompleted("tool_calls")),
-            _terminal_candidate("candidate must stay private"),
+            _terminal_candidate("PROVISIONAL_FALSE_SUCCESS_SENTINEL"),
         )
     )
     session_id = await store.create_session(str(tmp_path), "gate-scripted", "gate-model")
-
-    async def fail_after_final_response(event: AgentEvent) -> None:
-        if event.kind is AgentEventKind.TEXT_DELTA and event.data["text"] == "committed final":
-            raise RuntimeError("simulated failure before turn commit")
 
     runtime = _runtime(
         tmp_path,
@@ -704,15 +928,26 @@ async def test_failure_before_turn_commit_never_replays_terminal_candidate(tmp_p
         session_store=store,
     )
 
-    with pytest.raises(RuntimeError, match="simulated failure"):
-        await runtime.run(
-            "fail before commit", session_id=session_id, sink=fail_after_final_response
-        )
+    with (
+        patch.object(
+            store,
+            "finalize_turn",
+            new=AsyncMock(side_effect=RuntimeError("simulated failure before turn commit")),
+        ),
+        pytest.raises(RuntimeError, match="simulated failure"),
+    ):
+        await runtime.run("fail before commit", session_id=session_id)
 
     persisted_events = await store.load_events(session_id)
     persisted_items = await store.load_session_items(session_id)
-    assert "candidate must stay private" not in repr(persisted_events)
+    assert "PROVISIONAL_FALSE_SUCCESS_SENTINEL" not in repr(persisted_events)
+    assert "committed final" not in repr(persisted_events)
     assert "committed final" not in repr(persisted_items)
     assert not any(
         event["kind"] == AgentEventKind.TURN_COMPLETED.value for event in persisted_events
     )
+    attempts = await store.load_turn_attempts(session_id)
+    assert len(attempts) == 1
+    assert attempts[0].output_started is True
+    assert attempts[0].resolution is TurnRecoveryResolution.FAILED
+    assert "PROVISIONAL_FALSE_SUCCESS_SENTINEL" not in repr(attempts[0].safe_projection())

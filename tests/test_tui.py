@@ -712,6 +712,63 @@ class FinalizingTuiConversation:
         )
 
 
+class GatedTuiConversation:
+    """Project the runtime's committed event boundary into the TUI fixture."""
+
+    @property
+    def session_id(self) -> str:
+        return "gated-session"
+
+    async def run(
+        self,
+        prompt: str,
+        *,
+        sink: EventSink | None = None,
+        cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
+    ) -> AgentRunResult:
+        del prompt, cancellation_policy
+        events = (
+            AgentEvent.create(
+                1,
+                AgentEventKind.FINALIZING_STARTED,
+                {
+                    "execution_status": "completed",
+                    "execution_reason": None,
+                    "recoverable": False,
+                },
+            ),
+            AgentEvent.create(
+                2,
+                AgentEventKind.TEXT_DELTA,
+                {"text": "safe committed response"},
+            ),
+            AgentEvent.create(
+                3,
+                AgentEventKind.TURN_COMPLETED,
+                {
+                    "step": 2,
+                    "response_committed": True,
+                    "response_source": "evidence_aware_finalizer",
+                    "verification_state": "incomplete",
+                    "verification_workspace_generation": 1,
+                },
+            ),
+        )
+        if sink is not None:
+            for event in events:
+                outcome = sink(event)
+                if inspect.isawaitable(outcome):
+                    await outcome
+        return AgentRunResult(
+            self.session_id,
+            "safe committed response",
+            (Message(Role.ASSISTANT, "safe committed response"),),
+            (),
+            events,
+            2,
+        )
+
+
 class UnknownTerminalMetadataTuiConversation:
     @property
     def session_id(self) -> str | None:
@@ -2127,6 +2184,28 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(prompt.disabled)
                     prompt.value = "continue with new instructions"
                     self.assertEqual(prompt.value, "continue with new instructions")
+
+    async def test_gated_completion_renders_only_the_committed_response_once(self) -> None:
+        app = NeuroCodeApp(
+            GatedTuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", PromptInput)
+            prompt.value = "complete a gated turn"
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause(0.01)
+                if any(entry.category == "assistant" for entry in app.entries):
+                    break
+
+        assistant_entries = [entry.text for entry in app.entries if entry.category == "assistant"]
+        self.assertEqual(assistant_entries, ["safe committed response"])
+        self.assertNotIn("PROVISIONAL_FALSE_SUCCESS_SENTINEL", repr(app.entries))
+        self.assertFalse(any(entry.category == "error" for entry in app.entries))
 
     async def test_unknown_terminal_metadata_falls_back_to_normal_completion(self) -> None:
         app = NeuroCodeApp(

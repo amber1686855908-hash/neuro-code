@@ -821,6 +821,61 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
                 [(1, AgentEventKind.TURN_COMPLETED.value, {"step": 1})],
             )
 
+    async def test_finalize_turn_commits_staged_response_before_completion_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SqliteSessionStore(Path(directory) / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session("/workspace", "fixture", "model")
+            initial_items = [Message(Role.USER, "persist this turn")]
+            await store.save_session_items(session_id, initial_items)
+            response_event = AgentEvent.create(
+                1,
+                AgentEventKind.TEXT_DELTA,
+                {"text": "committed response"},
+            )
+            completion_event = AgentEvent.create(
+                2,
+                AgentEventKind.TURN_COMPLETED,
+                {
+                    "response_committed": True,
+                    "response_source": "evidence_aware_finalizer",
+                },
+            )
+            final_items = [*initial_items, Message(Role.ASSISTANT, "committed response")]
+            record = SessionExecutionRecord(
+                AgentExecutionOutcome(
+                    AgentExecutionStatus.COMPLETED,
+                    None,
+                    finalized=False,
+                    recoverable=False,
+                ),
+                completion_event.sequence,
+                completion_event.created_at,
+            )
+
+            await store.finalize_turn(
+                session_id,
+                completion_event,
+                final_items,
+                record,
+                committed_response_event=response_event,
+            )
+
+            persisted_events = await store.load_events(session_id)
+            self.assertEqual(
+                [(item["sequence"], item["kind"]) for item in persisted_events],
+                [
+                    (1, AgentEventKind.TEXT_DELTA.value),
+                    (2, AgentEventKind.TURN_COMPLETED.value),
+                ],
+            )
+            self.assertEqual(
+                persisted_events[0]["data"],
+                {"text": "committed response"},
+            )
+            self.assertEqual(await store.load_session_items(session_id), final_items)
+            self.assertEqual(await store.load_execution_record(session_id), record)
+
     async def test_finalize_turn_without_record_preserves_previous_execution_record(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = SqliteSessionStore(Path(directory) / "sessions.db")
