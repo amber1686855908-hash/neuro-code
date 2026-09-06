@@ -961,6 +961,9 @@ def test_execution_package_preserves_public_identity_across_value_object_modules
     outcomes = importlib.import_module("neuro_code.domain.execution.outcomes")
     tasks = importlib.import_module("neuro_code.domain.execution.tasks")
     checkpoints = importlib.import_module("neuro_code.domain.execution.checkpoints")
+    verification_requirements = importlib.import_module(
+        "neuro_code.domain.execution.verification_requirements"
+    )
 
     for name in (
         "AgentExecutionOutcome",
@@ -984,6 +987,16 @@ def test_execution_package_preserves_public_identity_across_value_object_modules
         assert getattr(aggregate, name) is getattr(tasks, name)
     for name in ("ExecutionSnapshot", "SessionExecutionRecord"):
         assert getattr(aggregate, name) is getattr(checkpoints, name)
+    for name in (
+        "RequirementActivation",
+        "RequirementProvenance",
+        "RequirementSource",
+        "RequirementStrength",
+        "VerificationRequirement",
+        "VerificationRequirementsSnapshot",
+    ):
+        assert getattr(aggregate, name) is getattr(verification_requirements, name)
+    assert aggregate.VerificationRequirement.__module__ == verification_requirements.__name__
 
     assert aggregate.AgentExecutionOutcome.__module__ == outcomes.__name__
     assert aggregate.ExecutionBudget.__module__ == tasks.__name__
@@ -2166,6 +2179,10 @@ def test_canonical_runtime_public_types_keep_module_paths_and_metadata() -> None
             "ToolObservationBuilder",
         ),
         "neuro_code.application.runtime.verification": (
+            "RequirementEvaluation",
+            "RequirementEvaluationState",
+            "VerificationBlockReason",
+            "VerificationBlocker",
             "VerificationEvidence",
             "VerificationFreshness",
             "VerificationObservation",

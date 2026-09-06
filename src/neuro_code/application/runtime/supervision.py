@@ -465,6 +465,7 @@ class ToolExecutionObservation:
         progress_kind: ProgressKind = ProgressKind.NONE,
         verification: VerificationEvidence | None = None,
         verification_scope: Sequence[str] = (),
+        covered_requirement_ids: Sequence[str] = (),
         path_context: PathNormalizationContext | None = None,
         redaction_values: Sequence[str] = (),
         tool_call_id: str | None = None,
@@ -507,6 +508,7 @@ class ToolExecutionObservation:
                 result_content=result_content,
                 is_error=is_error,
                 scope=verification_scope,
+                covered_requirement_ids=covered_requirement_ids,
                 redaction_values=redaction_values,
             )
         return cls(

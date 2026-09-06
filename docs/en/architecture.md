@@ -2975,6 +2975,32 @@ cancellation or failure before this commit follows the existing turn-failure
 recovery path and cannot replay the provisional candidate. This is a step-level
 truth boundary, not whole-turn buffering and not verification discovery.
 
+## VF-3a structured verification requirements
+
+`neuro_code.domain.execution.verification_requirements` owns immutable,
+provider- and tool-independent requirement declarations. It generates stable
+`req-v1` identities from normalized criterion, descriptive scope, and
+activation; strength and provenance are mergeable metadata and are not part of
+identity. Snapshots are bounded, redacted, fingerprinted, and do not retain raw
+prompts.
+
+`neuro_code.application.runtime.verification` remains the sole mutable
+verification-truth owner. `VerificationEvidence` links to requirements only
+through explicit bounded `covered_requirement_ids`; its existing `scope` stays
+descriptive command-classification metadata. The tracker retains one bounded
+latest fact per requirement independently of the diagnostic evidence ring,
+reuses the global workspace generation, and evaluates active requirements as
+`SATISFIED`, `FAILED`, `NO_EVIDENCE`, `STALE`, or `BLOCKED`. Blocked is produced
+only by an explicit typed blocker fact, never by free-text inference.
+
+Required failures produce top-level `FAIL`; required incomplete, stale, or
+blocked requirements produce `INCOMPLETE`; all active required requirements
+must be satisfied for `PASS`. Advisory requirements are projected but do not
+turn into a verified completion on their own. Legacy runs without a structured
+snapshot retain the VF-1 latest-evidence behavior. This slice adds no request
+propagation, persistence schema, discovery, test runner, UI contract, or
+UltraCode integration; those remain later work.
+
 ## Cache-friendly model request projection and usage
 
 `ContextBuilder` owns the stable early request prefix: the request-scoped

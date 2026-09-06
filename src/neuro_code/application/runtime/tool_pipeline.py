@@ -200,6 +200,7 @@ class ToolObservationBuilder:
         current_plan_fingerprint: str | None,
         tool_call_id: str,
         verification_eligible: bool = True,
+        covered_requirement_ids: Sequence[str] = (),
     ) -> ToolExecutionObservation:
         """Build a fail-open, redacted supervision record after a tool terminal path.
 
@@ -220,6 +221,7 @@ class ToolObservationBuilder:
                 result_content=result.content,
                 is_error=result.is_error,
                 redaction_values=self._redaction_values,
+                covered_requirement_ids=covered_requirement_ids,
             )
             if verification_eligible
             else None

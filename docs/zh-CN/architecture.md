@@ -1625,6 +1625,23 @@ session schema 契约均不改变。
 只根据有界的验证/工作区事实报告，并使用 fallback source 提交。提交前取消或失败沿用现有回合失败恢复
 路径，不能重放 provisional candidate。这是逐步骤的 truth boundary，不是整回合 buffer，也不执行验证发现。
 
+## VF-3a：结构化验证要求
+
+`neuro_code.domain.execution.verification_requirements` 拥有不可变、与 Provider 和工具无关的验证要求声明。
+它根据规范化的 criterion、描述性 scope 和 activation 生成稳定的 `req-v1` 身份；strength 与 provenance
+属于可合并元数据，不参与身份。Snapshot 有界、脱敏并带 fingerprint，不保存原始 prompt。
+
+`neuro_code.application.runtime.verification` 继续是唯一可变的验证事实所有者。`VerificationEvidence` 只通过
+有界的显式 `covered_requirement_ids` 关联要求；原有 `scope` 仍然只是描述性的命令分类元数据。Tracker 独立于
+诊断 evidence ring 为每个要求保留一个有界的最新事实，复用全局 workspace generation，并将 active 要求评估为
+`SATISFIED`、`FAILED`、`NO_EVIDENCE`、`STALE` 或 `BLOCKED`。`BLOCKED` 只能由显式类型化 blocker 事实产生，
+不会从自由文本推断。
+
+Required 失败产生顶层 `FAIL`；Required 的不完整、过期或 blocked 产生 `INCOMPLETE`；只有所有 active Required
+要求满足时才产生 `PASS`。Advisory 要求会被投影，但不能单独把完成表述为已充分验证。没有结构化 snapshot 的
+Legacy 回合继续使用 VF-1 的最新 evidence 语义。本切片不增加 request propagation、持久化 schema、发现、
+TestRunner、UI contract 或 UltraCode 集成；这些属于后续工作。
+
 ## 面向 Prompt Cache 的模型请求投影与用量
 
 `ContextBuilder` 拥有稳定的请求前缀：请求范围 system 策略、确定顺序的工具定义，以及当前序列化后的

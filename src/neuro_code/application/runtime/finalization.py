@@ -17,6 +17,9 @@ from typing import Protocol
 
 from neuro_code.application.ports.model import ModelProvider, ModelToolPolicy
 from neuro_code.application.runtime.verification import (
+    MAX_VERIFICATION_EVALUATIONS,
+    RequirementEvaluation,
+    RequirementEvaluationState,
     VerificationEvidence,
     VerificationFreshness,
     VerificationOutcome,
@@ -25,7 +28,7 @@ from neuro_code.application.runtime.verification import (
 from neuro_code.domain.conversation.context import ModelContext
 from neuro_code.domain.conversation.events import ModelCompleted, ModelTextDelta, ModelToolCall
 from neuro_code.domain.conversation.messages import Message, Role, ToolCall
-from neuro_code.domain.execution import SupervisorReasonCode
+from neuro_code.domain.execution import RequirementStrength, SupervisorReasonCode
 from neuro_code.domain.tools import ToolResult
 from neuro_code.shared.errors import ProviderError
 from neuro_code.shared.redaction import redact_sensitive_text
@@ -154,6 +157,7 @@ class FinalizationEvidence:
     verification_state: VerificationState = VerificationState.NOT_APPLICABLE
     verification_evidence: tuple[VerificationEvidence, ...] = field(default_factory=tuple)
     verification_workspace_generation: int = 0
+    requirement_evaluations: tuple[RequirementEvaluation, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         if not isinstance(self.trigger, SupervisorReasonCode):
@@ -203,6 +207,16 @@ class FinalizationEvidence:
                 "blocker",
                 _bounded_text(self.blocker, limit=_MAX_EVIDENCE_BLOCKER_CHARS),
             )
+        requirement_evaluations = tuple(self.requirement_evaluations)
+        if len(requirement_evaluations) > MAX_VERIFICATION_EVALUATIONS:
+            raise ValueError("requirement_evaluations exceed the bounded verification limit")
+        if not all(isinstance(item, RequirementEvaluation) for item in requirement_evaluations):
+            raise TypeError("requirement_evaluations must contain RequirementEvaluation values")
+        if len({item.requirement_id for item in requirement_evaluations}) != len(
+            requirement_evaluations
+        ):
+            raise ValueError("requirement_evaluations must not contain duplicate IDs")
+        object.__setattr__(self, "requirement_evaluations", requirement_evaluations)
 
 
 @dataclass(frozen=True, slots=True)
@@ -366,6 +380,19 @@ class AgentFinalizer:
             )
         return self._format_evidence_category("Verification evidence", items)
 
+    def _format_requirement_evaluations(
+        self,
+        evaluations: Sequence[RequirementEvaluation],
+    ) -> str:
+        items = []
+        for item in evaluations[:MAX_VERIFICATION_EVALUATIONS]:
+            reason = self._safe_text(item.reason, limit=_MAX_EVIDENCE_ITEM_CHARS)
+            detail = f"{item.requirement_id}: {item.state.value}"
+            if reason:
+                detail = f"{detail} ({reason})"
+            items.append(detail)
+        return self._format_evidence_category("Requirement evaluations", items)
+
     def _instruction(self, evidence: FinalizationEvidence) -> str:
         blocker = (
             self._safe_text(evidence.blocker, limit=_MAX_EVIDENCE_BLOCKER_CHARS)
@@ -384,6 +411,25 @@ class AgentFinalizer:
             and latest_verification.outcome is VerificationOutcome.SUCCESS
             and latest_verification.freshness_for(evidence.verification_workspace_generation)
             is VerificationFreshness.CURRENT
+        )
+        required_evaluations = tuple(
+            item
+            for item in evidence.requirement_evaluations
+            if item.strength is RequirementStrength.REQUIRED
+        )
+        can_confirm_structured_verification = bool(required_evaluations) and (
+            evidence.verification_state is VerificationState.PASS
+            and all(
+                item.state is RequirementEvaluationState.SATISFIED for item in required_evaluations
+            )
+        )
+        can_confirm_legacy_verification = (
+            can_confirm_legacy_verification or can_confirm_structured_verification
+        )
+        requirement_evaluation_section = (
+            self._format_requirement_evaluations(evidence.requirement_evaluations)
+            if evidence.requirement_evaluations
+            else None
         )
         sections = (
             "You are producing the final response for the user.",
@@ -405,11 +451,12 @@ class AgentFinalizer:
                 evidence.verification_evidence,
                 workspace_generation=evidence.verification_workspace_generation,
             ),
+            requirement_evaluation_section,
             self._format_evidence_category("Unverified work", evidence.unverified_items),
             f"Blocker: {blocker}",
             self._format_evidence_category("Remaining uncertainty", evidence.uncertainty),
         )
-        return "\n\n".join(sections)
+        return "\n\n".join(section for section in sections if section)
 
     def _safe_tool_name(self, value: str) -> str:
         candidate = self._safe_text(value, limit=_MAX_TOOL_NAME_CHARS)
