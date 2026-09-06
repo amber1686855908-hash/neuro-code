@@ -20,6 +20,7 @@ from neuro_code.domain.conversation.events import ModelEvent
 from neuro_code.domain.conversation.interaction_mode import InteractionMode
 from neuro_code.domain.conversation.messages import Message, Role, SessionItem
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
+from neuro_code.domain.execution import VerificationRequirementsSnapshot
 from neuro_code.domain.plans import PlanComment, PlanStep, SessionPlan
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
@@ -63,6 +64,7 @@ class FixtureConversation:
         self._plan_comments = tuple(plan_comments)
         self._session_tasks = tuple(session_tasks)
         self.prompts: list[str] = []
+        self.verification_requirements: VerificationRequirementsSnapshot | None = None
         self.plan_execution_calls = 0
         self.blocked = blocked
         self.started = asyncio.Event()
@@ -108,9 +110,16 @@ class FixtureConversation:
     def set_interaction_mode(self, mode: InteractionMode) -> None:
         self.interaction_mode = mode
 
-    async def run(self, prompt: str, *, sink: EventSink | None = None) -> AgentRunResult:
+    async def run(
+        self,
+        prompt: str,
+        *,
+        sink: EventSink | None = None,
+        verification_requirements: VerificationRequirementsSnapshot | None = None,
+    ) -> AgentRunResult:
         del sink
         self.prompts.append(prompt)
+        self.verification_requirements = verification_requirements
         self.started.set()
         if self.blocked:
             await self.release.wait()
@@ -243,6 +252,25 @@ def summary(
 
 
 class ProfileConversationControllerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_forwards_the_structured_requirement_snapshot(self) -> None:
+        runner = FixtureConversation()
+
+        async def bind(name: str) -> ConversationBinding:
+            return ConversationBinding(FixtureConversation(), FixtureProvider(name, "model"))
+
+        controller = ProfileConversationController(
+            options=(option("first"),),
+            selected_profile="first",
+            binding=ConversationBinding(runner, FixtureProvider("first", "first-model")),
+            binding_factory=bind,
+        )
+        snapshot = VerificationRequirementsSnapshot()
+
+        result = await controller.run("inspect", verification_requirements=snapshot)
+
+        self.assertEqual(result.response, "ok")
+        self.assertIs(runner.verification_requirements, snapshot)
+
     async def test_execute_plan_delegates_through_the_turn_lock(self) -> None:
         plan = SessionPlan((PlanStep("Execute the change"),), "Use the saved plan")
         runner = FixtureConversation(plan=plan)

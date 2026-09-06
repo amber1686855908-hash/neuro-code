@@ -21,6 +21,9 @@ from typing import Any
 
 from neuro_code.domain.conversation.messages import ContentPart, ContentPartKind
 from neuro_code.domain.execution.tasks import TurnSource
+from neuro_code.domain.execution.verification_requirements import (
+    VerificationRequirementsSnapshot,
+)
 
 MAX_TURN_INPUT_BYTES = 256 * 1024
 MAX_RECOVERY_REASON_BYTES = 512
@@ -127,6 +130,7 @@ class TurnInput:
     source: TurnSource = TurnSource.USER
     plan_execution_requested: bool = False
     plan_execution_task_id: str | None = None
+    verification_requirements: VerificationRequirementsSnapshot | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.prompt, str):
@@ -141,6 +145,14 @@ class TurnInput:
             raise ValueError("turn input plan flag must be boolean")
         if self.plan_execution_task_id is not None:
             _bounded_identifier(self.plan_execution_task_id, field_name="plan_execution_task_id")
+        if self.verification_requirements is not None and not isinstance(
+            self.verification_requirements,
+            VerificationRequirementsSnapshot,
+        ):
+            raise ValueError(
+                "turn input verification_requirements must be a "
+                "VerificationRequirementsSnapshot or None"
+            )
 
     @property
     def background(self) -> bool:
@@ -151,13 +163,16 @@ class TurnInput:
         return not self.background
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "prompt": self.prompt,
             "content_parts": [part.to_dict() for part in self.content_parts],
             "source": self.source.value,
             "plan_execution_requested": self.plan_execution_requested,
             "plan_execution_task_id": self.plan_execution_task_id,
         }
+        if self.verification_requirements is not None:
+            payload["verification_requirements"] = self.verification_requirements.to_dict()
+        return payload
 
     def canonical_json(self) -> str:
         return _canonical_json(self.to_dict())
@@ -175,6 +190,13 @@ class TurnInput:
         raw_source = value.get("source")
         requested = value.get("plan_execution_requested", False)
         task_id = value.get("plan_execution_task_id")
+        verification_requirements = None
+        if "verification_requirements" in value:
+            raw_requirements = value.get("verification_requirements")
+            if raw_requirements is not None:
+                verification_requirements = VerificationRequirementsSnapshot.from_dict(
+                    raw_requirements
+                )
         if not isinstance(prompt, str) or not isinstance(raw_parts, list):
             raise ValueError("turn input payload is invalid")
         if not isinstance(raw_source, str):
@@ -193,6 +215,7 @@ class TurnInput:
             source,
             requested,
             task_id,
+            verification_requirements=verification_requirements,
         )
 
 

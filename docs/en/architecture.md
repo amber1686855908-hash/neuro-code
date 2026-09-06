@@ -3001,6 +3001,31 @@ snapshot retain the VF-1 latest-evidence behavior. This slice adds no request
 propagation, persistence schema, discovery, test runner, UI contract, or
 UltraCode integration; those remain later work.
 
+## VF-3b structured requirement propagation
+
+`RunTurnRequest.verification_requirements` is the optional immutable
+`VerificationRequirementsSnapshot` captured for one logical turn. `None` keeps
+the legacy mode, while an explicit empty snapshot remains distinguishable from
+an absent declaration. `SessionTurnService`, the conversation binding, and
+`AgentRuntime` pass the same snapshot to `AgentLoopRunner`; the loop constructs
+the sole `VerificationTracker` with that exact declaration before the first
+model step. No layer reconstructs requirements from a prompt, plan, policy,
+workspace, model, or provider setting.
+
+`TurnInput` persists a structured snapshot in its canonical JSON payload and
+therefore carries the same requirement identity, strength, activation,
+provenance, and fingerprint through safe retry and crash recovery. The absent
+field remains compatible with legacy rows and retains their historical
+fingerprint shape; a present malformed snapshot is an invalid recovery input
+and fails closed rather than becoming legacy mode. No database column or
+migration is added. Saved-plan execution does not synthesize requirements.
+
+The current UltraCode delegation path cannot preserve structured requirement
+semantics, so a structured request is rejected before parent-session creation
+or a durable execution claim. Legacy UltraCode requests retain their existing
+behavior. Requirement discovery, acquisition, blocker producers, and UltraCode
+verification propagation remain outside this slice.
+
 ## Cache-friendly model request projection and usage
 
 `ContextBuilder` owns the stable early request prefix: the request-scoped

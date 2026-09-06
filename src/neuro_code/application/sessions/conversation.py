@@ -10,7 +10,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from neuro_code.application.memory.compaction import ProviderContextWindow
 from neuro_code.application.memory.compaction_runtime import (
@@ -75,6 +75,7 @@ from neuro_code.domain.execution import (
     TurnRecoveryResolution,
     TurnRecoveryStatus,
     TurnSource,
+    VerificationRequirementsSnapshot,
 )
 from neuro_code.domain.plans import PlanComment, SessionPlan
 from neuro_code.domain.session_tasks import (
@@ -311,6 +312,7 @@ class AgentConversation:
         turn_source: TurnSource = TurnSource.USER,
         turn_id: str | None = None,
         ultracode_execution_id: str | None = None,
+        verification_requirements: VerificationRequirementsSnapshot | None = None,
     ) -> AgentRunResult:
         async with self._turn_lock:
 
@@ -325,20 +327,22 @@ class AgentConversation:
                         await outcome
 
             try:
-                result = await self._runtime.run(
-                    prompt,
-                    sink=capture_session,
-                    content_parts=content_parts,
-                    initial_items=self._items,
-                    source_provider=self._source_provider,
-                    source_model=self._source_model,
-                    source_context_affinity=self._source_context_affinity,
-                    session_id=self._session_id,
-                    turn_id=turn_id,
-                    ultracode_execution_id=ultracode_execution_id,
-                    cancellation_policy=cancellation_policy,
-                    turn_source=turn_source,
-                )
+                runtime_kwargs: dict[str, Any] = {
+                    "sink": capture_session,
+                    "content_parts": content_parts,
+                    "initial_items": self._items,
+                    "source_provider": self._source_provider,
+                    "source_model": self._source_model,
+                    "source_context_affinity": self._source_context_affinity,
+                    "session_id": self._session_id,
+                    "turn_id": turn_id,
+                    "ultracode_execution_id": ultracode_execution_id,
+                    "cancellation_policy": cancellation_policy,
+                    "turn_source": turn_source,
+                }
+                if verification_requirements is not None:
+                    runtime_kwargs["verification_requirements"] = verification_requirements
+                result = await self._runtime.run(prompt, **runtime_kwargs)
             except asyncio.CancelledError:
                 await self._reload_persisted_state()
                 raise
@@ -662,16 +666,20 @@ class AgentConversation:
                         await outcome
 
             try:
-                result = await self._runtime.run(
-                    handoff.input.prompt,
-                    sink=capture_session,
-                    content_parts=handoff.input.content_parts,
-                    initial_items=self._items,
-                    source_provider=self._source_provider,
-                    source_model=self._source_model,
-                    source_context_affinity=self._source_context_affinity,
-                    session_id=self._session_id,
-                )
+                runtime_kwargs: dict[str, Any] = {
+                    "sink": capture_session,
+                    "content_parts": handoff.input.content_parts,
+                    "initial_items": self._items,
+                    "source_provider": self._source_provider,
+                    "source_model": self._source_model,
+                    "source_context_affinity": self._source_context_affinity,
+                    "session_id": self._session_id,
+                }
+                if handoff.input.verification_requirements is not None:
+                    runtime_kwargs["verification_requirements"] = (
+                        handoff.input.verification_requirements
+                    )
+                result = await self._runtime.run(handoff.input.prompt, **runtime_kwargs)
             except asyncio.CancelledError:
                 await self._reload_persisted_state()
                 raise

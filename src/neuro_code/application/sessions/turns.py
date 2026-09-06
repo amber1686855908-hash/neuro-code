@@ -11,7 +11,11 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from neuro_code.domain.conversation.messages import ContentPart
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
-from neuro_code.domain.execution import TurnCancellationPolicy, TurnSource
+from neuro_code.domain.execution import (
+    TurnCancellationPolicy,
+    TurnSource,
+    VerificationRequirementsSnapshot,
+)
 from neuro_code.shared.errors import ConfigurationError
 
 if TYPE_CHECKING:
@@ -37,6 +41,7 @@ class RunTurnRequest:
     turn_source: TurnSource = TurnSource.USER
     expected_session_id: str | None = None
     turn_id: str | None = None
+    verification_requirements: VerificationRequirementsSnapshot | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.prompt, str):
@@ -57,6 +62,13 @@ class RunTurnRequest:
             not isinstance(self.turn_id, str) or not self.turn_id.strip()
         ):
             raise ValueError("turn_id must be non-empty when provided")
+        if self.verification_requirements is not None and not isinstance(
+            self.verification_requirements,
+            VerificationRequirementsSnapshot,
+        ):
+            raise ValueError(
+                "verification_requirements must be a VerificationRequirementsSnapshot or None"
+            )
 
 
 class SessionTurnRunner(Protocol):
@@ -81,6 +93,7 @@ class SessionTurnRunner(Protocol):
         turn_source: TurnSource = TurnSource.USER,
         turn_id: str | None = None,
         ultracode_execution_id: str | None = None,
+        verification_requirements: VerificationRequirementsSnapshot | None = None,
     ) -> AgentRunResult: ...
 
 
@@ -130,6 +143,10 @@ class SessionTurnService:
             raise ValueError("conversation runner is bound to a different session")
         effort = getattr(self._runner, "reasoning_effort", None)
         if request.turn_source is TurnSource.USER and effort is ReasoningEffort.ULTRACODE:
+            if request.verification_requirements is not None:
+                raise ConfigurationError(
+                    "Ultracode delegation does not support structured verification requirements"
+                )
             if self._ultracode_delegate is None:
                 raise ConfigurationError("Ultracode delegation entry is not configured")
             return await self._ultracode_delegate(request, sink)
@@ -141,6 +158,8 @@ class SessionTurnService:
         }
         if request.turn_id is not None:
             kwargs["turn_id"] = request.turn_id
+        if request.verification_requirements is not None:
+            kwargs["verification_requirements"] = request.verification_requirements
         return await self._runner.run(
             request.prompt,
             **kwargs,

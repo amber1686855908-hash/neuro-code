@@ -67,6 +67,7 @@ from neuro_code.domain.execution import (
     SupervisorReasonCode,
     TurnCancellationPolicy,
     TurnSource,
+    VerificationRequirementsSnapshot,
 )
 from neuro_code.domain.plans import PlanComment, PlanStep, SessionPlan
 from neuro_code.domain.sandbox import SandboxProfile
@@ -274,6 +275,7 @@ class SessionTurnRunnerFixture:
     def __init__(self) -> None:
         self.session_id = "session-1"
         self.calls: list[tuple[object, ...]] = []
+        self.verification_requirements: VerificationRequirementsSnapshot | None = None
         self.result = AgentRunResult("session-1", "done", (), (), (), 1)
         self.cancel = False
 
@@ -285,7 +287,9 @@ class SessionTurnRunnerFixture:
         content_parts: Sequence[ContentPart] = (),
         cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
         turn_source: TurnSource = TurnSource.USER,
+        verification_requirements: VerificationRequirementsSnapshot | None = None,
     ) -> AgentRunResult:
+        self.verification_requirements = verification_requirements
         self.calls.append(
             (
                 prompt,
@@ -903,6 +907,18 @@ class SessionApplicationServiceTests(unittest.IsolatedAsyncioTestCase):
                 )
             ],
         )
+
+    async def test_bound_turn_service_forwards_the_exact_structured_snapshot(self) -> None:
+        runner = SessionTurnRunnerFixture()
+        service = self.service.bind_runner(runner)
+        snapshot = VerificationRequirementsSnapshot()
+
+        result = await service.run_turn(
+            RunTurnRequest("inspect the workspace", verification_requirements=snapshot)
+        )
+
+        self.assertIs(result, runner.result)
+        self.assertIs(runner.verification_requirements, snapshot)
 
     async def test_bound_turn_service_rejects_wrong_session_before_run(self) -> None:
         runner = SessionTurnRunnerFixture()

@@ -296,6 +296,10 @@ class UltracodeDelegationApplicationService:
             raise ValueError("Ultracode turn request must be canonical")
         if request.turn_source is not TurnSource.USER:
             raise ConfigurationError("Ultracode delegation is available only for user turns")
+        if request.verification_requirements is not None:
+            raise ConfigurationError(
+                "Ultracode delegation does not support structured verification requirements"
+            )
         runner = self._require_runner()
         if getattr(runner.reasoning_effort, "value", None) != "ultracode":
             raise ConfigurationError("Ultracode delegation requires effort=ultracode")
