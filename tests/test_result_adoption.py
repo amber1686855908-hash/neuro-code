@@ -1131,14 +1131,14 @@ async def test_schema_28_to_29_result_adoption_migration_is_idempotent_and_lossl
 
     migrated = SqliteSessionStore(database)
     await migrated.initialize()
-    assert SCHEMA_VERSION == 29
+    assert SCHEMA_VERSION == 30
     assert await migrated.get_session(session_id) is not None
 
     def schema_snapshot() -> tuple[tuple[str, str | None], ...]:
         with closing(sqlite3.connect(database)) as connection:
             assert connection.execute(
                 "SELECT version FROM schema_meta WHERE singleton = 1"
-            ).fetchone() == (29,)
+            ).fetchone() == (30,)
             return tuple(
                 (str(row[0]), None if row[1] is None else str(row[1]))
                 for row in connection.execute(

@@ -957,6 +957,13 @@ def _migrate_ultracode_schema(connection: sqlite3.Connection) -> None:
     _ensure_ultracode_schema(connection)
 
 
+def _migrate_ultracode_verification_schema(connection: sqlite3.Connection) -> None:
+    """Add parent-requirements columns during schema 29 -> 30."""
+
+    _ensure_ultracode_schema(connection)
+    _ensure_ultracode_verification_schema(connection)
+
+
 def _ensure_ultracode_schema(connection: sqlite3.Connection) -> None:
     """Create the insert-once, one-branch Ultracode lifecycle projection."""
 
@@ -986,6 +993,8 @@ def _ensure_ultracode_schema(connection: sqlite3.Connection) -> None:
             final_result_fingerprint TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
+            verification_requirements_json TEXT,
+            verification_requirements_fingerprint TEXT,
             FOREIGN KEY (parent_session_id) REFERENCES sessions(id) ON DELETE RESTRICT
         )
         """
@@ -996,6 +1005,27 @@ def _ensure_ultracode_schema(connection: sqlite3.Connection) -> None:
         ON orchestration_ultracode_executions(state, updated_at, execution_id)
         """
     )
+
+
+def _ensure_ultracode_verification_schema(connection: sqlite3.Connection) -> None:
+    """Ensure the optional, immutable parent-requirements columns exist."""
+
+    columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(orchestration_ultracode_executions)"
+        ).fetchall()
+    }
+    if "verification_requirements_json" not in columns:
+        connection.execute(
+            "ALTER TABLE orchestration_ultracode_executions "
+            "ADD COLUMN verification_requirements_json TEXT"
+        )
+    if "verification_requirements_fingerprint" not in columns:
+        connection.execute(
+            "ALTER TABLE orchestration_ultracode_executions "
+            "ADD COLUMN verification_requirements_fingerprint TEXT"
+        )
 
 
 def _migrate_result_adoption_schema(connection: sqlite3.Connection) -> None:

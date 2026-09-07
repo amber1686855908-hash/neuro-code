@@ -30,6 +30,7 @@ from neuro_code.application.ports.ultracode import (
 )
 from neuro_code.application.runtime.agent import AgentRunResult, EventSink
 from neuro_code.application.runtime.process_liveness import owner_is_alive
+from neuro_code.application.sessions.requirements import NormalTurnRequirementsPolicy
 from neuro_code.application.sessions.turns import RunTurnRequest
 from neuro_code.domain.agent_swarm import (
     MAX_SWARM_OBJECTIVE_BYTES,
@@ -49,6 +50,7 @@ from neuro_code.domain.execution import (
     TurnRecoveryResolution,
     TurnRecoveryStatus,
     TurnSource,
+    VerificationRequirementsSnapshot,
 )
 from neuro_code.domain.result_adoption import (
     ResultAdoptionRequest,
@@ -198,6 +200,7 @@ class UltracodeParentRunner(Protocol):
         turn_source: TurnSource = TurnSource.USER,
         turn_id: str | None = None,
         ultracode_execution_id: str | None = None,
+        verification_requirements: VerificationRequirementsSnapshot | None = None,
     ) -> AgentRunResult: ...
 
     async def commit_external_turn(
@@ -209,6 +212,17 @@ class UltracodeParentRunner(Protocol):
         execution_id: str,
         decision: UltracodeDelegationDecision,
         content_parts: Sequence[ContentPart] = (),
+        sink: EventSink | None = None,
+    ) -> AgentRunResult: ...
+
+    async def replay_committed_turn(
+        self,
+        prompt: str,
+        *,
+        turn_id: str,
+        execution_id: str,
+        content_parts: Sequence[ContentPart] = (),
+        verification_requirements: VerificationRequirementsSnapshot | None = None,
         sink: EventSink | None = None,
     ) -> AgentRunResult: ...
 
@@ -296,30 +310,65 @@ class UltracodeDelegationApplicationService:
             raise ValueError("Ultracode turn request must be canonical")
         if request.turn_source is not TurnSource.USER:
             raise ConfigurationError("Ultracode delegation is available only for user turns")
-        if request.verification_requirements is not None:
-            raise ConfigurationError(
-                "Ultracode delegation does not support structured verification requirements"
-            )
         runner = self._require_runner()
         if getattr(runner.reasoning_effort, "value", None) != "ultracode":
             raise ConfigurationError("Ultracode delegation requires effort=ultracode")
+        if (
+            request.expected_session_id is not None
+            and runner.session_id is not None
+            and runner.session_id != request.expected_session_id
+        ):
+            raise ConfigurationError("Ultracode parent session identity does not match the request")
+
+        requested_requirements = request.verification_requirements
+        preselected_decision: UltracodeDelegationDecision | None = None
+        existing_hint: UltracodeExecution | None = None
+        if runner.session_id is not None and request.turn_id is not None:
+            existing_hint = await self._store.get_ultracode_execution(
+                ultracode_execution_id(runner.session_id, request.turn_id)
+            )
+        if existing_hint is None and requested_requirements is not None:
+            preselected_decision = self._policy.decide(request.prompt)
+            if preselected_decision is UltracodeDelegationDecision.BOUNDED_SWARM:
+                raise ConfigurationError(
+                    "structured verification requirements are supported only for MAIN_MAX"
+                )
         session_id = await runner.ensure_persisted_session()
         if request.expected_session_id is not None and session_id != request.expected_session_id:
             raise ConfigurationError("Ultracode parent session identity does not match the request")
         turn_id = request.turn_id or f"ultracode-turn-{uuid.uuid4().hex}"
-        turn_input = TurnInput(request.prompt, request.content_parts, TurnSource.USER)
         execution_id = ultracode_execution_id(session_id, turn_id)
         swarm_id = ultracode_swarm_run_id(execution_id)
         context_fp = _context_fingerprint(runner.items)
         async with self._lock:
+            existing = await self._store.get_ultracode_execution(execution_id)
+            if existing is not None:
+                decision = existing.decision
+                effective_requirements = self._requirements_for_existing(
+                    existing,
+                    requested_requirements,
+                )
+            else:
+                decision = preselected_decision or self._policy.decide(request.prompt)
+                effective_requirements = self._requirements_for_new(
+                    decision,
+                    requested_requirements,
+                )
+            turn_input = TurnInput(
+                request.prompt,
+                request.content_parts,
+                TurnSource.USER,
+                verification_requirements=effective_requirements,
+            )
             run = await self._claim_or_recover(
                 execution_id=execution_id,
                 parent_session_id=session_id,
                 turn_id=turn_id,
                 turn_input=turn_input,
                 context_fingerprint=context_fp,
-                decision=None,
+                decision=decision,
                 swarm_id=swarm_id,
+                verification_requirements=effective_requirements,
             )
             if run.state is UltracodeExecutionState.COMPLETED:
                 return await self._recover_completed(run, request, sink=sink)
@@ -342,6 +391,39 @@ class UltracodeDelegationApplicationService:
                 await self._mark_indeterminate(run)
                 raise
 
+    @staticmethod
+    def _requirements_for_new(
+        decision: UltracodeDelegationDecision,
+        requested: VerificationRequirementsSnapshot | None,
+    ) -> VerificationRequirementsSnapshot | None:
+        if decision is UltracodeDelegationDecision.BOUNDED_SWARM:
+            if requested is not None:
+                raise ConfigurationError(
+                    "structured verification requirements are supported only for MAIN_MAX"
+                )
+            return None
+        if requested is None:
+            return NormalTurnRequirementsPolicy.resolve(None)
+        return requested
+
+    @staticmethod
+    def _requirements_for_existing(
+        existing: UltracodeExecution,
+        requested: VerificationRequirementsSnapshot | None,
+    ) -> VerificationRequirementsSnapshot | None:
+        stored = existing.verification_requirements
+        if existing.decision is UltracodeDelegationDecision.BOUNDED_SWARM:
+            if stored is not None or requested is not None:
+                raise ConfigurationError(
+                    "BOUNDED_SWARM does not support structured verification requirements"
+                )
+            return None
+        if requested is None:
+            return stored
+        if stored is None or stored != requested:
+            raise ConfigurationError("Ultracode verification requirements identity conflicts")
+        return stored
+
     def _require_runner(self) -> UltracodeParentRunner:
         runner = self._parent_binding.runner
         required = (
@@ -351,6 +433,7 @@ class UltracodeDelegationApplicationService:
             "ensure_persisted_session",
             "run",
             "commit_external_turn",
+            "replay_committed_turn",
         )
         if any(not hasattr(runner, name) for name in required):
             raise ConfigurationError("Ultracode parent runner does not expose the required seam")
@@ -366,6 +449,7 @@ class UltracodeDelegationApplicationService:
         context_fingerprint: str,
         decision: UltracodeDelegationDecision | None,
         swarm_id: str,
+        verification_requirements: VerificationRequirementsSnapshot | None,
     ) -> UltracodeExecution:
         existing = await self._store.get_ultracode_execution(execution_id)
         if existing is not None:
@@ -378,6 +462,8 @@ class UltracodeDelegationApplicationService:
                 )
             if existing.input_fingerprint != turn_input.fingerprint:
                 raise ConfigurationError("Ultracode execution input identity conflicts")
+            if existing.verification_requirements != verification_requirements:
+                raise ConfigurationError("Ultracode verification requirements identity conflicts")
             if existing.state is UltracodeExecutionState.DECIDED and (
                 existing.context_fingerprint != context_fingerprint
             ):
@@ -420,6 +506,7 @@ class UltracodeDelegationApplicationService:
             lease_expires_at=now + timedelta(seconds=self._lease_seconds),
             created_at=now,
             updated_at=now,
+            verification_requirements=verification_requirements,
         )
         try:
             claim = await self._store.claim_ultracode_execution(
@@ -490,6 +577,7 @@ class UltracodeDelegationApplicationService:
             turn_source=request.turn_source,
             turn_id=run.parent_turn_id,
             ultracode_execution_id=run.execution_id,
+            verification_requirements=run.verification_requirements,
         )
         response = _response(result.response)
         completed = await self._transition(
@@ -513,20 +601,8 @@ class UltracodeDelegationApplicationService:
         if attempt is None:
             return await self._run_main(run, request, sink=sink)
         if attempt.resolution is TurnRecoveryResolution.COMMITTED:
-            response = await self._require_parent_result(
-                run.parent_session_id,
-                run.parent_turn_id,
-                run.execution_id,
-            )
-            result = await self._require_runner().commit_external_turn(
-                request.prompt,
-                response=response,
-                turn_id=run.parent_turn_id,
-                execution_id=run.execution_id,
-                decision=run.decision,
-                content_parts=request.content_parts,
-                sink=sink,
-            )
+            result = await self._replay_main_result(run, request, sink=sink)
+            response = result.response
             completed = await self._transition(
                 run,
                 UltracodeExecutionState.COMPLETED,
@@ -969,6 +1045,8 @@ class UltracodeDelegationApplicationService:
         *,
         sink: EventSink | None,
     ) -> AgentRunResult:
+        if run.decision is UltracodeDelegationDecision.MAIN_MAX:
+            return await self._replay_main_result(run, request, sink=sink)
         response = _response(run.final_response or "")
         return await self._require_runner().commit_external_turn(
             request.prompt,
@@ -993,6 +1071,8 @@ class UltracodeDelegationApplicationService:
             raise ConfigurationError(
                 "Ultracode execution is indeterminate; automatic replay is disabled"
             )
+        if run.decision is UltracodeDelegationDecision.MAIN_MAX:
+            return await self._replay_main_result(run, request, sink=sink)
         response = await self._require_parent_result(
             run.parent_session_id,
             run.parent_turn_id,
@@ -1008,11 +1088,31 @@ class UltracodeDelegationApplicationService:
             sink=sink,
         )
 
+    async def _replay_main_result(
+        self,
+        run: UltracodeExecution,
+        request: RunTurnRequest,
+        *,
+        sink: EventSink | None,
+    ) -> AgentRunResult:
+        return await self._require_runner().replay_committed_turn(
+            request.prompt,
+            turn_id=run.parent_turn_id,
+            execution_id=run.execution_id,
+            content_parts=request.content_parts,
+            verification_requirements=run.verification_requirements,
+            sink=sink,
+        )
+
     async def _ensure_parent_attempt(
         self,
         run: UltracodeExecution,
         request: RunTurnRequest,
     ) -> None:
+        if run.verification_requirements is not None:
+            raise ConfigurationError(
+                "BOUNDED_SWARM parent attempts cannot carry structured verification requirements"
+            )
         attempts = await self._parent_attempts(run.parent_session_id)
         exact = next((item for item in attempts if item.turn_id == run.parent_turn_id), None)
         turn_input = TurnInput(request.prompt, request.content_parts, TurnSource.USER)

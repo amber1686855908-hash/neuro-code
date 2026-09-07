@@ -14,6 +14,10 @@ from datetime import UTC, datetime
 
 from neuro_code.application.ports.agent_swarm import ProcessLivenessProbe
 from neuro_code.application.ports.ultracode import UltracodeExecutionClaim, UltracodeStoreError
+from neuro_code.domain.execution import (
+    MAX_REQUIREMENT_SNAPSHOT_BYTES,
+    VerificationRequirementsSnapshot,
+)
 from neuro_code.domain.ultracode import (
     UltracodeDelegationDecision,
     UltracodeExecution,
@@ -23,6 +27,8 @@ from neuro_code.infrastructure.persistence.sqlite_session_connection import (
     _SqliteSessionPersistenceContext,
 )
 from neuro_code.shared.async_utils import run_blocking
+
+_MAX_ULTRACODE_REQUIREMENTS_JSON_BYTES = MAX_REQUIREMENT_SNAPSHOT_BYTES + 128
 
 
 class UltracodeMixin(_SqliteSessionPersistenceContext):
@@ -66,6 +72,7 @@ class UltracodeMixin(_SqliteSessionPersistenceContext):
         _validated_ultracode_identifier(execution.parent_turn_id)
         _validated_ultracode_fingerprint(execution.input_fingerprint)
         _validated_ultracode_fingerprint(execution.context_fingerprint)
+        _ultracode_verification_requirements_values(execution.verification_requirements)
         now_utc = now.astimezone(UTC)
         prepared = replace(execution, created_at=now_utc, updated_at=now_utc)
 
@@ -138,6 +145,12 @@ class UltracodeMixin(_SqliteSessionPersistenceContext):
             except UltracodeStoreError:
                 connection.rollback()
                 raise
+            except (KeyError, TypeError, ValueError) as error:
+                connection.rollback()
+                raise UltracodeStoreError(
+                    "Ultracode execution record is invalid",
+                    kind="integrity",
+                ) from error
             except sqlite3.IntegrityError as error:
                 connection.rollback()
                 raise UltracodeStoreError(
@@ -286,7 +299,8 @@ _ULTRACODE_EXECUTION_SELECT = """
            input_fingerprint, context_fingerprint, decision, downstream_id,
            provider_name, model_name, context_affinity, state, generation,
            owner_id, owner_pid, owner_token, lease_expires_at,
-           final_response, final_result_fingerprint, created_at, updated_at
+           final_response, final_result_fingerprint, created_at, updated_at,
+           verification_requirements_json, verification_requirements_fingerprint
     FROM orchestration_ultracode_executions
 """
 
@@ -296,8 +310,9 @@ _ULTRACODE_EXECUTION_INSERT = """
         input_fingerprint, context_fingerprint, decision, downstream_id,
         provider_name, model_name, context_affinity, state, generation,
         owner_id, owner_pid, owner_token, lease_expires_at,
-        final_response, final_result_fingerprint, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        final_response, final_result_fingerprint, created_at, updated_at,
+        verification_requirements_json, verification_requirements_fingerprint
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 
@@ -319,6 +334,9 @@ def _validated_ultracode_fingerprint(value: str) -> None:
 
 
 def _ultracode_execution_values(execution: UltracodeExecution) -> tuple[object, ...]:
+    requirements_json, requirements_fingerprint = _ultracode_verification_requirements_values(
+        execution.verification_requirements
+    )
     return (
         execution.execution_id,
         execution.parent_session_id,
@@ -340,6 +358,8 @@ def _ultracode_execution_values(execution: UltracodeExecution) -> tuple[object, 
         execution.final_result_fingerprint,
         execution.created_at.astimezone(UTC).isoformat(),
         execution.updated_at.astimezone(UTC).isoformat(),
+        requirements_json,
+        requirements_fingerprint,
     )
 
 
@@ -355,7 +375,7 @@ def _load_ultracode_execution(
 
 
 def _ultracode_execution_from_row(row: Sequence[object]) -> UltracodeExecution:
-    if len(row) != 20:
+    if len(row) != 22:
         raise ValueError("Ultracode execution record is malformed")
     (
         execution_id,
@@ -378,6 +398,8 @@ def _ultracode_execution_from_row(row: Sequence[object]) -> UltracodeExecution:
         final_result_fingerprint,
         created_at,
         updated_at,
+        verification_requirements_json,
+        verification_requirements_fingerprint,
     ) = row
     if not isinstance(owner_pid, int) or isinstance(owner_pid, bool):
         raise ValueError("Ultracode owner PID is invalid")
@@ -406,4 +428,48 @@ def _ultracode_execution_from_row(row: Sequence[object]) -> UltracodeExecution:
         final_result_fingerprint=(
             str(final_result_fingerprint) if final_result_fingerprint is not None else None
         ),
+        verification_requirements=_ultracode_verification_requirements_from_values(
+            verification_requirements_json,
+            verification_requirements_fingerprint,
+        ),
     )
+
+
+def _ultracode_verification_requirements_values(
+    requirements: VerificationRequirementsSnapshot | None,
+) -> tuple[str | None, str | None]:
+    if requirements is None:
+        return None, None
+    if not isinstance(requirements, VerificationRequirementsSnapshot):
+        raise TypeError("Ultracode verification requirements are not canonical")
+    payload = json.dumps(
+        requirements.to_dict(),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if len(payload.encode("utf-8")) > _MAX_ULTRACODE_REQUIREMENTS_JSON_BYTES:
+        raise ValueError("Ultracode verification requirements exceed their byte bound")
+    return payload, requirements.fingerprint
+
+
+def _ultracode_verification_requirements_from_values(
+    raw_json: object,
+    raw_fingerprint: object,
+) -> VerificationRequirementsSnapshot | None:
+    if raw_json is None and raw_fingerprint is None:
+        return None
+    if not isinstance(raw_json, str) or not isinstance(raw_fingerprint, str):
+        raise ValueError("Ultracode verification requirements projection is incomplete")
+    if len(raw_json.encode("utf-8")) > _MAX_ULTRACODE_REQUIREMENTS_JSON_BYTES:
+        raise ValueError("Ultracode verification requirements exceed their byte bound")
+    payload = json.loads(raw_json)
+    if not isinstance(payload, dict):
+        raise ValueError("Ultracode verification requirements JSON must be an object")
+    requirements = VerificationRequirementsSnapshot.from_dict(payload)
+    canonical_json, canonical_fingerprint = _ultracode_verification_requirements_values(
+        requirements
+    )
+    if canonical_json != raw_json or canonical_fingerprint != raw_fingerprint:
+        raise ValueError("Ultracode verification requirements projection is not canonical")
+    return requirements

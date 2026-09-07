@@ -66,6 +66,7 @@ from neuro_code.infrastructure.persistence.sqlite_session_schema import (
     _ensure_task_dag_replan_schema,
     _ensure_task_dag_schema,
     _ensure_ultracode_schema,
+    _ensure_ultracode_verification_schema,
     _ensure_writable_subagent_lease_schema,
     _migrate_agent_swarm_schema,
     _migrate_leader_parallel_decision_schema,
@@ -75,6 +76,7 @@ from neuro_code.infrastructure.persistence.sqlite_session_schema import (
     _migrate_task_dag_parallelism_schema,
     _migrate_task_dag_replan_schema,
     _migrate_ultracode_schema,
+    _migrate_ultracode_verification_schema,
     _migrate_writable_subagent_lease_schema,
 )
 from neuro_code.shared.async_utils import run_blocking
@@ -272,6 +274,12 @@ class CoreMixin(_SqliteSessionPersistenceContext):
                             "UPDATE schema_meta SET version = 29 WHERE singleton = 1"
                         )
                         version = (29,)
+                    if version is not None and version[0] == 29:
+                        _migrate_ultracode_verification_schema(connection)
+                        connection.execute(
+                            "UPDATE schema_meta SET version = 30 WHERE singleton = 1"
+                        )
+                        version = (30,)
                     if version is None or version[0] != SCHEMA_VERSION:
                         raise SessionError(
                             "unsupported session schema version: "
@@ -294,6 +302,7 @@ class CoreMixin(_SqliteSessionPersistenceContext):
                     _ensure_task_dag_dependency_result_relay_schema(connection)
                     _ensure_task_dag_recovery_claim_schema(connection)
                     _ensure_ultracode_schema(connection)
+                    _ensure_ultracode_verification_schema(connection)
                     _ensure_model_planning_schema(connection)
                     _ensure_task_dag_replan_schema(connection)
                     _ensure_agent_swarm_schema(connection)

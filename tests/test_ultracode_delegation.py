@@ -32,6 +32,10 @@ from neuro_code.application.sessions.profile_conversation import (
     ProfileConversationController,
     ProviderOption,
 )
+from neuro_code.application.sessions.requirements import (
+    DEFAULT_NORMAL_REQUIREMENTS,
+    NormalTurnRequirementsPolicy,
+)
 from neuro_code.application.sessions.turns import RunTurnRequest, SessionTurnService
 from neuro_code.application.settings import ApplicationSettings
 from neuro_code.application.workflows.agent_swarm import RunAgentSwarmRequest
@@ -149,6 +153,8 @@ class _ParentRunner:
         self.response = response
         self.run_calls = 0
         self.commit_calls = 0
+        self.replay_calls = 0
+        self.verification_requirements: VerificationRequirementsSnapshot | None = None
         self.fail_main = False
 
     @property
@@ -190,10 +196,11 @@ class _ParentRunner:
         turn_source: TurnSource = TurnSource.USER,
         turn_id: str | None = None,
         ultracode_execution_id: str | None = None,
-        verification_requirements=None,
+        verification_requirements: VerificationRequirementsSnapshot | None = None,
     ) -> AgentRunResult:
-        del cancellation_policy, turn_source, verification_requirements
+        del cancellation_policy, turn_source
         self.run_calls += 1
+        self.verification_requirements = verification_requirements
         if self.fail_main:
             raise RuntimeError("fixture main failure")
         if turn_id is None or ultracode_execution_id is None:
@@ -206,6 +213,7 @@ class _ParentRunner:
             decision=UltracodeDelegationDecision.MAIN_MAX,
             content_parts=content_parts,
             sink=sink,
+            verification_requirements=verification_requirements,
         )
 
     async def commit_external_turn(
@@ -218,6 +226,7 @@ class _ParentRunner:
         decision: UltracodeDelegationDecision,
         content_parts=(),
         sink=None,
+        verification_requirements: VerificationRequirementsSnapshot | None = None,
     ) -> AgentRunResult:
         self.commit_calls += 1
         return await self._conversation.commit_external_turn(
@@ -227,6 +236,27 @@ class _ParentRunner:
             execution_id=execution_id,
             decision=decision,
             content_parts=content_parts,
+            sink=sink,
+            verification_requirements=verification_requirements,
+        )
+
+    async def replay_committed_turn(
+        self,
+        prompt: str,
+        *,
+        turn_id: str,
+        execution_id: str,
+        content_parts=(),
+        verification_requirements: VerificationRequirementsSnapshot | None = None,
+        sink=None,
+    ) -> AgentRunResult:
+        self.replay_calls += 1
+        return await self._conversation.replay_committed_turn(
+            prompt,
+            turn_id=turn_id,
+            execution_id=execution_id,
+            content_parts=content_parts,
+            verification_requirements=verification_requirements,
             sink=sink,
         )
 
@@ -985,9 +1015,14 @@ def _fresh_ultracode_candidate(
     turn_id: str,
     prompt: str,
     decision: UltracodeDelegationDecision,
+    verification_requirements: VerificationRequirementsSnapshot | None = None,
 ) -> UltracodeExecution:
     now = datetime.now(UTC)
-    turn_input = TurnInput(prompt, source=TurnSource.USER)
+    turn_input = TurnInput(
+        prompt,
+        source=TurnSource.USER,
+        verification_requirements=verification_requirements,
+    )
     execution_id = ultracode_execution_id(session_id, turn_id)
     downstream_id = (
         turn_id
@@ -1013,6 +1048,7 @@ def _fresh_ultracode_candidate(
         lease_expires_at=now + timedelta(minutes=5),
         created_at=now,
         updated_at=now,
+        verification_requirements=verification_requirements,
     )
 
 
@@ -1068,6 +1104,7 @@ async def _fresh_commit_parent_result(
         turn_id=candidate.parent_turn_id,
         execution_id=candidate.execution_id,
         decision=candidate.decision,
+        verification_requirements=candidate.verification_requirements,
     )
 
 
@@ -1227,6 +1264,161 @@ async def test_simple_ultracode_uses_existing_main_path_once_and_replays_exact_r
 
 
 @pytest.mark.asyncio
+async def test_main_max_freezes_default_and_explicit_parent_requirements() -> None:
+    explicit = VerificationRequirementsSnapshot.create(
+        (VerificationRequirement.create(criterion="run the relevant checks"),)
+    )
+    cases = (
+        ("default", None, DEFAULT_NORMAL_REQUIREMENTS),
+        ("explicit", explicit, explicit),
+        ("explicit-empty", VerificationRequirementsSnapshot(), VerificationRequirementsSnapshot()),
+    )
+    for label, requested, expected in cases:
+        with tempfile.TemporaryDirectory(prefix=f"ultracode-requirements-{label}-") as directory:
+            cwd = Path(directory)
+            store = await _store(cwd)
+            runner = _ParentRunner(store, cwd)
+            binding = _binding(runner, cwd)
+            service = _service(store, binding, _unexpected_swarm_factory)
+            request = RunTurnRequest(
+                "summarize this local file",
+                turn_id=f"main-requirements-{label}",
+                verification_requirements=requested,
+            )
+            with patch(
+                "neuro_code.application.workflows.ultracode.NormalTurnRequirementsPolicy.resolve",
+                wraps=NormalTurnRequirementsPolicy.resolve,
+            ) as resolver:
+                result = await service.run_turn(request)
+            assert result.response == "main answer"
+            assert runner.verification_requirements == expected
+            assert resolver.call_count == (1 if requested is None else 0)
+            session_id = runner.session_id
+            assert session_id is not None
+            execution = await store.get_ultracode_execution(
+                ultracode_execution_id(session_id, request.turn_id or "")
+            )
+            assert execution is not None
+            assert execution.decision is UltracodeDelegationDecision.MAIN_MAX
+            assert execution.verification_requirements == expected
+            attempts = await store.load_turn_attempts(session_id)
+            assert len(attempts) == 1
+            assert (
+                attempts[0].input_fingerprint
+                == TurnInput(
+                    request.prompt,
+                    source=TurnSource.USER,
+                    verification_requirements=expected,
+                ).fingerprint
+            )
+
+
+@pytest.mark.asyncio
+async def test_structured_main_max_execution_round_trips_and_rejects_tampered_projection() -> None:
+    snapshot = VerificationRequirementsSnapshot.create(
+        (VerificationRequirement.create(criterion="run the relevant checks"),)
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        cwd = Path(directory)
+        store = await _store(cwd)
+        session_id = await store.create_session(str(cwd), "fixture-provider", "fixture-model")
+        candidate = _fresh_ultracode_candidate(
+            session_id,
+            "structured-persistence",
+            "summarize this local file",
+            UltracodeDelegationDecision.MAIN_MAX,
+            snapshot,
+        )
+        claim = await store.claim_ultracode_execution(
+            candidate,
+            now=datetime.now(UTC),
+            owner_is_alive=lambda _pid: True,
+        )
+        assert claim.acquired is True
+        restored = await store.get_ultracode_execution(candidate.execution_id)
+        assert restored is not None
+        assert restored.verification_requirements == snapshot
+        with closing(sqlite3.connect(cwd / "sessions.db")) as connection:
+            row = connection.execute(
+                "SELECT verification_requirements_json, "
+                "verification_requirements_fingerprint "
+                "FROM orchestration_ultracode_executions WHERE execution_id = ?",
+                (candidate.execution_id,),
+            ).fetchone()
+        assert row is not None
+        assert row[0] == json.dumps(
+            snapshot.to_dict(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        assert row[1] == snapshot.fingerprint
+
+        with closing(sqlite3.connect(cwd / "sessions.db")) as connection, connection:
+            connection.execute(
+                "UPDATE orchestration_ultracode_executions "
+                "SET verification_requirements_json = ? WHERE execution_id = ?",
+                ("{malformed", candidate.execution_id),
+            )
+        with pytest.raises(UltracodeStoreError, match="record is invalid"):
+            await store.get_ultracode_execution(candidate.execution_id)
+
+        with closing(sqlite3.connect(cwd / "sessions.db")) as connection, connection:
+            connection.execute(
+                "UPDATE orchestration_ultracode_executions "
+                "SET verification_requirements_json = ?, "
+                "verification_requirements_fingerprint = ? WHERE execution_id = ?",
+                (
+                    json.dumps(
+                        snapshot.to_dict(),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    "0" * 64,
+                    candidate.execution_id,
+                ),
+            )
+        with pytest.raises(UltracodeStoreError, match="record is invalid"):
+            await store.get_ultracode_execution(candidate.execution_id)
+
+
+def test_ultracode_requirement_snapshot_is_part_of_identity_and_input() -> None:
+    first = VerificationRequirementsSnapshot.create(
+        (VerificationRequirement.create(criterion="run the relevant checks"),)
+    )
+    second = VerificationRequirementsSnapshot.create(
+        (VerificationRequirement.create(criterion="run the complete checks"),)
+    )
+    legacy = _fresh_ultracode_candidate(
+        "identity-session",
+        "identity-turn",
+        "summarize this local file",
+        UltracodeDelegationDecision.MAIN_MAX,
+    )
+    structured = _fresh_ultracode_candidate(
+        "identity-session",
+        "identity-turn",
+        "summarize this local file",
+        UltracodeDelegationDecision.MAIN_MAX,
+        first,
+    )
+    other_structured = _fresh_ultracode_candidate(
+        "identity-session",
+        "identity-turn",
+        "summarize this local file",
+        UltracodeDelegationDecision.MAIN_MAX,
+        second,
+    )
+    assert legacy.verification_requirements is None
+    assert structured.verification_requirements == first
+    assert legacy.input_fingerprint != structured.input_fingerprint
+    assert structured.input_fingerprint != other_structured.input_fingerprint
+    assert not legacy.same_identity(structured)
+    assert not structured.same_identity(other_structured)
+
+
+@pytest.mark.asyncio
 async def test_decomposable_ultracode_uses_existing_swarm_and_replays_without_rerun() -> None:
     with tempfile.TemporaryDirectory() as directory:
         cwd = Path(directory)
@@ -1257,6 +1449,7 @@ async def test_decomposable_ultracode_uses_existing_swarm_and_replays_without_re
         execution = await store.get_ultracode_execution(execution_id)
         assert execution is not None
         assert execution.decision is UltracodeDelegationDecision.BOUNDED_SWARM
+        assert execution.verification_requirements is None
         assert execution.downstream_id == swarm_id
         assert execution.state is UltracodeExecutionState.COMPLETED
 
@@ -1273,6 +1466,109 @@ async def test_decomposable_ultracode_uses_existing_swarm_and_replays_without_re
         assert factory_calls == 1
         messages = await store.load_messages(session_id)
         assert len([message for message in messages if message.role is Role.ASSISTANT]) == 1
+
+
+@pytest.mark.asyncio
+async def test_structured_main_max_recovery_reuses_snapshot_without_policy_or_duplicate_run() -> (
+    None
+):
+    snapshot = VerificationRequirementsSnapshot.create(
+        (VerificationRequirement.create(criterion="run the relevant checks"),)
+    )
+    conflicting = VerificationRequirementsSnapshot.create(
+        (VerificationRequirement.create(criterion="run the complete checks"),)
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        cwd = Path(directory)
+        store = await _store(cwd)
+        runner = _ParentRunner(store, cwd)
+        binding = _binding(runner, cwd)
+        request = RunTurnRequest(
+            "summarize this local file",
+            turn_id="structured-recovery",
+            verification_requirements=snapshot,
+        )
+        first = await _service(store, binding, _unexpected_swarm_factory).run_turn(request)
+        assert first.response == "main answer"
+        assert runner.run_calls == 1
+        assert runner.commit_calls == 1
+
+        replay = await _service(
+            store,
+            binding,
+            _unexpected_swarm_factory,
+            policy=_UnexpectedPolicy(),
+            owner_id="structured-recovery-owner",
+        ).run_turn(RunTurnRequest("summarize this local file", turn_id="structured-recovery"))
+        assert replay.response == first.response
+        assert runner.run_calls == 1
+        assert runner.commit_calls == 1
+        assert runner.replay_calls == 1
+        execution = await store.get_ultracode_execution(
+            ultracode_execution_id(runner.session_id or "", "structured-recovery")
+        )
+        assert execution is not None
+        assert execution.verification_requirements == snapshot
+
+        with pytest.raises(ConfigurationError, match="identity conflicts"):
+            await _service(
+                store,
+                binding,
+                _unexpected_swarm_factory,
+                policy=_UnexpectedPolicy(),
+                owner_id="conflicting-recovery-owner",
+            ).run_turn(
+                RunTurnRequest(
+                    "summarize this local file",
+                    turn_id="structured-recovery",
+                    verification_requirements=conflicting,
+                )
+            )
+        assert runner.run_calls == 1
+        assert runner.commit_calls == 1
+        assert runner.replay_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_main_max_recovery_remains_legacy_without_default_upgrade() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        cwd = Path(directory)
+        store = await _store(cwd)
+        session_id = await store.create_session(str(cwd), "fixture-provider", "fixture-model")
+        candidate = replace(
+            _fresh_ultracode_candidate(
+                session_id,
+                "legacy-main",
+                "summarize this local file",
+                UltracodeDelegationDecision.MAIN_MAX,
+            ),
+            owner_id="legacy-owner",
+            owner_pid=999_999_999,
+            owner_token="legacy-token",
+        )
+        claim = await store.claim_ultracode_execution(
+            candidate,
+            now=datetime.now(UTC),
+            owner_is_alive=lambda _pid: False,
+        )
+        assert claim.acquired is True
+        runner = _ParentRunner(store, cwd, session_id=session_id)
+        binding = _binding(runner, cwd)
+        service = _service(
+            store,
+            binding,
+            _unexpected_swarm_factory,
+            policy=_UnexpectedPolicy(),
+            owner_id="legacy-recovery-owner",
+        )
+        result = await service.run_turn(
+            RunTurnRequest("summarize this local file", turn_id="legacy-main")
+        )
+        assert result.response == "main answer"
+        assert runner.verification_requirements is None
+        restored = await store.get_ultracode_execution(candidate.execution_id)
+        assert restored is not None
+        assert restored.verification_requirements is None
 
 
 @pytest.mark.asyncio
@@ -1374,7 +1670,7 @@ async def test_ultracode_store_uses_insert_once_and_generation_owner_fence() -> 
 
 
 @pytest.mark.asyncio
-async def test_schema_27_to_29_migration_creates_ultracode_projection_without_loss() -> None:
+async def test_schema_27_to_30_migration_creates_ultracode_projection_without_loss() -> None:
     with tempfile.TemporaryDirectory() as directory:
         cwd = Path(directory)
         database = cwd / "sessions.db"
@@ -1385,16 +1681,52 @@ async def test_schema_27_to_29_migration_creates_ultracode_projection_without_lo
             connection.execute("UPDATE schema_meta SET version = 27 WHERE singleton = 1")
         await store.initialize()
 
-        assert SCHEMA_VERSION == 29
+        assert SCHEMA_VERSION == 30
         assert await store.get_session(session_id) is not None
         with closing(sqlite3.connect(database)) as connection:
             assert connection.execute(
                 "SELECT version FROM schema_meta WHERE singleton = 1"
-            ).fetchone() == (29,)
+            ).fetchone() == (30,)
             assert connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' "
                 "AND name = 'orchestration_ultracode_executions'"
             ).fetchone() == ("orchestration_ultracode_executions",)
+            columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(orchestration_ultracode_executions)"
+                ).fetchall()
+            }
+            assert "verification_requirements_json" in columns
+            assert "verification_requirements_fingerprint" in columns
+
+
+@pytest.mark.asyncio
+async def test_schema_29_to_30_migration_preserves_legacy_ultracode_execution() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        cwd = Path(directory)
+        store = await _store(cwd)
+        session_id = await store.create_session(str(cwd), "fixture-provider", "fixture-model")
+        candidate = _fresh_ultracode_candidate(
+            session_id,
+            "legacy-schema-29",
+            "summarize this local file",
+            UltracodeDelegationDecision.MAIN_MAX,
+        )
+        claim = await store.claim_ultracode_execution(
+            candidate,
+            now=datetime.now(UTC),
+            owner_is_alive=lambda _pid: True,
+        )
+        assert claim.acquired is True
+        with closing(sqlite3.connect(cwd / "sessions.db")) as connection, connection:
+            connection.execute("UPDATE schema_meta SET version = 29 WHERE singleton = 1")
+
+        await store.initialize()
+        restored = await store.get_ultracode_execution(candidate.execution_id)
+        assert restored is not None
+        assert restored.same_identity(candidate)
+        assert restored.verification_requirements is None
 
 
 @pytest.mark.asyncio
@@ -1584,15 +1916,24 @@ def test_run_turn_request_rejects_noncanonical_values() -> None:
 
 
 @pytest.mark.asyncio
-async def test_structured_ultracode_request_fails_before_session_or_execution_claim() -> None:
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        VerificationRequirementsSnapshot.create(
+            (VerificationRequirement.create(criterion="run the relevant checks"),)
+        ),
+        VerificationRequirementsSnapshot(),
+    ],
+    ids=("nonempty", "explicit-empty"),
+)
+async def test_structured_bounded_swarm_request_fails_before_session_or_execution_claim(
+    snapshot: VerificationRequirementsSnapshot,
+) -> None:
     with tempfile.TemporaryDirectory() as directory:
         cwd = Path(directory)
         store = await _store(cwd)
         runner = _ParentRunner(store, cwd)
         binding = _binding(runner, cwd)
-        snapshot = VerificationRequirementsSnapshot.create(
-            (VerificationRequirement.create(criterion="run the relevant checks"),)
-        )
         swarm_calls = 0
 
         async def swarm_factory() -> Any:
@@ -2528,6 +2869,7 @@ async def test_real_composition_ultracode_simple_task_uses_main_without_orchestr
                 assert execution is not None
                 assert execution.decision is UltracodeDelegationDecision.MAIN_MAX
                 assert execution.state is UltracodeExecutionState.COMPLETED
+                assert execution.verification_requirements == DEFAULT_NORMAL_REQUIREMENTS
                 assert first.response == replay.response == "production main answer"
                 assert provider.calls == 1
                 messages = await store.load_messages(session_id)
@@ -3586,7 +3928,13 @@ async def test_ultracode_fresh_process_recovery_matrix(
         else UltracodeDelegationDecision.BOUNDED_SWARM
     )
     turn_id = f"fresh-process-{stage}-turn"
-    candidate = _fresh_ultracode_candidate(session_id, turn_id, prompt, decision)
+    candidate = _fresh_ultracode_candidate(
+        session_id,
+        turn_id,
+        prompt,
+        decision,
+        DEFAULT_NORMAL_REQUIREMENTS if decision is UltracodeDelegationDecision.MAIN_MAX else None,
+    )
     process = context.Process(
         target=_spawn_ultracode_crash,
         args=(str(database), candidate, prompt, stage),
@@ -3635,9 +3983,13 @@ async def test_ultracode_fresh_process_recovery_matrix(
     assert execution.downstream_id == candidate.downstream_id
     assert execution.state is UltracodeExecutionState.COMPLETED
     assert execution.final_response == expected_response
+    assert execution.verification_requirements == (
+        DEFAULT_NORMAL_REQUIREMENTS if decision is UltracodeDelegationDecision.MAIN_MAX else None
+    )
     assert result.response == expected_response
     assert runner.run_calls == (1 if stage == "A" else 0)
-    assert runner.commit_calls == 1
+    assert runner.commit_calls == (0 if stage == "B" else 1)
+    assert runner.replay_calls == (1 if stage == "B" else 0)
     assert factory_calls == (1 if stage == "C" else 0)
     assert swarm.calls == (1 if stage == "C" else 0)
 

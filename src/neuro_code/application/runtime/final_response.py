@@ -16,6 +16,8 @@ and turn completion persistence.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -122,6 +124,48 @@ class FinalResponseContract:
 
         state, generation = _verification_projection(verification)
         return cls(response, ResponseCommitState.COMMITTED, source, state, generation)
+
+    @classmethod
+    def from_completion_metadata(
+        cls,
+        response: str,
+        metadata: Mapping[str, object],
+    ) -> FinalResponseContract:
+        """Reconstruct a safe projection of an already durable completion.
+
+        Missing or malformed optional metadata is treated as unknown rather
+        than as a successful verification.  This is intentionally a projection
+        helper: it does not recreate a ``VerificationReport`` or take ownership
+        of verification truth during recovery.
+        """
+
+        if not isinstance(metadata, Mapping):
+            raise TypeError("completion metadata must be a mapping")
+        raw_committed = metadata.get("response_committed")
+        if raw_committed is not None and raw_committed is not True:
+            raise ValueError("completion metadata does not describe a committed response")
+        source = ResponseSource.EXTERNAL_RESULT
+        raw_source = metadata.get("response_source")
+        if isinstance(raw_source, str):
+            with suppress(ValueError):
+                source = ResponseSource(raw_source)
+
+        verification_state = VerificationState.NOT_APPLICABLE
+        raw_state = metadata.get("verification_state")
+        if isinstance(raw_state, str):
+            with suppress(ValueError):
+                verification_state = VerificationState(raw_state)
+        generation = metadata.get("verification_workspace_generation", 0)
+        if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+            verification_state = VerificationState.NOT_APPLICABLE
+            generation = 0
+        return cls(
+            response,
+            ResponseCommitState.COMMITTED,
+            source,
+            verification_state,
+            generation,
+        )
 
     def commit(
         self,
