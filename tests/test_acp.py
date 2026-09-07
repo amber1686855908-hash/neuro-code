@@ -133,6 +133,7 @@ from neuro_code.domain.execution import (
     SupervisorReasonCode,
     TurnCancellationPolicy,
     TurnSource,
+    VerificationRequirementsSnapshot,
 )
 from neuro_code.domain.plans import SessionPlan
 from neuro_code.domain.sandbox import SandboxProfile
@@ -468,8 +469,9 @@ class RunnerFixture:
         content_parts: Sequence[ContentPart] = (),
         cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
         turn_source: TurnSource = TurnSource.USER,
+        verification_requirements: VerificationRequirementsSnapshot | None = None,
     ) -> AgentRunResult:
-        del cancellation_policy, turn_source
+        del cancellation_policy, turn_source, verification_requirements
         if self._session_id is None:
             self._session_id = f"internal-session-{id(self)}"
         self._started.set()

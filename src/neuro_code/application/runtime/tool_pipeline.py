@@ -32,6 +32,7 @@ from neuro_code.application.permissions.contracts import (
 )
 from neuro_code.application.permissions.policy import (
     PermissionDecision,
+    PermissionDecisionSource,
     PermissionEffect,
     PermissionManager,
 )
@@ -63,10 +64,15 @@ from neuro_code.application.runtime.supervision import (
     ToolExecutionObservation,
     stable_metadata_fact,
 )
-from neuro_code.application.runtime.verification import build_verification_evidence
+from neuro_code.application.runtime.verification import (
+    VerificationBlocker,
+    VerificationBlockReason,
+    build_verification_evidence,
+    resolve_verification_coverage,
+)
 from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
 from neuro_code.domain.conversation.messages import Message, Role, SessionItem, ToolCall
-from neuro_code.domain.execution import ProgressKind
+from neuro_code.domain.execution import ProgressKind, VerificationRequirementsSnapshot
 from neuro_code.domain.plans import SessionPlan
 from neuro_code.domain.tools import ToolExecutionResult, ToolResult
 from neuro_code.shared.async_utils import run_blocking
@@ -201,6 +207,7 @@ class ToolObservationBuilder:
         tool_call_id: str,
         verification_eligible: bool = True,
         covered_requirement_ids: Sequence[str] = (),
+        verification_blocker_reason: VerificationBlockReason | None = None,
     ) -> ToolExecutionObservation:
         """Build a fail-open, redacted supervision record after a tool terminal path.
 
@@ -214,6 +221,11 @@ class ToolObservationBuilder:
             else None
         )
         external_state_token = self.background_state_token(tool_name, result.metadata)
+        if verification_blocker_reason is not None and not isinstance(
+            verification_blocker_reason,
+            VerificationBlockReason,
+        ):
+            raise TypeError("verification_blocker_reason must be a VerificationBlockReason or None")
         verification = (
             build_verification_evidence(
                 tool_name=tool_name,
@@ -224,6 +236,15 @@ class ToolObservationBuilder:
                 covered_requirement_ids=covered_requirement_ids,
             )
             if verification_eligible
+            else None
+        )
+        verification_blocker = (
+            VerificationBlocker(
+                tuple(covered_requirement_ids),
+                verification_blocker_reason,
+                0,
+            )
+            if verification_blocker_reason is not None and covered_requirement_ids
             else None
         )
         if workspace_changed:
@@ -253,6 +274,7 @@ class ToolObservationBuilder:
             redaction_values=self._redaction_values,
             tool_call_id=tool_call_id,
             verification=verification,
+            verification_blocker=verification_blocker,
         )
 
 
@@ -396,6 +418,7 @@ class ToolExecutor:
         interrupted_observation_sink: Callable[[ToolExecutionObservation], None] | None = None,
         workspace_change_sink: Callable[[WorkspaceChangeReport], None] | None = None,
         recovery_started_sink: Callable[[str, str, bool], Awaitable[None]] | None = None,
+        verification_requirements: VerificationRequirementsSnapshot | None = None,
     ) -> ToolExecutionObservation | None:
         resolved = False
         tool_requested_at = monotonic()
@@ -502,6 +525,7 @@ class ToolExecutor:
                     tool=None,
                     change_report=None,
                     plan_fingerprint_before=plan_fingerprint_before,
+                    verification_requirements=verification_requirements,
                 )
 
             filesystem_access_plan = None
@@ -552,6 +576,7 @@ class ToolExecutor:
                     tool=tool,
                     change_report=None,
                     plan_fingerprint_before=plan_fingerprint_before,
+                    verification_requirements=verification_requirements,
                 )
 
             if filesystem_access_plan is not None:
@@ -638,6 +663,15 @@ class ToolExecutor:
                     },
                 )
             if not decision.allowed:
+                verification_blocker_reason = (
+                    VerificationBlockReason.POLICY_RESTRICTION
+                    if decision.source
+                    in {
+                        PermissionDecisionSource.EXPLICIT_RULE,
+                        PermissionDecisionSource.MODE,
+                    }
+                    else None
+                )
                 result = ToolResult(f"permission denied: {decision.reason}", is_error=True)
                 record_result(result)
                 await emit(
@@ -650,6 +684,8 @@ class ToolExecutor:
                     tool=tool,
                     change_report=None,
                     plan_fingerprint_before=plan_fingerprint_before,
+                    verification_requirements=verification_requirements,
+                    verification_blocker_reason=verification_blocker_reason,
                 )
 
             for hook in self._hooks:
@@ -767,6 +803,7 @@ class ToolExecutor:
                 change_report=change_report,
                 plan_fingerprint_before=plan_fingerprint_before,
                 verification_eligible=True,
+                verification_requirements=verification_requirements,
             )
         except BaseException as error:
             if not resolved:
@@ -806,6 +843,7 @@ class ToolExecutor:
                     tool=tool,
                     change_report=change_report,
                     plan_fingerprint_before=plan_fingerprint_before,
+                    verification_requirements=verification_requirements,
                 )
                 if observation is not None:
                     interrupted_observation_sink(observation)
@@ -820,6 +858,8 @@ class ToolExecutor:
         change_report: WorkspaceChangeReport | None,
         plan_fingerprint_before: str | None,
         verification_eligible: bool = False,
+        verification_requirements: VerificationRequirementsSnapshot | None = None,
+        verification_blocker_reason: VerificationBlockReason | None = None,
     ) -> ToolExecutionObservation | None:
         """Build a fail-open, redacted supervision record after a tool terminal path.
 
@@ -831,6 +871,11 @@ class ToolExecutor:
                 if self._context_builder.plan is not None
                 else None
             )
+            covered_requirement_ids = resolve_verification_coverage(
+                verification_requirements,
+                call.name,
+                call.arguments,
+            )
             return self._observation_builder.build(
                 tool_name=call.name,
                 arguments=call.arguments,
@@ -841,6 +886,8 @@ class ToolExecutor:
                 current_plan_fingerprint=current_plan_fingerprint,
                 tool_call_id=call.id,
                 verification_eligible=verification_eligible,
+                covered_requirement_ids=covered_requirement_ids,
+                verification_blocker_reason=verification_blocker_reason,
             )
         except Exception as error:
             LOGGER.debug(

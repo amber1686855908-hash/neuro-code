@@ -190,8 +190,9 @@ class _ParentRunner:
         turn_source: TurnSource = TurnSource.USER,
         turn_id: str | None = None,
         ultracode_execution_id: str | None = None,
+        verification_requirements=None,
     ) -> AgentRunResult:
-        del cancellation_policy, turn_source
+        del cancellation_policy, turn_source, verification_requirements
         self.run_calls += 1
         if self.fail_main:
             raise RuntimeError("fixture main failure")
@@ -247,6 +248,7 @@ class _DynamicParentRunner(_ParentRunner):
         turn_source: TurnSource = TurnSource.USER,
         turn_id: str | None = None,
         ultracode_execution_id: str | None = None,
+        verification_requirements=None,
     ) -> AgentRunResult:
         if ultracode_execution_id is not None:
             return await super().run(
@@ -257,8 +259,10 @@ class _DynamicParentRunner(_ParentRunner):
                 turn_source=turn_source,
                 turn_id=turn_id,
                 ultracode_execution_id=ultracode_execution_id,
+                verification_requirements=verification_requirements,
             )
         del sink, content_parts, cancellation_policy, turn_source, turn_id
+        del verification_requirements
         self.ordinary_prompts.append(prompt)
         session_id = await self.ensure_persisted_session()
         return AgentRunResult(session_id, f"ordinary:{prompt}", (), (), (), 0)

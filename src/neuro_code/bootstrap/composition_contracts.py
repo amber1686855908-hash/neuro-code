@@ -97,6 +97,7 @@ class CompositionRootMixin:
             parent_context_relay: ParentContextRelay | None = None,
             dag_result_relay: TaskDagDependencyResultRelay | None = None,
             final_output_gate_enabled: bool = True,
+            normal_requirements_enabled: bool = True,
         ) -> ConversationBinding: ...
 
         def create_worktree_service(self) -> WorktreeApplicationService: ...

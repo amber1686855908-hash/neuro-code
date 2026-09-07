@@ -151,6 +151,10 @@ class ProfileConversationController:
         return self._reasoning_effort
 
     @property
+    def normal_requirements_enabled(self) -> bool:
+        return getattr(self._binding.runner, "normal_requirements_enabled", True)
+
+    @property
     def effective_reasoning_effort(self) -> ReasoningEffort:
         return self._reasoning_effort.effective
 

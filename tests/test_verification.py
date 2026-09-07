@@ -8,13 +8,25 @@ from neuro_code.application.runtime.verification import (
     MAX_VERIFICATION_EVIDENCE_ITEMS,
     MAX_VERIFICATION_SCOPE_BYTES,
     MAX_VERIFICATION_SUMMARY_BYTES,
+    RequirementEvaluationState,
+    VerificationBlockReason,
     VerificationEvidence,
     VerificationFreshness,
     VerificationOutcome,
     VerificationState,
     VerificationTracker,
+    build_verification_evidence,
+    resolve_verification_coverage,
 )
-from neuro_code.domain.execution import ProgressKind
+from neuro_code.application.sessions.requirements import (
+    DEFAULT_NORMAL_MUTATION_REQUIREMENT_ID,
+    DEFAULT_NORMAL_REQUIREMENTS,
+)
+from neuro_code.domain.execution import (
+    ProgressKind,
+    VerificationRequirement,
+    VerificationRequirementsSnapshot,
+)
 from neuro_code.domain.tools import ToolResult
 
 
@@ -195,6 +207,144 @@ class VerificationTrackerTests(unittest.TestCase):
 
         self.assertIs(observation_value.progress_kind, ProgressKind.NONE)
         self.assertIsNone(observation_value.verification)
+
+    def test_normal_requirement_coverage_uses_only_the_trusted_classifier(self) -> None:
+        self.assertEqual(
+            resolve_verification_coverage(
+                DEFAULT_NORMAL_REQUIREMENTS,
+                "bash",
+                {"command": "pytest -q"},
+            ),
+            (DEFAULT_NORMAL_MUTATION_REQUIREMENT_ID,),
+        )
+        self.assertEqual(
+            resolve_verification_coverage(
+                DEFAULT_NORMAL_REQUIREMENTS,
+                "bash",
+                {"command": "echo pytest -q"},
+            ),
+            (),
+        )
+
+    def test_resolved_normal_requirement_coverage_is_preserved_by_observation_builder(self) -> None:
+        covered_requirement_ids = resolve_verification_coverage(
+            DEFAULT_NORMAL_REQUIREMENTS,
+            "bash",
+            {"command": "pytest -q"},
+        )
+        observation_value = ToolObservationBuilder(()).build(
+            tool_name="bash",
+            arguments={"command": "pytest -q"},
+            result=ToolResult("1 passed"),
+            tool=None,
+            change_report=None,
+            plan_fingerprint_before=None,
+            current_plan_fingerprint=None,
+            tool_call_id="call-normal-requirement",
+            covered_requirement_ids=covered_requirement_ids,
+        )
+
+        assert observation_value.verification is not None
+        self.assertEqual(
+            observation_value.verification.covered_requirement_ids,
+            (DEFAULT_NORMAL_MUTATION_REQUIREMENT_ID,),
+        )
+
+    def test_static_check_and_failure_keep_exact_generic_coverage(self) -> None:
+        static_coverage = resolve_verification_coverage(
+            DEFAULT_NORMAL_REQUIREMENTS,
+            "bash",
+            {"command": "ruff check ."},
+        )
+        self.assertEqual(static_coverage, (DEFAULT_NORMAL_MUTATION_REQUIREMENT_ID,))
+        failure = build_verification_evidence(
+            tool_name="bash",
+            arguments={"command": "pytest -q"},
+            result_content="1 failed",
+            is_error=True,
+            covered_requirement_ids=static_coverage,
+        )
+        assert failure is not None
+        self.assertEqual(failure.covered_requirement_ids, static_coverage)
+        tracker = VerificationTracker(requirements=DEFAULT_NORMAL_REQUIREMENTS)
+        tracker.record_workspace_mutation()
+        tracker.record_verification(failure)
+        self.assertIs(tracker.report().state, VerificationState.FAIL)
+        self.assertIs(
+            tracker.report().requirement_evaluations[0].state,
+            RequirementEvaluationState.FAILED,
+        )
+
+    def test_generic_resolver_does_not_cover_caller_behavioral_requirements(self) -> None:
+        behavioral = VerificationRequirement.create(criterion="the login behavior is correct")
+        requirements = VerificationRequirementsSnapshot.create(
+            (DEFAULT_NORMAL_REQUIREMENTS.requirements[0], behavioral)
+        )
+
+        self.assertEqual(
+            resolve_verification_coverage(
+                requirements,
+                "bash",
+                {"command": "pytest -q"},
+            ),
+            (DEFAULT_NORMAL_MUTATION_REQUIREMENT_ID,),
+        )
+
+    def test_default_on_mutation_requirement_is_inactive_without_workspace_change(self) -> None:
+        report = VerificationTracker(requirements=DEFAULT_NORMAL_REQUIREMENTS).report()
+
+        self.assertIs(report.state, VerificationState.NOT_APPLICABLE)
+        self.assertFalse(report.final_output_gate_active)
+        self.assertEqual(report.requirement_evaluations, ())
+
+    def test_policy_blocker_is_typed_and_not_verification_failure(self) -> None:
+        observation_value = ToolObservationBuilder(()).build(
+            tool_name="bash",
+            arguments={"command": "pytest -q"},
+            result=ToolResult("permission denied", is_error=True),
+            tool=None,
+            change_report=None,
+            plan_fingerprint_before=None,
+            current_plan_fingerprint=None,
+            tool_call_id="call-policy-blocker",
+            verification_eligible=False,
+            covered_requirement_ids=(DEFAULT_NORMAL_MUTATION_REQUIREMENT_ID,),
+            verification_blocker_reason=VerificationBlockReason.POLICY_RESTRICTION,
+        )
+
+        self.assertIsNone(observation_value.verification)
+        self.assertIsNotNone(observation_value.verification_blocker)
+        assert observation_value.verification_blocker is not None
+        self.assertEqual(
+            observation_value.verification_blocker.affected_requirement_ids,
+            (DEFAULT_NORMAL_MUTATION_REQUIREMENT_ID,),
+        )
+        tracker = VerificationTracker(requirements=DEFAULT_NORMAL_REQUIREMENTS)
+        tracker.record_workspace_mutation()
+        tracker.observe(observation_value)
+        self.assertIs(
+            tracker.report().requirement_evaluations[0].state,
+            RequirementEvaluationState.BLOCKED,
+        )
+
+    def test_normal_requirement_confirmation_uses_conservative_wording(self) -> None:
+        tracker = VerificationTracker(requirements=DEFAULT_NORMAL_REQUIREMENTS)
+        tracker.record_workspace_mutation()
+        tracker.record_verification(
+            VerificationEvidence(
+                "bash",
+                VerificationOutcome.SUCCESS,
+                "1 passed",
+                ("bash:test",),
+                0,
+                (DEFAULT_NORMAL_MUTATION_REQUIREMENT_ID,),
+            )
+        )
+
+        self.assertEqual(
+            tracker.report().confirmed_items,
+            ("A recognized verification check passed after the workspace changes.",),
+        )
 
 
 if __name__ == "__main__":

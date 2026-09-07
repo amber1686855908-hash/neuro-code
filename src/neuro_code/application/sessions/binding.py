@@ -87,6 +87,9 @@ class ConversationRunner(Protocol):
     def reasoning_effort(self) -> ReasoningEffort: ...
 
     @property
+    def normal_requirements_enabled(self) -> bool: ...
+
+    @property
     def items(self) -> tuple[SessionItem, ...]: ...
 
     @property

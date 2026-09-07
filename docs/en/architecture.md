@@ -116,8 +116,9 @@ infrastructure. See [ADR 0145](adr/0145-acp-prompt-content-boundary.md),
 [ADR 0147](adr/0147-acp-client-io-adapter-boundary.md),
 [ADR 0148](adr/0148-acp-mcp-configuration-boundary.md),
 [ADR 0150](adr/0150-acp-session-runtime-ownership-boundary.md), and
-[ADR 0151](adr/0151-acp-transport-boundary.md), and
-[ADR 0153](adr/0153-architecture-completion.md).
+[ADR 0151](adr/0151-acp-transport-boundary.md),
+[ADR 0153](adr/0153-architecture-completion.md), and
+[ADR 0154](adr/0154-normal-agent-verification-acquisition-boundary.md).
 
 Agent harness behavior currently lives in the explicit canonical submodules of
 `neuro_code.application.runtime`: `background_task_reminders`, `agent`,
@@ -260,9 +261,11 @@ choices to their inbound services. Initialization and failure-cleanup ordering
 is unchanged; CLI, TUI, and ACP continue to share the same services and typed
 runtime event stream.
 
-See [ADR 0049](adr/0049-progressive-architecture-boundaries.md) and
-[ADR 0153](adr/0153-architecture-completion.md) for the complete dependency
-rules, compatibility migration policy, and allowlist discipline.
+See [ADR 0049](adr/0049-progressive-architecture-boundaries.md),
+[ADR 0153](adr/0153-architecture-completion.md), and
+[ADR 0154](adr/0154-normal-agent-verification-acquisition-boundary.md) for the
+complete dependency rules, compatibility migration policy, and allowlist
+discipline.
 
 ## Runtime event model
 
@@ -3018,13 +3021,46 @@ provenance, and fingerprint through safe retry and crash recovery. The absent
 field remains compatible with legacy rows and retains their historical
 fingerprint shape; a present malformed snapshot is an invalid recovery input
 and fails closed rather than becoming legacy mode. No database column or
-migration is added. Saved-plan execution does not synthesize requirements.
+migration is added. Saved-plan execution does not infer task-specific
+requirements; a user-facing plan handoff follows the normal default policy
+described in VF-3c.
 
 The current UltraCode delegation path cannot preserve structured requirement
 semantics, so a structured request is rejected before parent-session creation
 or a durable execution claim. Legacy UltraCode requests retain their existing
 behavior. Requirement discovery, acquisition, blocker producers, and UltraCode
 verification propagation remain outside this slice.
+
+## VF-3c normal-agent verification acquisition boundary
+
+`NormalTurnRequirementsPolicy` is the sole application-owned producer for the
+first normal-agent verification requirement. After UltraCode routing and before
+TurnInput persistence, the first provider request, or tool execution, a fresh
+normal user turn with no explicit snapshot receives one immutable required
+`ON_WORKSPACE_MUTATION` requirement with the stable criterion `After a workspace
+mutation, a recognized verification command must produce a current result.`
+The policy does not inspect the prompt or workspace and does not discover or
+select a test runner. Explicit non-empty snapshots, explicit empty snapshots,
+legacy TurnInput rows, recovery, background work, subagents, and UltraCode
+paths keep their existing semantics.
+
+`resolve_verification_coverage` is the runtime-owned trusted linkage seam. It
+reuses the existing conservative `verification_scope_for_tool` classifier and
+can attach only the canonical generic requirement ID to an already recognized
+`bash:test` or `bash:static_check` command. Classification scope remains bounded
+descriptive metadata; command text, summaries, model-provided IDs, and NLP do
+not establish requirement coverage. A recognized command failure remains
+typed failed evidence, while an explicit policy restriction can produce a
+typed blocker; interactive denial, missing approval UI, environment failures,
+and other inability facts are not guessed from strings.
+
+The generic finalizer projection is deliberately conservative: a successful
+current check may be described as `A recognized verification check passed after
+the workspace changes.` It does not claim that all tests or all behavior were
+verified. The existing `VerificationTracker` remains the sole mutable truth
+owner, and VF-2 remains the final-response boundary. This slice adds no
+automatic discovery, framework/package-manager detection, dedicated test
+runner, UI/schema change, or UltraCode verification integration.
 
 ## Cache-friendly model request projection and usage
 

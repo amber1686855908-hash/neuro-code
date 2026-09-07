@@ -1516,6 +1516,7 @@ class AgentLoopRunner:
                                 and turn_id is not None
                                 else None
                             ),
+                            verification_requirements=verification_requirements,
                         )
                         return _ScheduledToolOutcome(
                             observation,

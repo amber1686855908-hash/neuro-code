@@ -23,7 +23,7 @@ from neuro_code.application.execution_policy import (
     NORMAL_EXECUTION_BUDGET,
     ExecutionBudgetPolicy,
 )
-from neuro_code.application.runtime.verification import VerificationEvidence
+from neuro_code.application.runtime.verification import VerificationBlocker, VerificationEvidence
 from neuro_code.domain.execution import (
     AgentExecutionStatus,
     ExecutionBudget,
@@ -401,6 +401,7 @@ class ToolExecutionObservation:
     external_state_token: str | None = None
     progress_kind: ProgressKind = ProgressKind.NONE
     verification: VerificationEvidence | None = None
+    verification_blocker: VerificationBlocker | None = None
 
     def __post_init__(self) -> None:
         _validate_tool_name(self.tool_name)
@@ -437,6 +438,11 @@ class ToolExecutionObservation:
             expected_outcome = "failure" if self.is_error else "success"
             if self.verification.outcome.value != expected_outcome:
                 raise ValueError("verification outcome must match observation is_error")
+        if self.verification_blocker is not None and not isinstance(
+            self.verification_blocker,
+            VerificationBlocker,
+        ):
+            raise TypeError("verification_blocker must be a VerificationBlocker or None")
 
     @property
     def fingerprint(self) -> ToolInteractionFingerprint:
@@ -464,6 +470,7 @@ class ToolExecutionObservation:
         external_state_token: str | None = None,
         progress_kind: ProgressKind = ProgressKind.NONE,
         verification: VerificationEvidence | None = None,
+        verification_blocker: VerificationBlocker | None = None,
         verification_scope: Sequence[str] = (),
         covered_requirement_ids: Sequence[str] = (),
         path_context: PathNormalizationContext | None = None,
@@ -537,6 +544,7 @@ class ToolExecutionObservation:
             ),
             progress_kind=progress_kind,
             verification=verification,
+            verification_blocker=verification_blocker,
         )
 
 

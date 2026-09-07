@@ -20,6 +20,7 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Protocol
 
+from neuro_code.application.sessions.requirements import DEFAULT_NORMAL_MUTATION_REQUIREMENT_ID
 from neuro_code.domain.execution import (
     MAX_VERIFICATION_REQUIREMENTS,
     ProgressKind,
@@ -389,6 +390,9 @@ class VerificationObservation(Protocol):
     @property
     def verification(self) -> VerificationEvidence | None: ...
 
+    @property
+    def verification_blocker(self) -> VerificationBlocker | None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class VerificationReport:
@@ -513,6 +517,11 @@ class VerificationReport:
                 and required
                 and all(item.state is RequirementEvaluationState.SATISFIED for item in required)
             ):
+                if (
+                    len(self.requirement_evaluations) == 1
+                    and required[0].requirement_id == DEFAULT_NORMAL_MUTATION_REQUIREMENT_ID
+                ):
+                    return ("A recognized verification check passed after the workspace changes.",)
                 return ("All required verification requirements are satisfied.",)
             return ()
         latest = self.latest
@@ -707,6 +716,9 @@ class VerificationTracker:
             self.record_workspace_mutation()
 
         evidence = observation.verification
+        blocker = getattr(observation, "verification_blocker", None)
+        if blocker is not None:
+            self.record_blocker(blocker)
         if evidence is None and observation.progress_kind is ProgressKind.VERIFICATION:
             evidence = VerificationEvidence.from_result(
                 tool_name=observation.tool_name,
@@ -864,6 +876,34 @@ def verification_scope_for_tool(
     return ()
 
 
+def resolve_verification_coverage(
+    requirements: VerificationRequirementsSnapshot | None,
+    tool_name: str,
+    arguments: Mapping[str, object],
+) -> tuple[str, ...]:
+    """Resolve trusted requirement coverage for one already classified tool call.
+
+    The resolver deliberately links only the canonical normal-turn mutation
+    requirement to the existing conservative Bash classifier.  Command text,
+    summaries, model-provided IDs, and descriptive scopes never establish
+    requirement coverage.
+
+    为已经完成分类的工具调用解析可信的要求覆盖关系。
+    本解析器只把现有保守 Bash 分类器链接到规范的普通回合工作区变更要求;
+    命令文本、摘要、模型提供的 ID 和描述性 scope 都不能建立覆盖关系。
+    """
+
+    if requirements is None or DEFAULT_NORMAL_MUTATION_REQUIREMENT_ID not in (
+        requirements.requirement_ids
+    ):
+        return ()
+    return (
+        (DEFAULT_NORMAL_MUTATION_REQUIREMENT_ID,)
+        if verification_scope_for_tool(tool_name, arguments)
+        else ()
+    )
+
+
 def build_verification_evidence(
     *,
     tool_name: str,
@@ -911,5 +951,6 @@ __all__ = [
     "VerificationState",
     "VerificationTracker",
     "build_verification_evidence",
+    "resolve_verification_coverage",
     "verification_scope_for_tool",
 ]
