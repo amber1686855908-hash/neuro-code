@@ -137,6 +137,7 @@ class CompositionWorkflowMixin(CompositionRootMixin):
                 allowed_tool_names=(),
                 enable_background_tasks=False,
                 final_output_gate_enabled=False,
+                normal_requirements_enabled=False,
             )
         except BaseException:
             await asyncio.shield(self.store.delete_session(leader_session_id))
@@ -192,6 +193,7 @@ class CompositionWorkflowMixin(CompositionRootMixin):
                 allowed_tool_names=(),
                 enable_background_tasks=False,
                 final_output_gate_enabled=False,
+                normal_requirements_enabled=False,
             )
         except BaseException:
             await asyncio.shield(self.store.delete_session(planner_session_id))
@@ -249,6 +251,7 @@ class CompositionWorkflowMixin(CompositionRootMixin):
                 allowed_tool_names=(),
                 enable_background_tasks=False,
                 final_output_gate_enabled=False,
+                normal_requirements_enabled=False,
             )
         except BaseException:
             await asyncio.shield(self.store.delete_session(planner_session_id))

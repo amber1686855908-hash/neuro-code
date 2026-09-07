@@ -9,6 +9,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
+from neuro_code.application.sessions.requirements import NormalTurnRequirementsPolicy
 from neuro_code.domain.conversation.messages import ContentPart
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
 from neuro_code.domain.execution import (
@@ -83,6 +84,9 @@ class SessionTurnRunner(Protocol):
     @property
     def reasoning_effort(self) -> ReasoningEffort: ...
 
+    @property
+    def normal_requirements_enabled(self) -> bool: ...
+
     async def run(
         self,
         prompt: str,
@@ -150,16 +154,22 @@ class SessionTurnService:
             if self._ultracode_delegate is None:
                 raise ConfigurationError("Ultracode delegation entry is not configured")
             return await self._ultracode_delegate(request, sink)
+        effective_requirements = request.verification_requirements
+        if (
+            effective_requirements is None
+            and request.turn_source is TurnSource.USER
+            and getattr(self._runner, "normal_requirements_enabled", True)
+        ):
+            effective_requirements = NormalTurnRequirementsPolicy.resolve(None)
         kwargs: dict[str, Any] = {
             "sink": sink,
             "content_parts": request.content_parts,
             "cancellation_policy": request.cancellation_policy,
             "turn_source": request.turn_source,
+            "verification_requirements": effective_requirements,
         }
         if request.turn_id is not None:
             kwargs["turn_id"] = request.turn_id
-        if request.verification_requirements is not None:
-            kwargs["verification_requirements"] = request.verification_requirements
         return await self._runner.run(
             request.prompt,
             **kwargs,

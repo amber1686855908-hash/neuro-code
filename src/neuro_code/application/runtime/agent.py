@@ -109,6 +109,9 @@ class AgentRuntime:
         # Internal orchestration bindings may explicitly defer this gate until
         # their verification integration is implemented.
         final_output_gate_enabled: bool = True,
+        # Only the user-facing normal binding produces the default structured
+        # requirement.  Internal orchestration bindings opt out explicitly.
+        normal_requirements_enabled: bool = True,
         compaction_runtime_gate: ContextCompactionRuntimeGate | None = None,
         provider_context_window: ProviderContextWindow | None = None,
         tool_hooks: Sequence[ToolPipelineHook] = (),
@@ -134,6 +137,8 @@ class AgentRuntime:
             raise ValueError("finalizer_max_attempts must be a positive integer")
         if not isinstance(final_output_gate_enabled, bool):
             raise TypeError("final_output_gate_enabled must be a bool")
+        if not isinstance(normal_requirements_enabled, bool):
+            raise TypeError("normal_requirements_enabled must be a bool")
         if compaction_runtime_gate is not None and not isinstance(
             compaction_runtime_gate,
             ContextCompactionRuntimeGate,
@@ -166,6 +171,7 @@ class AgentRuntime:
         self._execution_control_mode = execution_control_mode
         self._finalizer_factory = finalizer_factory or _create_finalizer
         self._finalizer_max_attempts = finalizer_max_attempts
+        self._normal_requirements_enabled = normal_requirements_enabled
         self._compaction_runtime_gate = compaction_runtime_gate
         self._auto_permission_mode = (
             PermissionMode.BYPASS
@@ -309,6 +315,12 @@ class AgentRuntime:
             InteractionMode.AUTO: self._auto_permission_mode,
         }[self._context_builder.interaction_mode]
         self._permissions.set_mode(permission_mode)
+
+    @property
+    def normal_requirements_enabled(self) -> bool:
+        """Return whether fresh normal turns receive the default requirement."""
+
+        return self._normal_requirements_enabled
 
     def _model_items_with_reasoning_guidance(
         self,

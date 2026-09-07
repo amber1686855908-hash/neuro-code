@@ -46,6 +46,7 @@ from neuro_code.application.sessions.recovery import (
     TurnRecoveryInspection,
     TurnRecoveryService,
 )
+from neuro_code.application.sessions.requirements import NormalTurnRequirementsPolicy
 from neuro_code.application.sessions.service import (
     ListPlanCommentsRequest,
     LoadSessionPlanRequest,
@@ -302,6 +303,34 @@ class AgentConversation:
     def set_interaction_mode(self, mode: InteractionMode) -> None:
         self._runtime.set_interaction_mode(mode)
 
+    @property
+    def normal_requirements_enabled(self) -> bool:
+        return self._runtime.normal_requirements_enabled
+
+    def _resolve_new_normal_turn_requirements(
+        self,
+        requirements: VerificationRequirementsSnapshot | None,
+        *,
+        turn_source: TurnSource,
+        ultracode_execution_id: str | None,
+    ) -> VerificationRequirementsSnapshot | None:
+        """Produce requirements only for fresh, user-facing normal turns.
+
+        SessionTurnService normally resolves this before reaching the
+        conversation.  The conversation keeps the same policy at the lower
+        application seam for direct plan/session callers, while recovery and
+        internal orchestration paths remain explicit pass-throughs.
+        """
+
+        if (
+            requirements is None
+            and self._runtime.normal_requirements_enabled
+            and turn_source is TurnSource.USER
+            and ultracode_execution_id is None
+        ):
+            return NormalTurnRequirementsPolicy.resolve(None)
+        return requirements
+
     async def run(
         self,
         prompt: str,
@@ -314,6 +343,11 @@ class AgentConversation:
         ultracode_execution_id: str | None = None,
         verification_requirements: VerificationRequirementsSnapshot | None = None,
     ) -> AgentRunResult:
+        verification_requirements = self._resolve_new_normal_turn_requirements(
+            verification_requirements,
+            turn_source=turn_source,
+            ultracode_execution_id=ultracode_execution_id,
+        )
         async with self._turn_lock:
 
             async def capture_session(event: AgentEvent) -> None:
@@ -921,6 +955,11 @@ class AgentConversation:
                         await outcome
 
             try:
+                verification_requirements = self._resolve_new_normal_turn_requirements(
+                    None,
+                    turn_source=TurnSource.USER,
+                    ultracode_execution_id=None,
+                )
                 result = await self._runtime.run(
                     PLAN_EXECUTION_PROMPT,
                     sink=capture_session,
@@ -931,6 +970,7 @@ class AgentConversation:
                     source_model=self._source_model,
                     source_context_affinity=self._source_context_affinity,
                     session_id=self._session_id,
+                    verification_requirements=verification_requirements,
                 )
             except asyncio.CancelledError:
                 await self._reload_persisted_state()

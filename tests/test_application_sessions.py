@@ -10,6 +10,7 @@ from typing import cast
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.runtime.agent import AgentRunResult, EventSink
 from neuro_code.application.sessions import (
+    DEFAULT_NORMAL_REQUIREMENTS,
     BindSessionAliasRequest,
     DeleteSessionRequest,
     ExportSessionRequest,
@@ -919,6 +920,27 @@ class SessionApplicationServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(result, runner.result)
         self.assertIs(runner.verification_requirements, snapshot)
+
+    async def test_bound_turn_service_produces_default_requirements_for_new_user_turn(self) -> None:
+        runner = SessionTurnRunnerFixture()
+        service = self.service.bind_runner(runner)
+
+        await service.run_turn(RunTurnRequest("edit the workspace"))
+
+        self.assertIs(runner.verification_requirements, DEFAULT_NORMAL_REQUIREMENTS)
+
+    async def test_bound_turn_service_does_not_produce_default_for_background_turn(self) -> None:
+        runner = SessionTurnRunnerFixture()
+        service = self.service.bind_runner(runner)
+
+        await service.run_turn(
+            RunTurnRequest(
+                "",
+                turn_source=TurnSource.BACKGROUND_TASK_AUTO_WAKE,
+            )
+        )
+
+        self.assertIsNone(runner.verification_requirements)
 
     async def test_bound_turn_service_rejects_wrong_session_before_run(self) -> None:
         runner = SessionTurnRunnerFixture()

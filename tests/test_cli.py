@@ -69,6 +69,7 @@ from neuro_code.domain.execution import (
     AgentExecutionStatus,
     SessionExecutionRecord,
     SupervisorReasonCode,
+    VerificationRequirementsSnapshot,
 )
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.session_tasks import SessionTaskStatus
@@ -227,7 +228,9 @@ class CliApplicationRunnerFixture:
         content_parts=(),
         cancellation_policy=None,
         turn_source=None,
+        verification_requirements: VerificationRequirementsSnapshot | None = None,
     ) -> AgentRunResult:
+        del verification_requirements
         self.calls.append(
             (
                 prompt,

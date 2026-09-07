@@ -109,6 +109,7 @@ from neuro_code.domain.execution import (
     SupervisorReasonCode,
     TurnCancellationPolicy,
     TurnSource,
+    VerificationRequirementsSnapshot,
 )
 from neuro_code.domain.plans import PlanComment, PlanStep, PlanStepStatus, SessionPlan
 from neuro_code.domain.sandbox import SandboxProfile
@@ -188,8 +189,9 @@ class TuiConversation:
         *,
         sink: EventSink | None = None,
         cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
+        verification_requirements: VerificationRequirementsSnapshot | None = None,
     ) -> AgentRunResult:
-        del cancellation_policy
+        del cancellation_policy, verification_requirements
         self.prompts.append(prompt)
         self._session_id = "session-fixture"
         events = (
@@ -338,8 +340,9 @@ class TypedTuiConversation(TuiConversation):
         content_parts: tuple[ContentPart, ...] = (),
         cancellation_policy: TurnCancellationPolicy = TurnCancellationPolicy.RETAIN,
         turn_source: TurnSource = TurnSource.USER,
+        verification_requirements: VerificationRequirementsSnapshot | None = None,
     ) -> AgentRunResult:
-        del content_parts
+        del content_parts, verification_requirements
         self.turn_sources.append(turn_source)
         return await super().run(
             prompt,

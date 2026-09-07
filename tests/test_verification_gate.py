@@ -7,7 +7,12 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from neuro_code.application.permissions.policy import PermissionManager, PermissionMode
+from neuro_code.application.permissions.policy import (
+    PermissionEffect,
+    PermissionManager,
+    PermissionMode,
+    PermissionRule,
+)
 from neuro_code.application.ports.model import ModelProvider, ModelToolPolicy
 from neuro_code.application.ports.tools import Tool, ToolCollection, ToolContext
 from neuro_code.application.ports.workspace_changes import (
@@ -16,7 +21,7 @@ from neuro_code.application.ports.workspace_changes import (
     WorkspaceChangeReport,
     WorkspaceFileChange,
 )
-from neuro_code.application.runtime.agent import AgentRuntime
+from neuro_code.application.runtime.agent import AgentRunResult, AgentRuntime
 from neuro_code.application.runtime.finalization import (
     FinalizationAttempt,
     FinalizationEvidence,
@@ -27,7 +32,12 @@ from neuro_code.application.runtime.model_step import (
     MAX_BUFFERED_MODEL_STEP_TEXT_BYTES,
     MAX_BUFFERED_MODEL_STEP_TEXT_CHUNKS,
 )
-from neuro_code.application.runtime.verification import VerificationState
+from neuro_code.application.runtime.verification import (
+    RequirementEvaluationState,
+    VerificationBlockReason,
+    VerificationState,
+)
+from neuro_code.application.sessions.requirements import DEFAULT_NORMAL_REQUIREMENTS
 from neuro_code.domain.conversation.context import ModelContext
 from neuro_code.domain.conversation.events import (
     AgentEvent,
@@ -271,12 +281,17 @@ def _runtime(
     *,
     finalizer: object | None = None,
     session_store: SqliteSessionStore | None = None,
+    permissions: PermissionManager | None = None,
 ) -> AgentRuntime:
     return AgentRuntime(
         provider=provider,
         tools=tools,
         workspace_change_observer=observer,
-        permissions=PermissionManager(mode=PermissionMode.BYPASS),
+        permissions=(
+            permissions
+            if permissions is not None
+            else PermissionManager(mode=PermissionMode.BYPASS)
+        ),
         tool_context=ToolContext(root),
         session_store=session_store,
         finalizer_factory=_factory(finalizer) if finalizer is not None else None,
@@ -285,6 +300,110 @@ def _runtime(
 
 def _text_events(events: Sequence[AgentEvent]) -> list[object]:
     return [event.data["text"] for event in events if event.kind is AgentEventKind.TEXT_DELTA]
+
+
+async def _run_permission_denied_verification(
+    tmp_path: Path,
+    permissions: PermissionManager,
+) -> AgentRunResult:
+    provider = _ScriptedProvider(
+        (
+            (_mutation_call(), ModelCompleted("tool_calls")),
+            (_verification_call(), ModelCompleted("tool_calls")),
+            _terminal_candidate("PROVISIONAL_FALSE_SUCCESS_SENTINEL"),
+        )
+    )
+    finalizer = _RecordingFinalizer("safe committed response")
+    return await _runtime(
+        tmp_path,
+        provider,
+        _Tools(
+            (
+                _FixtureTool("mutate", ToolResult("changed"), side_effecting=True),
+                _FixtureTool("bash", ToolResult("not executed"), side_effecting=True),
+            )
+        ),
+        _FixedWorkspaceObserver(),
+        finalizer=finalizer,
+        permissions=permissions,
+    ).run(
+        "change files",
+        verification_requirements=DEFAULT_NORMAL_REQUIREMENTS,
+    )
+
+
+def _requirement_evaluation(result: AgentRunResult):
+    assert result.verification is not None
+    assert len(result.verification.requirement_evaluations) == 1
+    return result.verification.requirement_evaluations[0]
+
+
+@pytest.mark.asyncio
+async def test_mode_denied_verification_produces_a_typed_policy_blocker(
+    tmp_path: Path,
+) -> None:
+    result = await _run_permission_denied_verification(
+        tmp_path,
+        PermissionManager(
+            mode=PermissionMode.DONT_ASK,
+            rules=(PermissionRule(PermissionEffect.ALLOW, "mutate"),),
+        ),
+    )
+
+    evaluation = _requirement_evaluation(result)
+    assert evaluation.state is RequirementEvaluationState.BLOCKED
+    assert evaluation.blocker_reason is VerificationBlockReason.POLICY_RESTRICTION
+    assert result.verification is not None
+    assert result.verification.state is VerificationState.INCOMPLETE
+    assert result.verification.evidence == ()
+
+
+@pytest.mark.asyncio
+async def test_headless_explicit_ask_verification_stays_without_a_typed_blocker(
+    tmp_path: Path,
+) -> None:
+    result = await _run_permission_denied_verification(
+        tmp_path,
+        PermissionManager(
+            interactive=False,
+            mode=PermissionMode.BYPASS,
+            rules=(
+                PermissionRule(PermissionEffect.ALLOW, "mutate"),
+                PermissionRule(PermissionEffect.ASK, "bash:pytest*"),
+            ),
+        ),
+    )
+
+    evaluation = _requirement_evaluation(result)
+    assert evaluation.state is RequirementEvaluationState.NO_EVIDENCE
+    assert evaluation.blocker_reason is None
+    assert result.verification is not None
+    assert result.verification.state is VerificationState.INCOMPLETE
+    assert result.verification.evidence == ()
+
+
+@pytest.mark.asyncio
+async def test_explicit_deny_verification_stays_without_a_typed_blocker(
+    tmp_path: Path,
+) -> None:
+    result = await _run_permission_denied_verification(
+        tmp_path,
+        PermissionManager(
+            interactive=False,
+            mode=PermissionMode.BYPASS,
+            rules=(
+                PermissionRule(PermissionEffect.ALLOW, "mutate"),
+                PermissionRule(PermissionEffect.DENY, "bash:pytest*"),
+            ),
+        ),
+    )
+
+    evaluation = _requirement_evaluation(result)
+    assert evaluation.state is RequirementEvaluationState.NO_EVIDENCE
+    assert evaluation.blocker_reason is None
+    assert result.verification is not None
+    assert result.verification.state is VerificationState.INCOMPLETE
+    assert result.verification.evidence == ()
 
 
 @pytest.mark.asyncio

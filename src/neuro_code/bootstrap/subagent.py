@@ -175,6 +175,7 @@ class CompositionReadOnlySubagentRuntimeFactory(IsolatedSubagentRuntimeFactory):
                 resume_id=child_session_id,
                 additional_workspace_roots=capabilities.workspace_roots[1:],
                 capabilities=capabilities,
+                normal_requirements_enabled=False,
             )
         except BaseException:
             with suppress(BaseException):
@@ -294,6 +295,7 @@ class CompositionWritableSubagentRuntimeFactory(WritableSubagentRuntimeFactory):
             capabilities=capabilities.capabilities,
             enable_background_tasks=False,
             final_output_gate_enabled=False,
+            normal_requirements_enabled=False,
             parent_context_relay=relay,
             dag_result_relay=request.dependency_result_relay,
         )

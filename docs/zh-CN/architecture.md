@@ -90,7 +90,8 @@ factory 选择位于 `bootstrap.factories`。公共 `ApplicationComposition` fac
 [ADR 0147](adr/0147-acp-client-io-adapter-boundary.md)、[ADR 0148](adr/0148-acp-mcp-configuration-boundary.md)、
 [ADR 0150](adr/0150-acp-session-runtime-ownership-boundary.md) 和
 [ADR 0151](adr/0151-acp-transport-boundary.md) 以及
-[ADR 0153](adr/0153-architecture-completion.md)。
+[ADR 0153](adr/0153-architecture-completion.md) 以及
+[ADR 0154](adr/0154-normal-agent-verification-acquisition-boundary.md)。
 
 Agent harness 行为现阶段位于 `neuro_code.application.runtime` 的明确 canonical 子模块：
 `background_task_reminders`、`agent`、`conversation` 以及循环、上下文、工具和终结模块。
@@ -176,8 +177,9 @@ concrete factory 选择，`bootstrap.cli` 和 `bootstrap.acp` 将这些选择适
 CLI、TUI 和 ACP 继续共享同一服务和带类型运行时事件流。
 
 完整依赖规则、兼容迁移策略和 allowlist 纪律见
-[ADR 0049](adr/0049-progressive-architecture-boundaries.md) 和
-[ADR 0153](adr/0153-architecture-completion.md)。
+[ADR 0049](adr/0049-progressive-architecture-boundaries.md)、
+[ADR 0153](adr/0153-architecture-completion.md) 以及
+[ADR 0154](adr/0154-normal-agent-verification-acquisition-boundary.md)。
 
 ## 运行时事件模型
 
@@ -1653,11 +1655,31 @@ TestRunner、UI contract 或 UltraCode 集成；这些属于后续工作。
 `TurnInput` 在规范 JSON payload 中持久化结构化 snapshot，因此 safe retry 与崩溃恢复会保留相同的 requirement
 身份、strength、activation、provenance 和 fingerprint。缺少该字段仍兼容旧行并保持历史 fingerprint 形状；存在但
 损坏的 snapshot 会被视为无效恢复输入并失败关闭，不会退化为 Legacy 模式。不增加数据库列或 migration。保存的
-plan 执行不会合成 requirements。
+plan 执行不会推断 task-specific requirements；面向用户的 plan handoff 遵循 VF-3c 描述的普通回合 default policy。
 
 当前 UltraCode delegation 路径无法保持结构化 requirements 语义，因此结构化请求会在创建 parent session 或 durable
 execution claim 之前被拒绝。Legacy UltraCode 请求保持既有行为。Requirement discovery、acquisition、blocker producer
 和 UltraCode verification propagation 不属于本切片。
+
+## VF-3c：普通 Agent 验证获取边界
+
+`NormalTurnRequirementsPolicy` 是第一版普通 Agent 验证要求唯一的 application-owned producer。在 UltraCode 路由之后、
+TurnInput 持久化、第一次 Provider 请求或工具执行之前，若新的普通用户回合没有显式 snapshot，策略会提供一个不可变的
+Required `ON_WORKSPACE_MUTATION` 要求，其稳定 criterion 为：`After a workspace mutation, a recognized verification command must produce a current result.`
+该策略不会检查 prompt 或工作区，也不会发现或选择测试运行器。显式非空 snapshot、显式空 snapshot、旧 TurnInput 行、恢复、
+后台任务、子代理和 UltraCode 路径继续保持各自既有语义。
+
+`resolve_verification_coverage` 是 runtime-owned 的可信 linkage 接缝。它复用现有保守的 `verification_scope_for_tool`
+分类器，只能将规范 generic requirement ID 关联到已经识别为 `bash:test` 或 `bash:static_check` 的命令。分类 scope 仍是
+有界的描述性 metadata；命令文本、summary、模型提供的 ID 和 NLP 都不能建立 requirement coverage。已识别命令的失败仍是
+类型化的 FAILED evidence。本切片只有无歧义的被拒绝 `MODE` permission decision 才可以产生类型化的
+`POLICY_RESTRICTION` blocker；`EXPLICIT_RULE` denial 暂不分类，因为该 source 也表示 headless ASK-to-deny 和 restrictive Bash conversion。
+不会从 reason string 或其他自由文本推断交互式拒绝、审批 UI 缺失、环境失败或其他 inability fact。
+
+generic finalizer projection 使用保守文案：当前检查成功时只能描述为
+`A recognized verification check passed after the workspace changes.`，不会声称所有测试或所有行为都已验证。
+现有 `VerificationTracker` 仍是唯一可变 verification truth owner，VF-2 仍是 final-response boundary。本切片不增加自动发现、
+framework/package-manager detection、专用 TestRunner、UI/schema 变更或 UltraCode verification integration。
 
 ## 面向 Prompt Cache 的模型请求投影与用量
 
