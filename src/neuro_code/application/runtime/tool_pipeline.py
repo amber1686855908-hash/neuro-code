@@ -663,13 +663,11 @@ class ToolExecutor:
                     },
                 )
             if not decision.allowed:
+                # EXPLICIT_RULE also covers headless ASK-to-DENY; only MODE is
+                # unambiguous enough to produce a typed policy blocker here.
                 verification_blocker_reason = (
                     VerificationBlockReason.POLICY_RESTRICTION
-                    if decision.source
-                    in {
-                        PermissionDecisionSource.EXPLICIT_RULE,
-                        PermissionDecisionSource.MODE,
-                    }
+                    if decision.source is PermissionDecisionSource.MODE
                     else None
                 )
                 result = ToolResult(f"permission denied: {decision.reason}", is_error=True)

@@ -3050,9 +3050,12 @@ can attach only the canonical generic requirement ID to an already recognized
 `bash:test` or `bash:static_check` command. Classification scope remains bounded
 descriptive metadata; command text, summaries, model-provided IDs, and NLP do
 not establish requirement coverage. A recognized command failure remains
-typed failed evidence, while an explicit policy restriction can produce a
-typed blocker; interactive denial, missing approval UI, environment failures,
-and other inability facts are not guessed from strings.
+typed failed evidence. Only an unambiguous denied `MODE` permission decision
+may produce the typed `POLICY_RESTRICTION` blocker in this slice;
+`EXPLICIT_RULE` denial is deliberately deferred because that source also
+represents headless ASK-to-deny and restrictive Bash conversions. Interactive
+denial, missing approval UI, environment failures, and other inability facts
+are not inferred from reason strings or other free text.
 
 The generic finalizer projection is deliberately conservative: a successful
 current check may be described as `A recognized verification check passed after

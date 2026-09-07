@@ -35,9 +35,10 @@ coverage fact。
 NLP 或通用 scope algebra 建立 coverage。
 
 Effective snapshot 沿用现有 ToolExecutor observation path。先观察 mutation，再观察 verification，因此 evidence 会被当前 workspace generation
-标记。已识别命令的失败在 requirement active 后仍是 FAILED evidence，会评估为 `FAILED`，不会变成 `NO_EVIDENCE`。本切片唯一的 blocker producer
-是来自现有 permission decision source（`EXPLICIT_RULE` 或 `MODE`）的类型化显式 policy restriction。交互式拒绝、审批 UI 不可用、环境失败和其他
-blocker producer 会等到存在可靠 typed fact source 后再实现；绝不从自由文本推断 blocker。
+标记。已识别命令的失败在 requirement active 后仍是 FAILED evidence，会评估为 `FAILED`，不会变成 `NO_EVIDENCE`。本切片只有无歧义的被拒绝
+`MODE` permission decision 才可以产生类型化的 `POLICY_RESTRICTION` blocker。`EXPLICIT_RULE` denial 暂不分类，因为该 source 目前同时涵盖
+显式 deny rule、headless ASK-to-deny 以及其他 restrictive Bash conversion。交互式拒绝、审批 UI 不可用、环境失败和其他 blocker producer 会等到
+存在可靠 typed fact source 后再实现；不会从 reason string 或其他自由文本推断 blocker。
 
 现有 `VerificationTracker` 仍是唯一可变 verification truth owner。每 requirement 最新 fact 与全局 workspace-generation freshness 仍是权威事实，
 有界 diagnostic evidence ring 只负责 projection。generic finalizer 文案保持保守，只能写：

@@ -1672,8 +1672,9 @@ Required `ON_WORKSPACE_MUTATION` 要求，其稳定 criterion 为：`After a wor
 `resolve_verification_coverage` 是 runtime-owned 的可信 linkage 接缝。它复用现有保守的 `verification_scope_for_tool`
 分类器，只能将规范 generic requirement ID 关联到已经识别为 `bash:test` 或 `bash:static_check` 的命令。分类 scope 仍是
 有界的描述性 metadata；命令文本、summary、模型提供的 ID 和 NLP 都不能建立 requirement coverage。已识别命令的失败仍是
-类型化的 FAILED evidence；显式 policy restriction 可以产生类型化 blocker；不会从字符串猜测交互式拒绝、审批 UI 缺失、
-环境失败或其他 inability fact。
+类型化的 FAILED evidence。本切片只有无歧义的被拒绝 `MODE` permission decision 才可以产生类型化的
+`POLICY_RESTRICTION` blocker；`EXPLICIT_RULE` denial 暂不分类，因为该 source 也表示 headless ASK-to-deny 和 restrictive Bash conversion。
+不会从 reason string 或其他自由文本推断交互式拒绝、审批 UI 缺失、环境失败或其他 inability fact。
 
 generic finalizer projection 使用保守文案：当前检查成功时只能描述为
 `A recognized verification check passed after the workspace changes.`，不会声称所有测试或所有行为都已验证。

@@ -55,11 +55,14 @@ The effective snapshot travels through the existing ToolExecutor observation
 path. Mutation is observed before verification, so evidence is stamped with
 the current workspace generation. A recognized verification failure remains
 failure evidence and evaluates as `FAILED` once the requirement is active; it
-does not become `NO_EVIDENCE`. The only blocker producer in this slice is a
-typed explicit policy restriction from the existing permission decision source
-(`EXPLICIT_RULE` or `MODE`). Interactive denial, unavailable approval UI,
+does not become `NO_EVIDENCE`. In this slice, only an unambiguous denied
+`MODE` permission decision may produce the typed `POLICY_RESTRICTION` blocker.
+`EXPLICIT_RULE` denials are deliberately not classified because that source
+currently conflates explicit deny rules with headless ASK-to-deny and other
+restrictive Bash conversions. Interactive denial, unavailable approval UI,
 environment failures, and other blocker producers remain deferred until a
-reliable typed fact source exists. Blockers are never inferred from free text.
+reliable typed fact source exists. No blocker is inferred from reason strings
+or other free text.
 
 The existing `VerificationTracker` remains the sole mutable verification-truth
 owner. Its per-requirement latest fact and global workspace-generation
