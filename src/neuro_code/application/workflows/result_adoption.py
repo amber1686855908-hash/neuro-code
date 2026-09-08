@@ -24,6 +24,7 @@ from neuro_code.application.ports.checkpoints import (
     WorkspaceCheckpointError,
 )
 from neuro_code.application.ports.result_adoption import (
+    RESULT_ADOPTION_POST_APPLY_CONCURRENT_MODIFICATION,
     ParentWorkspaceProjectionReader,
     ParentWorkspaceSnapshot,
     ResultAdoptionError,
@@ -901,7 +902,7 @@ class ResultAdoptionApplicationService:
                         ordinal=ordinal,
                         state=ResultAdoptionTargetState.INDETERMINATE,
                         observed=observed,
-                        error="post_apply_concurrent_modification",
+                        error=RESULT_ADOPTION_POST_APPLY_CONCURRENT_MODIFICATION,
                     )
                 raise ResultAdoptionError(
                     f"target {target.path!r} changed during final verification",

@@ -2428,6 +2428,20 @@ plan, target, worker, Worktree, Checkpoint, or approval side effects. Schema
 rows, the adoption projections, and the optional MAIN_MAX verification snapshot
 columns.
 
+VF-4b adds the parent-workspace freshness projection needed by the later
+verification integration without adding a schema column or a second runtime
+truth owner. `ResultAdoptionRecord.parent_workspace_changed` is true when at
+least one durable target reached `APPLIED`. If a target reached `APPLIED` and
+then became `INDETERMINATE` during final verification, the exact canonical
+`post_apply_concurrent_modification` target error preserves that historical
+fact; a pre-apply `APPLYING` recovery that becomes `INDETERMINATE` remains
+false. `APPLIED` records an observed desired image, not causal authorship of a
+write. One logical adoption, identified by its stable `adoption_id`, is one
+future parent verification-mutation boundary even when recovery observes it
+again. VF-4b does not advance `VerificationTracker`, import worker evidence,
+or expose new UI/protocol behavior; parent verification integration remains
+VF-4c.
+
 ### Automatic Ultracode result adoption integration
 
 [ADR 0144](adr/0144-automatic-ultracode-result-adoption-integration.md) adds

@@ -2253,6 +2253,14 @@ adoption 由 fresh composition 重入时返回相同 durable result，且不产�
 副作用。Schema 28→29 migration 与重复 schema-30 initialization 会保留旧 rows、adoption projection 和可选的
 MAIN_MAX verification snapshot columns。
 
+VF-4b 增加后续 verification integration 所需的 parent-workspace freshness projection，但不增加 schema column，也不建立第二个
+runtime truth owner。`ResultAdoptionRecord.parent_workspace_changed` 在至少一个 durable target 到达 `APPLIED` 时为 true。
+如果 target 到达 `APPLIED` 后在 final verification 中变为 `INDETERMINATE`，精确的 canonical
+`post_apply_concurrent_modification` target error 会保留该历史事实；pre-apply 的 `APPLYING` recovery 若变为
+`INDETERMINATE` 则保持 false。`APPLIED` 记录观察到 desired image，不记录写入的因果作者。一次 logical adoption 由稳定的
+`adoption_id` 标识，即使 recovery 再次观察它，也只对应未来一次 parent verification-mutation boundary。VF-4b 不推进
+`VerificationTracker`、不导入 worker evidence，也不暴露新的 UI/protocol 行为；parent verification integration 留给 VF-4c。
+
 ### Automatic Ultracode 结果采纳集成
 
 [ADR 0144](adr/0144-automatic-ultracode-result-adoption-integration.md) 增加显式 `ULTRACODE` entry 与内部 Result Adoption

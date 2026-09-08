@@ -81,6 +81,7 @@ from neuro_code.application.ports.provider_settings import (
     ProviderSettingsStore,
 )
 from neuro_code.application.ports.result_adoption import (
+    RESULT_ADOPTION_POST_APPLY_CONCURRENT_MODIFICATION,
     ParentWorkspaceProjectionReader,
     ParentWorkspaceSnapshot,
     ResultAdoptionError,
@@ -287,6 +288,7 @@ __all__ = [
     "MAX_TOOL_OUTPUT_ARTIFACT_BYTES",
     "MAX_TOOL_OUTPUT_ARTIFACT_READ_BYTES",
     "MAX_TOTAL_RESULT_BYTES",
+    "RESULT_ADOPTION_POST_APPLY_CONCURRENT_MODIFICATION",
     "TOOL_OUTPUT_ARTIFACT_PRUNE_GRACE_SECONDS",
     "WINDOWS_SANDBOX_SETUP_SCHEMA_VERSION",
     "AgentSwarmRunClaim",
