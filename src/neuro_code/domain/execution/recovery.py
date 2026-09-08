@@ -131,6 +131,7 @@ class TurnInput:
     plan_execution_requested: bool = False
     plan_execution_task_id: str | None = None
     verification_requirements: VerificationRequirementsSnapshot | None = None
+    verification_workspace_mutation_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.prompt, str):
@@ -153,6 +154,11 @@ class TurnInput:
                 "turn input verification_requirements must be a "
                 "VerificationRequirementsSnapshot or None"
             )
+        if self.verification_workspace_mutation_id is not None:
+            _bounded_identifier(
+                self.verification_workspace_mutation_id,
+                field_name="verification_workspace_mutation_id",
+            )
 
     @property
     def background(self) -> bool:
@@ -172,6 +178,8 @@ class TurnInput:
         }
         if self.verification_requirements is not None:
             payload["verification_requirements"] = self.verification_requirements.to_dict()
+        if self.verification_workspace_mutation_id is not None:
+            payload["verification_workspace_mutation_id"] = self.verification_workspace_mutation_id
         return payload
 
     def canonical_json(self) -> str:
@@ -197,6 +205,9 @@ class TurnInput:
                 verification_requirements = VerificationRequirementsSnapshot.from_dict(
                     raw_requirements
                 )
+        mutation_id = value.get("verification_workspace_mutation_id")
+        if mutation_id is not None and not isinstance(mutation_id, str):
+            raise ValueError("turn input workspace mutation id is invalid")
         if not isinstance(prompt, str) or not isinstance(raw_parts, list):
             raise ValueError("turn input payload is invalid")
         if not isinstance(raw_source, str):
@@ -216,6 +227,7 @@ class TurnInput:
             requested,
             task_id,
             verification_requirements=verification_requirements,
+            verification_workspace_mutation_id=mutation_id,
         )
 
 

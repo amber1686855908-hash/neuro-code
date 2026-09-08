@@ -198,6 +198,8 @@ class ProfileConversationController:
         turn_id: str | None = None,
         ultracode_execution_id: str | None = None,
         verification_requirements: VerificationRequirementsSnapshot | None = None,
+        verification_workspace_mutation_id: str | None = None,
+        resume_existing_attempt: bool = False,
     ) -> AgentRunResult:
         async with self._turn_lock:
             identity_kwargs: dict[str, Any] = {}
@@ -207,6 +209,12 @@ class ProfileConversationController:
                 identity_kwargs["ultracode_execution_id"] = ultracode_execution_id
             if verification_requirements is not None:
                 identity_kwargs["verification_requirements"] = verification_requirements
+            if verification_workspace_mutation_id is not None:
+                identity_kwargs["verification_workspace_mutation_id"] = (
+                    verification_workspace_mutation_id
+                )
+            if resume_existing_attempt:
+                identity_kwargs["resume_existing_attempt"] = True
             if not content_parts and (
                 cancellation_policy is TurnCancellationPolicy.RETAIN
                 and turn_source is TurnSource.USER
@@ -256,6 +264,36 @@ class ProfileConversationController:
                 execution_id=execution_id,
                 decision=decision,
                 content_parts=content_parts,
+                sink=sink,
+            )
+
+    async def commit_deterministic_turn(
+        self,
+        prompt: str,
+        *,
+        turn_id: str,
+        execution_id: str,
+        decision: UltracodeDelegationDecision,
+        content_parts: Sequence[ContentPart] = (),
+        verification_requirements: VerificationRequirementsSnapshot | None = None,
+        verification_workspace_mutation_id: str | None = None,
+        workspace_changes: Sequence[str] = (),
+        unverified_items: Sequence[str] = (),
+        blocker: str | None = None,
+        sink: EventSink | None = None,
+    ) -> AgentRunResult:
+        async with self._turn_lock:
+            return await self._binding.runner.commit_deterministic_turn(
+                prompt,
+                turn_id=turn_id,
+                execution_id=execution_id,
+                decision=decision,
+                content_parts=content_parts,
+                verification_requirements=verification_requirements,
+                verification_workspace_mutation_id=verification_workspace_mutation_id,
+                workspace_changes=workspace_changes,
+                unverified_items=unverified_items,
+                blocker=blocker,
                 sink=sink,
             )
 

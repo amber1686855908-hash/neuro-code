@@ -1431,8 +1431,17 @@ class CrashRecoveryTests(unittest.IsolatedAsyncioTestCase):
         serialized = structured.to_dict()
         self.assertEqual(serialized["verification_requirements"], snapshot.to_dict())
         self.assertEqual(TurnInput.from_dict(serialized), structured)
+        seeded = TurnInput(
+            "seeded input",
+            verification_requirements=snapshot,
+            verification_workspace_mutation_id="adoption-1",
+        )
+        seeded_payload = seeded.to_dict()
+        self.assertEqual(seeded_payload["verification_workspace_mutation_id"], "adoption-1")
+        self.assertEqual(TurnInput.from_dict(seeded_payload), seeded)
         legacy = TurnInput("legacy input")
         self.assertNotIn("verification_requirements", legacy.to_dict())
+        self.assertNotIn("verification_workspace_mutation_id", legacy.to_dict())
         self.assertEqual(TurnInput.from_dict(legacy.to_dict()), legacy)
         self.assertNotEqual(structured.fingerprint, legacy.fingerprint)
         with self.assertRaises(ValueError):

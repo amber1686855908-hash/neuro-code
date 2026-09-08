@@ -26,6 +26,7 @@ from neuro_code.application.ports.ultracode import (
     UltracodeStoreError,
 )
 from neuro_code.application.runtime.agent import AgentRunResult
+from neuro_code.application.runtime.final_response import ResponseSource
 from neuro_code.application.sessions.binding import ConversationBinding
 from neuro_code.application.sessions.conversation import AgentConversation
 from neuro_code.application.sessions.profile_conversation import (
@@ -153,8 +154,11 @@ class _ParentRunner:
         self.response = response
         self.run_calls = 0
         self.commit_calls = 0
+        self.deterministic_calls = 0
         self.replay_calls = 0
         self.verification_requirements: VerificationRequirementsSnapshot | None = None
+        self.verification_workspace_mutation_id: str | None = None
+        self.resume_existing_attempt = False
         self.fail_main = False
 
     @property
@@ -197,10 +201,14 @@ class _ParentRunner:
         turn_id: str | None = None,
         ultracode_execution_id: str | None = None,
         verification_requirements: VerificationRequirementsSnapshot | None = None,
+        verification_workspace_mutation_id: str | None = None,
+        resume_existing_attempt: bool = False,
     ) -> AgentRunResult:
         del cancellation_policy, turn_source
         self.run_calls += 1
         self.verification_requirements = verification_requirements
+        self.verification_workspace_mutation_id = verification_workspace_mutation_id
+        self.resume_existing_attempt = resume_existing_attempt
         if self.fail_main:
             raise RuntimeError("fixture main failure")
         if turn_id is None or ultracode_execution_id is None:
@@ -240,6 +248,36 @@ class _ParentRunner:
             verification_requirements=verification_requirements,
         )
 
+    async def commit_deterministic_turn(
+        self,
+        prompt: str,
+        *,
+        turn_id: str,
+        execution_id: str,
+        decision: UltracodeDelegationDecision,
+        content_parts=(),
+        verification_requirements: VerificationRequirementsSnapshot | None = None,
+        verification_workspace_mutation_id: str | None = None,
+        workspace_changes=(),
+        unverified_items=(),
+        blocker: str | None = None,
+        sink=None,
+    ) -> AgentRunResult:
+        self.deterministic_calls += 1
+        return await self._conversation.commit_deterministic_turn(
+            prompt,
+            turn_id=turn_id,
+            execution_id=execution_id,
+            decision=decision,
+            content_parts=content_parts,
+            verification_requirements=verification_requirements,
+            verification_workspace_mutation_id=verification_workspace_mutation_id,
+            workspace_changes=workspace_changes,
+            unverified_items=unverified_items,
+            blocker=blocker,
+            sink=sink,
+        )
+
     async def replay_committed_turn(
         self,
         prompt: str,
@@ -248,6 +286,7 @@ class _ParentRunner:
         execution_id: str,
         content_parts=(),
         verification_requirements: VerificationRequirementsSnapshot | None = None,
+        verification_workspace_mutation_id: str | None = None,
         sink=None,
     ) -> AgentRunResult:
         self.replay_calls += 1
@@ -257,6 +296,7 @@ class _ParentRunner:
             execution_id=execution_id,
             content_parts=content_parts,
             verification_requirements=verification_requirements,
+            verification_workspace_mutation_id=verification_workspace_mutation_id,
             sink=sink,
         )
 
@@ -279,6 +319,8 @@ class _DynamicParentRunner(_ParentRunner):
         turn_id: str | None = None,
         ultracode_execution_id: str | None = None,
         verification_requirements=None,
+        verification_workspace_mutation_id: str | None = None,
+        resume_existing_attempt: bool = False,
     ) -> AgentRunResult:
         if ultracode_execution_id is not None:
             return await super().run(
@@ -290,9 +332,11 @@ class _DynamicParentRunner(_ParentRunner):
                 turn_id=turn_id,
                 ultracode_execution_id=ultracode_execution_id,
                 verification_requirements=verification_requirements,
+                verification_workspace_mutation_id=verification_workspace_mutation_id,
+                resume_existing_attempt=resume_existing_attempt,
             )
         del sink, content_parts, cancellation_policy, turn_source, turn_id
-        del verification_requirements
+        del verification_requirements, verification_workspace_mutation_id, resume_existing_attempt
         self.ordinary_prompts.append(prompt)
         session_id = await self.ensure_persisted_session()
         return AgentRunResult(session_id, f"ordinary:{prompt}", (), (), (), 0)
@@ -801,41 +845,33 @@ def _spawn_production_swarm_crash(
                 service = await application.create_ultracode_delegation_service(
                     parent_binding=binding,
                 )
-                original = AgentConversation.commit_external_turn
+                original = AgentConversation.run
                 expected_turn_id = turn_id
 
                 async def hooked(
                     conversation: AgentConversation,
-                    external_prompt: str,
-                    *,
-                    response: str,
-                    turn_id: str,
-                    execution_id: str,
-                    decision: UltracodeDelegationDecision,
-                    content_parts=(),
-                    sink=None,
+                    parent_prompt: str,
+                    **kwargs: Any,
                 ) -> AgentRunResult:
-                    if decision is UltracodeDelegationDecision.BOUNDED_SWARM:
+                    execution_id = kwargs.get("ultracode_execution_id")
+                    result = await original(conversation, parent_prompt, **kwargs)
+                    if isinstance(execution_id, str):
                         execution = await store.get_ultracode_execution(execution_id)
                         lower = await store.get_swarm_run(ultracode_swarm_run_id(execution_id))
                         assert execution is not None
                         assert execution.state is UltracodeExecutionState.FINALIZING
                         assert lower is not None
                         assert lower.state is AgentSwarmRunState.COMPLETED
-                        assert turn_id == expected_turn_id
+                        assert kwargs.get("turn_id") == expected_turn_id
+                        attempts = await store.load_turn_attempts(execution.parent_session_id)
+                        parent_attempt = next(
+                            attempt for attempt in attempts if attempt.turn_id == expected_turn_id
+                        )
+                        assert parent_attempt.resolution is TurnRecoveryResolution.COMMITTED
                         os._exit(92)
-                    return await original(
-                        conversation,
-                        external_prompt,
-                        response=response,
-                        turn_id=turn_id,
-                        execution_id=execution_id,
-                        decision=decision,
-                        content_parts=content_parts,
-                        sink=sink,
-                    )
+                    return result
 
-                with patch.object(AgentConversation, "commit_external_turn", new=hooked):
+                with patch.object(AgentConversation, "run", new=hooked):
                     await service.run_turn(RunTurnRequest(prompt, turn_id=turn_id))
                 raise AssertionError("Swarm production process did not crash at the boundary")
             finally:
@@ -1440,8 +1476,9 @@ async def test_decomposable_ultracode_uses_existing_swarm_and_replays_without_re
         service = _service(store, binding, swarm_factory)
         request = RunTurnRequest("research these independent tasks in parallel", turn_id=turn_id)
         first = await service.run_turn(request)
-        assert first.response == "bounded swarm answer"
-        assert runner.run_calls == 0
+        assert first.response == "main answer"
+        assert runner.run_calls == 1
+        assert runner.commit_calls == 1
         assert swarm.calls == 1
         assert swarm.close_calls == 1
         assert factory_calls == 1
@@ -1449,7 +1486,7 @@ async def test_decomposable_ultracode_uses_existing_swarm_and_replays_without_re
         execution = await store.get_ultracode_execution(execution_id)
         assert execution is not None
         assert execution.decision is UltracodeDelegationDecision.BOUNDED_SWARM
-        assert execution.verification_requirements is None
+        assert execution.verification_requirements == DEFAULT_NORMAL_REQUIREMENTS
         assert execution.downstream_id == swarm_id
         assert execution.state is UltracodeExecutionState.COMPLETED
 
@@ -1461,7 +1498,9 @@ async def test_decomposable_ultracode_uses_existing_swarm_and_replays_without_re
             owner_id="new-process-owner",
         ).run_turn(request)
         assert replay.response == first.response
-        assert runner.run_calls == 0
+        assert runner.run_calls == 1
+        assert runner.commit_calls == 1
+        assert runner.replay_calls == 1
         assert swarm.calls == 1
         assert factory_calls == 1
         messages = await store.load_messages(session_id)
@@ -1926,7 +1965,7 @@ def test_run_turn_request_rejects_noncanonical_values() -> None:
     ],
     ids=("nonempty", "explicit-empty"),
 )
-async def test_structured_bounded_swarm_request_fails_before_session_or_execution_claim(
+async def test_structured_bounded_swarm_request_runs_parent_with_exact_snapshot(
     snapshot: VerificationRequirementsSnapshot,
 ) -> None:
     with tempfile.TemporaryDirectory() as directory:
@@ -1934,26 +1973,34 @@ async def test_structured_bounded_swarm_request_fails_before_session_or_executio
         store = await _store(cwd)
         runner = _ParentRunner(store, cwd)
         binding = _binding(runner, cwd)
-        swarm_calls = 0
+        session_id = await runner.ensure_persisted_session()
+        turn_id = "structured-ultracode"
+        execution_id = ultracode_execution_id(session_id, turn_id)
+        swarm = _CompletedSwarm(
+            _completed_swarm_result(ultracode_swarm_run_id(execution_id), session_id)
+        )
 
         async def swarm_factory() -> Any:
-            nonlocal swarm_calls
-            swarm_calls += 1
-            raise AssertionError("structured requirements must fail before Swarm creation")
+            return swarm
 
         service = _service(store, binding, swarm_factory)
         request = RunTurnRequest(
             "research these independent tasks in parallel",
-            turn_id="structured-ultracode",
+            turn_id=turn_id,
             verification_requirements=snapshot,
         )
 
-        with pytest.raises(ConfigurationError, match="structured verification requirements"):
-            await service.run_turn(request)
+        result = await service.run_turn(request)
 
-        assert runner.session_id is None
-        assert await store.list_sessions() == []
-        assert swarm_calls == 0
+        assert result.response == "main answer"
+        assert runner.run_calls == 1
+        assert runner.verification_requirements == snapshot
+        assert runner.verification_workspace_mutation_id is None
+        assert swarm.calls == 1
+        persisted = await store.get_ultracode_execution(execution_id)
+        assert persisted is not None
+        assert persisted.verification_requirements == snapshot
+        assert persisted.state is UltracodeExecutionState.COMPLETED
 
 
 def test_ultracode_execution_rejects_invalid_or_incomplete_terminal_identity() -> None:
@@ -2251,7 +2298,6 @@ async def test_ultracode_rejects_noncanonical_or_mismatched_swarm_results() -> N
 
         session_id = runner.session_id
         assert session_id is not None
-        await runner._conversation.abandon_recovery("bad-result")
         swarm_results.append(_completed_swarm_result("wrong-swarm-id", session_id))
         with pytest.raises(ConfigurationError, match="does not match"):
             await service.run_turn(
@@ -2451,9 +2497,9 @@ async def test_bounded_swarm_adopts_exact_result_before_parent_commit() -> None:
         events: list[str] = []
 
         class OrderedRunner(_ParentRunner):
-            async def commit_external_turn(self, prompt: str, **kwargs: Any) -> AgentRunResult:
-                events.append("parent_commit")
-                return await super().commit_external_turn(prompt, **kwargs)
+            async def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                events.append("parent_run")
+                return await super().run(prompt, **kwargs)
 
         runner = OrderedRunner(store, cwd)
         binding = _binding(runner, cwd)
@@ -2491,8 +2537,8 @@ async def test_bounded_swarm_adopts_exact_result_before_parent_commit() -> None:
                 turn_id=turn_id,
             )
         )
-        assert response.response == result.final_response
-        assert events == ["swarm_completed", "adoption_get", "adoption_adopt", "parent_commit"]
+        assert response.response == "main answer"
+        assert events == ["swarm_completed", "adoption_get", "adoption_adopt", "parent_run"]
         assert adapter.adopt_calls == 1
 
 
@@ -2501,7 +2547,7 @@ async def _completed_awaitable(value: Any) -> Any:
 
 
 @pytest.mark.asyncio
-async def test_adoption_conflict_is_parent_visible_and_never_falls_back() -> None:
+async def test_adoption_conflict_uses_parent_owned_deterministic_fallback() -> None:
     with tempfile.TemporaryDirectory() as directory:
         cwd = Path(directory)
         store = await _store(cwd)
@@ -2537,7 +2583,8 @@ async def test_adoption_conflict_is_parent_visible_and_never_falls_back() -> Non
         assert "terminal_state: conflict" in response.response
         assert "adoption_id:" in response.response
         assert runner.run_calls == 0
-        assert runner.commit_calls == 1
+        assert runner.commit_calls == 0
+        assert runner.deterministic_calls == 1
         assert adapter.adopt_calls == 0
         execution = await store.get_ultracode_execution(execution_id)
         assert execution is not None
@@ -3057,6 +3104,9 @@ async def test_real_composition_ultracode_decomposable_task_uses_existing_bounde
                     session_store=store,
                     parent_binding=binding,
                     swarm_factory=replay_swarm_factory,
+                    result_adoption_factory=lambda: _completed_awaitable(
+                        application.create_result_adoption_service(parent_binding=binding)
+                    ),
                     policy=_UnexpectedPolicy(),
                     owner_id="production-replay-owner",
                 )
@@ -3125,20 +3175,15 @@ def _spawn_integrated_result_adoption_boundary(
                     ),
                 )
                 if stage == "B":
-                    original_commit = AgentConversation.commit_external_turn
+                    original_run = AgentConversation.run
 
-                    async def hooked_commit(
+                    async def hooked_run(
                         conversation: AgentConversation,
-                        external_prompt: str,
-                        *,
-                        response: str,
-                        turn_id: str,
-                        execution_id: str,
-                        decision: UltracodeDelegationDecision,
-                        content_parts=(),
-                        sink=None,
+                        prompt: str,
+                        **kwargs: Any,
                     ) -> AgentRunResult:
-                        if decision is UltracodeDelegationDecision.BOUNDED_SWARM:
+                        execution_id = kwargs.get("ultracode_execution_id")
+                        if isinstance(execution_id, str):
                             execution = await store.get_ultracode_execution(execution_id)
                             assert execution is not None
                             adoption = await store.get_result_adoption(
@@ -3150,23 +3195,18 @@ def _spawn_integrated_result_adoption_boundary(
                             assert execution.state is UltracodeExecutionState.FINALIZING
                             assert adoption is not None
                             assert adoption.state is ResultAdoptionState.COMPLETED
-                            assert turn_id == "result-adoption-recovery-turn"
+                            assert kwargs.get("turn_id") == "result-adoption-recovery-turn"
                             os._exit(exit_code)
-                        return await original_commit(
+                        return await original_run(
                             conversation,
-                            external_prompt,
-                            response=response,
-                            turn_id=turn_id,
-                            execution_id=execution_id,
-                            decision=decision,
-                            content_parts=content_parts,
-                            sink=sink,
+                            prompt,
+                            **kwargs,
                         )
 
                     commit_patch = patch.object(
                         AgentConversation,
-                        "commit_external_turn",
-                        new=hooked_commit,
+                        "run",
+                        new=hooked_run,
                     )
                 else:
                     commit_patch = nullcontext()
@@ -3577,6 +3617,16 @@ async def test_real_composition_ultracode_swarm_adopts_worker_changes_safely() -
             assert [target.target.path for target in adoption.targets] == ["A.txt", "C.txt"]
             assert all(target.state.value == "applied" for target in adoption.targets)
             assert result.response == "planned DAG completed"
+            assert result.verification is not None
+            assert result.verification.workspace_generation == 1
+            assert result.response_contract is not None
+            assert result.response_contract.source is ResponseSource.EVIDENCE_AWARE_FINALIZER
+            attempts = await store.load_turn_attempts(session_id)
+            parent_attempt = next(
+                item for item in attempts if item.turn_id == "production-result-adoption-turn"
+            )
+            assert parent_attempt.input.verification_requirements == DEFAULT_NORMAL_REQUIREMENTS
+            assert parent_attempt.input.verification_workspace_mutation_id == adoption_id
             assert (repository / "A.txt").read_text(encoding="utf-8") == "worker-a\n"
             assert (repository / "B.txt").read_text(encoding="utf-8") == "base-b\n"
             assert (repository / "C.txt").read_text(encoding="utf-8") == "worker-c\n"
@@ -3734,7 +3784,7 @@ async def test_real_composition_fresh_process_result_adoption_recovery_matrix(
     assert fresh_state.planner_calls == 0
     assert fresh_state.leader_calls == 0
     assert fresh_state.worker_calls == []
-    assert fresh_state.zero_tool_calls == 0
+    assert fresh_state.zero_tool_calls == (2 if stage in {"A", "B"} else 0)
     assert _resource_counts(state_dir) == resources_before_recovery
     assert _run_git(repository, "rev-parse", "HEAD").decode().strip() == head_before
     assert (repository / "B.txt").read_bytes() == parent_before_recovery["B"]
@@ -3804,7 +3854,7 @@ async def test_real_composition_fresh_process_result_adoption_recovery_matrix(
 
 
 @pytest.mark.asyncio
-async def test_real_composition_swarm_recovers_after_lower_completion_before_parent_commit(
+async def test_real_composition_swarm_recovers_after_parent_commit_before_ultracode_projection(
     tmp_path: Path,
 ) -> None:
     context = mp.get_context("spawn")
@@ -3838,10 +3888,13 @@ async def test_real_composition_swarm_recovers_after_lower_completion_before_par
     assert lower is not None
     assert lower.state is AgentSwarmRunState.COMPLETED
     l1_calls = _read_durable_json_lines(call_log)
-    assert len(l1_calls) == 9
+    assert len(l1_calls) == 10
     assert sum(record["branch"] == "planner" for record in l1_calls) == 1
     assert sum(record["branch"] == "leader" for record in l1_calls) == 4
-    assert sum(record["branch"] == "worker" for record in l1_calls) == 4
+    worker_calls = [record for record in l1_calls if record["branch"] == "worker"]
+    assert len(worker_calls) == 5
+    assert sum("node_id" not in record for record in worker_calls) == 1
+    assert all(record["phase"] == "l1" for record in l1_calls)
     resources_before = _resource_counts(state_dir)
 
     state = _ProductionPlanningState()

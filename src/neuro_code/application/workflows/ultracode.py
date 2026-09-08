@@ -201,6 +201,8 @@ class UltracodeParentRunner(Protocol):
         turn_id: str | None = None,
         ultracode_execution_id: str | None = None,
         verification_requirements: VerificationRequirementsSnapshot | None = None,
+        verification_workspace_mutation_id: str | None = None,
+        resume_existing_attempt: bool = False,
     ) -> AgentRunResult: ...
 
     async def commit_external_turn(
@@ -215,6 +217,22 @@ class UltracodeParentRunner(Protocol):
         sink: EventSink | None = None,
     ) -> AgentRunResult: ...
 
+    async def commit_deterministic_turn(
+        self,
+        prompt: str,
+        *,
+        turn_id: str,
+        execution_id: str,
+        decision: UltracodeDelegationDecision,
+        content_parts: Sequence[ContentPart] = (),
+        verification_requirements: VerificationRequirementsSnapshot | None = None,
+        verification_workspace_mutation_id: str | None = None,
+        workspace_changes: Sequence[str] = (),
+        unverified_items: Sequence[str] = (),
+        blocker: str | None = None,
+        sink: EventSink | None = None,
+    ) -> AgentRunResult: ...
+
     async def replay_committed_turn(
         self,
         prompt: str,
@@ -223,6 +241,7 @@ class UltracodeParentRunner(Protocol):
         execution_id: str,
         content_parts: Sequence[ContentPart] = (),
         verification_requirements: VerificationRequirementsSnapshot | None = None,
+        verification_workspace_mutation_id: str | None = None,
         sink: EventSink | None = None,
     ) -> AgentRunResult: ...
 
@@ -329,10 +348,6 @@ class UltracodeDelegationApplicationService:
             )
         if existing_hint is None and requested_requirements is not None:
             preselected_decision = self._policy.decide(request.prompt)
-            if preselected_decision is UltracodeDelegationDecision.BOUNDED_SWARM:
-                raise ConfigurationError(
-                    "structured verification requirements are supported only for MAIN_MAX"
-                )
         session_id = await runner.ensure_persisted_session()
         if request.expected_session_id is not None and session_id != request.expected_session_id:
             raise ConfigurationError("Ultracode parent session identity does not match the request")
@@ -397,11 +412,7 @@ class UltracodeDelegationApplicationService:
         requested: VerificationRequirementsSnapshot | None,
     ) -> VerificationRequirementsSnapshot | None:
         if decision is UltracodeDelegationDecision.BOUNDED_SWARM:
-            if requested is not None:
-                raise ConfigurationError(
-                    "structured verification requirements are supported only for MAIN_MAX"
-                )
-            return None
+            return NormalTurnRequirementsPolicy.resolve(requested)
         if requested is None:
             return NormalTurnRequirementsPolicy.resolve(None)
         return requested
@@ -413,11 +424,15 @@ class UltracodeDelegationApplicationService:
     ) -> VerificationRequirementsSnapshot | None:
         stored = existing.verification_requirements
         if existing.decision is UltracodeDelegationDecision.BOUNDED_SWARM:
-            if stored is not None or requested is not None:
-                raise ConfigurationError(
-                    "BOUNDED_SWARM does not support structured verification requirements"
-                )
-            return None
+            if stored is None:
+                if requested is not None:
+                    raise ConfigurationError(
+                        "Ultracode verification requirements identity conflicts with legacy execution"
+                    )
+                return None
+            if requested is None or stored == requested:
+                return stored
+            raise ConfigurationError("Ultracode verification requirements identity conflicts")
         if requested is None:
             return stored
         if stored is None or stored != requested:
@@ -438,6 +453,25 @@ class UltracodeDelegationApplicationService:
         if any(not hasattr(runner, name) for name in required):
             raise ConfigurationError("Ultracode parent runner does not expose the required seam")
         return cast(UltracodeParentRunner, runner)
+
+    def _require_deterministic_runner(self) -> UltracodeParentRunner:
+        runner = self._require_runner()
+        if not callable(getattr(runner, "commit_deterministic_turn", None)):
+            raise ConfigurationError(
+                "Ultracode parent runner does not expose deterministic completion"
+            )
+        return runner
+
+    @staticmethod
+    def _structured_swarm(run: UltracodeExecution) -> bool:
+        return (
+            run.decision is UltracodeDelegationDecision.BOUNDED_SWARM
+            and run.verification_requirements is not None
+        )
+
+    @staticmethod
+    def _parent_mutation_seed(adoption: ResultAdoptionRecord) -> str | None:
+        return adoption.adoption_id if adoption.parent_workspace_changed else None
 
     async def _claim_or_recover(
         self,
@@ -545,9 +579,12 @@ class UltracodeDelegationApplicationService:
                 run = await self._transition(run, UltracodeExecutionState.MAIN_MAX_RUNNING)
                 await self._progress(run, sink=sink)
                 return await self._run_main(run, request, sink=sink)
-            await self._ensure_parent_attempt(run, request)
+            if not self._structured_swarm(run):
+                await self._ensure_parent_attempt(run, request)
             run = await self._transition(run, UltracodeExecutionState.BOUNDED_SWARM_RUNNING)
             await self._progress(run, sink=sink)
+            if self._structured_swarm(run):
+                return await self._run_swarm(run, request, sink=sink)
             attempts = await self._parent_attempts(run.parent_session_id)
             exact = next((item for item in attempts if item.turn_id == run.parent_turn_id), None)
             if exact is not None and exact.resolution is TurnRecoveryResolution.COMMITTED:
@@ -651,6 +688,14 @@ class UltracodeDelegationApplicationService:
             raise ConfigurationError("Ultracode Swarm result identity does not match the decision")
         await self._progress(run, sink=sink, stage="swarm_completed")
         adoption = await self._adopt_swarm_result(run, swarm_result, sink=sink)
+        if self._structured_swarm(run):
+            finalized = await self._transition(run, UltracodeExecutionState.FINALIZING)
+            return await self._continue_structured_parent(
+                finalized,
+                request,
+                adoption,
+                sink=sink,
+            )
         if adoption.state is ResultAdoptionState.COMPLETED:
             response = _response(swarm_result.final_response)
             terminal_state = UltracodeExecutionState.COMPLETED
@@ -670,6 +715,75 @@ class UltracodeDelegationApplicationService:
             terminal_state=terminal_state,
         )
 
+    async def _continue_structured_parent(
+        self,
+        run: UltracodeExecution,
+        request: RunTurnRequest,
+        adoption: ResultAdoptionRecord,
+        *,
+        sink: EventSink | None,
+        resume_existing_attempt: bool = False,
+    ) -> AgentRunResult:
+        """Run the real parent authority after structured adoption.
+
+        A structured Swarm response is orchestration evidence only.  The
+        parent AgentRuntime owns the verification tracker, final-output gate,
+        assistant transcript, and committed response.  Adoption failures use
+        the parent-owned deterministic completion seam so the workflow never
+        writes a second or unverified assistant result itself.
+        """
+
+        runner = self._require_runner()
+        mutation_id = self._parent_mutation_seed(adoption)
+        if adoption.state is ResultAdoptionState.COMPLETED:
+            result = await runner.run(
+                request.prompt,
+                sink=sink,
+                content_parts=request.content_parts,
+                cancellation_policy=request.cancellation_policy,
+                turn_source=request.turn_source,
+                turn_id=run.parent_turn_id,
+                ultracode_execution_id=run.execution_id,
+                verification_requirements=run.verification_requirements,
+                verification_workspace_mutation_id=mutation_id,
+                resume_existing_attempt=resume_existing_attempt,
+            )
+            response = _response(result.response)
+            completed = await self._transition(
+                run,
+                UltracodeExecutionState.COMPLETED,
+                final_response=response,
+                final_result_fingerprint=ultracode_result_fingerprint(run.execution_id, response),
+            )
+            await self._progress(completed, sink=sink)
+            return result
+
+        deterministic = self._require_deterministic_runner()
+        result = await deterministic.commit_deterministic_turn(
+            request.prompt,
+            turn_id=run.parent_turn_id,
+            execution_id=run.execution_id,
+            decision=run.decision,
+            content_parts=request.content_parts,
+            verification_requirements=run.verification_requirements,
+            verification_workspace_mutation_id=mutation_id,
+            unverified_items=(_adoption_failure_response(adoption),),
+            blocker=(
+                "Result adoption reached terminal state "
+                f"{adoption.state.value} before parent verification."
+            ),
+            sink=sink,
+        )
+        response = _response(result.response)
+        indeterminate = await self._transition(
+            run,
+            UltracodeExecutionState.INDETERMINATE,
+            final_response=response,
+            final_result_fingerprint=ultracode_result_fingerprint(run.execution_id, response),
+        )
+        await self._progress(indeterminate, sink=sink)
+        return result
+
     async def _recover_or_run_swarm(
         self,
         run: UltracodeExecution,
@@ -686,6 +800,34 @@ class UltracodeDelegationApplicationService:
         promote the projection to ``FINALIZING`` and complete the normal
         idempotent parent commit instead.
         """
+
+        if self._structured_swarm(run):
+            adoption = await self._load_adoption_record(run)
+            if adoption is not None and adoption.state.terminal:
+                return await self._recover_structured_parent_after_adoption(
+                    run,
+                    request,
+                    adoption,
+                    sink=sink,
+                )
+            lower = await self._load_completed_swarm_response(
+                run.downstream_id,
+                run.parent_session_id,
+            )
+            if lower is not None:
+                await self._progress(run, sink=sink, stage="swarm_completed")
+                adoption = await self._adopt_swarm_result(run, lower, sink=sink)
+                return await self._recover_structured_parent_after_adoption(
+                    run,
+                    request,
+                    adoption,
+                    sink=sink,
+                )
+            if await self._has_recoverable_swarm(run.downstream_id):
+                return await self._run_swarm(run, request, sink=sink)
+            raise ConfigurationError(
+                "structured Ultracode BOUNDED_SWARM has no recoverable Swarm evidence"
+            )
 
         attempts = await self._parent_attempts(run.parent_session_id)
         attempt = next((item for item in attempts if item.turn_id == run.parent_turn_id), None)
@@ -752,6 +894,60 @@ class UltracodeDelegationApplicationService:
             "Ultracode BOUNDED_SWARM has observable or unresolved parent state; replay is disabled"
         )
 
+    async def _recover_structured_parent_after_adoption(
+        self,
+        run: UltracodeExecution,
+        request: RunTurnRequest,
+        adoption: ResultAdoptionRecord,
+        *,
+        sink: EventSink | None,
+    ) -> AgentRunResult:
+        """Resume the single parent boundary after durable adoption evidence.
+
+        ``BOUNDED_SWARM_RUNNING`` is allowed to survive a process boundary
+        after adoption has completed.  Inspect the exact parent attempt before
+        creating or resuming the parent runtime so a committed parent is
+        replayed and an observable non-retryable parent is never duplicated.
+        """
+
+        attempts = await self._parent_attempts(run.parent_session_id)
+        attempt = next((item for item in attempts if item.turn_id == run.parent_turn_id), None)
+        if attempt is not None:
+            if attempt.resolution is TurnRecoveryResolution.COMMITTED:
+                finalized = await self._transition(run, UltracodeExecutionState.FINALIZING)
+                result = await self._replay_parent_result(finalized, request, sink=sink)
+                terminal_state = (
+                    UltracodeExecutionState.COMPLETED
+                    if adoption.state is ResultAdoptionState.COMPLETED
+                    else UltracodeExecutionState.INDETERMINATE
+                )
+                completed = await self._transition(
+                    finalized,
+                    terminal_state,
+                    final_response=_response(result.response),
+                    final_result_fingerprint=ultracode_result_fingerprint(
+                        run.execution_id,
+                        _response(result.response),
+                    ),
+                )
+                await self._progress(completed, sink=sink)
+                return result
+            if (
+                attempt.resolution is not None
+                or attempt.status is not TurnRecoveryStatus.SAFELY_RETRYABLE
+            ):
+                raise ConfigurationError(
+                    "structured Ultracode parent has observable state; recovery is disabled"
+                )
+        finalized = await self._transition(run, UltracodeExecutionState.FINALIZING)
+        return await self._continue_structured_parent(
+            finalized,
+            request,
+            adoption,
+            sink=sink,
+            resume_existing_attempt=attempt is not None,
+        )
+
     async def _recover_finalizing_swarm(
         self,
         run: UltracodeExecution,
@@ -766,6 +962,48 @@ class UltracodeDelegationApplicationService:
         Consequently, an absent adoption row is compatibility evidence to
         classify, never evidence that adoption completed.
         """
+
+        if self._structured_swarm(run):
+            adoption = await self._load_adoption_record(run)
+            if adoption is None or not adoption.state.terminal:
+                raise ConfigurationError(
+                    "structured Ultracode FINALIZING has no exact terminal adoption record"
+                )
+            attempts = await self._parent_attempts(run.parent_session_id)
+            attempt = next((item for item in attempts if item.turn_id == run.parent_turn_id), None)
+            if attempt is not None:
+                if attempt.resolution is TurnRecoveryResolution.COMMITTED:
+                    result = await self._replay_parent_result(run, request, sink=sink)
+                    terminal_state = (
+                        UltracodeExecutionState.COMPLETED
+                        if adoption.state is ResultAdoptionState.COMPLETED
+                        else UltracodeExecutionState.INDETERMINATE
+                    )
+                    completed = await self._transition(
+                        run,
+                        terminal_state,
+                        final_response=_response(result.response),
+                        final_result_fingerprint=ultracode_result_fingerprint(
+                            run.execution_id,
+                            _response(result.response),
+                        ),
+                    )
+                    await self._progress(completed, sink=sink)
+                    return result
+                if (
+                    attempt.resolution is not None
+                    or attempt.status is not TurnRecoveryStatus.SAFELY_RETRYABLE
+                ):
+                    raise ConfigurationError(
+                        "structured Ultracode FINALIZING has observable parent state; recovery is disabled"
+                    )
+            return await self._continue_structured_parent(
+                run,
+                request,
+                adoption,
+                sink=sink,
+                resume_existing_attempt=attempt is not None,
+            )
 
         adoption = await self._load_adoption_record(run)
         if adoption is not None:
@@ -1047,6 +1285,8 @@ class UltracodeDelegationApplicationService:
     ) -> AgentRunResult:
         if run.decision is UltracodeDelegationDecision.MAIN_MAX:
             return await self._replay_main_result(run, request, sink=sink)
+        if self._structured_swarm(run):
+            return await self._replay_parent_result(run, request, sink=sink)
         response = _response(run.final_response or "")
         return await self._require_runner().commit_external_turn(
             request.prompt,
@@ -1073,6 +1313,8 @@ class UltracodeDelegationApplicationService:
             )
         if run.decision is UltracodeDelegationDecision.MAIN_MAX:
             return await self._replay_main_result(run, request, sink=sink)
+        if self._structured_swarm(run):
+            return await self._replay_parent_result(run, request, sink=sink)
         response = await self._require_parent_result(
             run.parent_session_id,
             run.parent_turn_id,
@@ -1101,6 +1343,28 @@ class UltracodeDelegationApplicationService:
             execution_id=run.execution_id,
             content_parts=request.content_parts,
             verification_requirements=run.verification_requirements,
+            sink=sink,
+        )
+
+    async def _replay_parent_result(
+        self,
+        run: UltracodeExecution,
+        request: RunTurnRequest,
+        *,
+        sink: EventSink | None,
+    ) -> AgentRunResult:
+        """Replay a committed structured parent turn without inference."""
+
+        adoption = await self._load_adoption_record(run)
+        if adoption is None or not adoption.state.terminal:
+            raise ConfigurationError("structured parent replay requires terminal adoption")
+        return await self._require_runner().replay_committed_turn(
+            request.prompt,
+            turn_id=run.parent_turn_id,
+            execution_id=run.execution_id,
+            content_parts=request.content_parts,
+            verification_requirements=run.verification_requirements,
+            verification_workspace_mutation_id=self._parent_mutation_seed(adoption),
             sink=sink,
         )
 
@@ -1249,6 +1513,21 @@ class UltracodeDelegationApplicationService:
                 or current.owner_token != self._owner_token
             ):
                 return
+            if (
+                self._structured_swarm(current)
+                and current.state is UltracodeExecutionState.FINALIZING
+            ):
+                attempts = await self._parent_attempts(current.parent_session_id)
+                attempt = next(
+                    (item for item in attempts if item.turn_id == current.parent_turn_id),
+                    None,
+                )
+                if attempt is not None and attempt.resolution is TurnRecoveryResolution.COMMITTED:
+                    # The parent completion is already durable; keep the
+                    # orchestration row recoverable so a later call replays it
+                    # instead of classifying a delivery/transition failure as
+                    # a second failed turn.
+                    return
             await self._transition(current, UltracodeExecutionState.INDETERMINATE)
         except Exception:
             # The original failure remains the observable error.  Losing the

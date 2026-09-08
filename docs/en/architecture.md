@@ -2335,14 +2335,20 @@ For a fresh `MAIN_MAX` execution, `None` is resolved exactly once by
 `NormalTurnRequirementsPolicy`; an explicit non-empty or empty
 `VerificationRequirementsSnapshot` is preserved as the effective parent
 input. The snapshot is frozen into both `TurnInput` and the durable Ultracode
-identity before the parent model turn begins. Structured `BOUNDED_SWARM`
-requests fail closed before a durable branch claim (and, for a fresh request,
-before parent-session creation); legacy BOUNDED_SWARM requests continue with
-no structured snapshot. If a MAIN_MAX parent turn is already committed when
-the controller recovers, the existing exact completion is replayed through a
-dedicated projection seam. Recovery performs no provider, verification, or
-finalizer rerun and never uses the external-result commit boundary to
-manufacture a structured verified completion.
+identity before the parent model turn begins. The same rule now applies to a
+fresh structured `BOUNDED_SWARM` execution. A structured Swarm does not create
+the legacy parent attempt or commit the lower Swarm response: it runs the
+canonical Swarm, adopts its durable result, and only then starts the real
+parent `AgentRuntime` with the exact snapshot and, when adoption changed the
+parent, one adoption identity as the parent mutation seed. The parent runtime
+owns verification, finalization, and the committed response. An unresolved
+adoption reaches the parent-owned deterministic fallback instead and never
+claims a successful verification. Legacy BOUNDED_SWARM rows with a NULL
+snapshot retain their historical external-result path. If a parent turn is
+already committed when the controller recovers, the existing exact completion
+is replayed through a dedicated projection seam; recovery performs no provider,
+verification, or finalizer rerun and never manufactures a structured verified
+completion from the lower result.
 
 The parent `ConversationBinding` remains the capability ceiling. The entry
 adds no filesystem, Bash, LSP, MCP, network, Worktree, Checkpoint, or Writable
@@ -2450,8 +2456,14 @@ the internal Result Adoption core. `MAIN_MAX` retains ordinary single-agent
 semantics and performs zero adoption activity. `BOUNDED_SWARM` must first
 produce the exact canonical terminal `AgentSwarmResult`, then passes that
 typed result and the actual parent `ConversationBinding` to Result Adoption.
-The parent external turn is committed only after adoption reaches
-`COMPLETED`; Ultracode reaches `COMPLETED` only after that parent commit.
+Legacy executions commit the bounded external result after adoption reaches
+`COMPLETED`. Structured executions instead start the real parent AgentRuntime
+after adoption, seed its existing VerificationTracker once when a durable
+target reached `APPLIED`, and let that runtime commit the only parent response.
+An adoption conflict or indeterminate outcome uses the same parent-owned
+deterministic fallback seam; the lower Swarm response is never treated as
+verified parent truth. Ultracode reaches `COMPLETED` only after its selected
+parent completion path succeeds.
 
 Adoption identity is derived deterministically from the exact Ultracode
 execution and Swarm run identities. `CONFLICT`, `FAILED`, and
@@ -3060,12 +3072,11 @@ migration is added. Saved-plan execution does not infer task-specific
 requirements; a user-facing plan handoff follows the normal default policy
 described in VF-3c.
 
-The VF-3b propagation boundary is now extended by the narrowly scoped VF-4a
-MAIN_MAX integration described below. Structured `BOUNDED_SWARM` requests
-remain rejected before parent-session creation or a durable execution claim;
-legacy UltraCode requests retain their existing behavior. Requirement
-discovery, acquisition, blocker producers, and BOUNDED_SWARM verification
-execution remain outside this slice.
+The VF-3b propagation boundary is extended first by the narrowly scoped VF-4a
+`MAIN_MAX` integration and then by the VF-4c structured `BOUNDED_SWARM` parent
+integration described below. Requirement discovery and acquisition remain
+outside these slices; worker verification and generic verification execution
+are not inferred from the lower Swarm result.
 
 ## VF-3c normal-agent verification acquisition boundary
 
@@ -3125,11 +3136,51 @@ MAIN_MAX passes the exact persisted snapshot to the existing normal Agent
 runtime, which remains the sole verification and final-response owner.
 Recovery of a committed MAIN_MAX parent uses the existing durable completion
 through a dedicated replay projection and performs no Provider, verification,
-Finalizer, or duplicate-turn execution. `BOUNDED_SWARM` keeps its legacy
-`None` requirement mode; any structured request is rejected before a durable
-branch claim and does not reach Swarm, workers, adoption, or a Provider. This
-slice does not add worker-level verification, result-adoption verification,
-requirement inference, discovery, or a public interface change.
+Finalizer, or duplicate-turn execution. VF-4a leaves legacy `BOUNDED_SWARM`
+rows with a NULL requirement snapshot unchanged; structured BOUNDED_SWARM
+support is defined by VF-4c below. This slice does not add worker-level
+verification, result-adoption verification, requirement inference, discovery,
+or a public interface change.
+
+## VF-4c structured BOUNDED_SWARM parent verification
+
+VF-4c completes the structured verification path for `BOUNDED_SWARM` without
+changing the Swarm, worker, Planner, Leader, DAG, or Result Adoption owners.
+For a fresh request, `None` is resolved once by
+`NormalTurnRequirementsPolicy`; explicit non-empty and empty snapshots remain
+exact. The effective snapshot is persisted in the existing schema-30
+Ultracode columns and in the parent `TurnInput`. A persisted structured row
+must be replayed with that exact snapshot; a legacy NULL row stays legacy, and
+an attempted mode or snapshot identity change fails closed. Schema 31 is not
+introduced.
+
+The structured execution has one durable orchestration identity and does not
+pre-create the old external parent attempt. It runs the canonical bounded
+Swarm, adopts the durable result through the existing Result Adoption service,
+and then invokes the parent `AgentRuntime` with the original prompt, parent
+turn identity, execution identity, and exact snapshot. When
+`parent_workspace_changed` is true, the stable `adoption_id` is passed as one
+parent mutation seed; the parent `VerificationTracker` records that fact once
+before the first model step. No layer directly edits the tracker's generation,
+and worker verification evidence is not imported.
+
+Only the parent runtime can produce the parent committed response. A
+successful adoption therefore crosses the normal VF-2 final-response boundary
+and may run the usual parent tools and verification. A conflict or
+indeterminate adoption does not become verification `FAIL`; it is an
+orchestration failure completed through the parent-owned deterministic,
+truth-safe fallback, which is never the lower Swarm response. Structured
+recovery reuses exact Swarm, adoption, parent-attempt, and committed-response
+identities. It does not replay completed lower work, call the Provider or
+Finalizer twice, create a second turn, or commit a duplicate assistant item.
+
+The legacy BOUNDED_SWARM path, MAIN_MAX behavior, CLI/TUI/ACP projections,
+permission and sandbox boundaries, and existing schema remain compatible.
+Workers continue to run without parent requirements; requirement discovery,
+verification acquisition, test-runner/framework detection, and public
+verification UI remain outside this slice. With VF-4c, the Verification
+Foundation sequence is complete; further work is product or stabilization
+work rather than another verification-foundation slice.
 
 ## Cache-friendly model request projection and usage
 

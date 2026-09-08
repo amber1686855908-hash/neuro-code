@@ -33,6 +33,14 @@ from neuro_code.application.runtime.final_response import (
     FinalResponseContract,
     ResponseSource,
 )
+from neuro_code.application.runtime.finalization import (
+    FinalizationEvidence,
+    deterministic_fallback_result,
+)
+from neuro_code.application.runtime.verification import (
+    VerificationReport,
+    VerificationTracker,
+)
 from neuro_code.application.sessions.execution_queries import (
     LoadExecutionRecordRequest,
     SessionExecutionQueryService,
@@ -70,6 +78,7 @@ from neuro_code.domain.execution import (
     AgentExecutionOutcome,
     AgentExecutionStatus,
     SessionExecutionRecord,
+    SupervisorReasonCode,
     TurnCancellationPolicy,
     TurnInput,
     TurnRecoveryAttempt,
@@ -342,6 +351,8 @@ class AgentConversation:
         turn_id: str | None = None,
         ultracode_execution_id: str | None = None,
         verification_requirements: VerificationRequirementsSnapshot | None = None,
+        verification_workspace_mutation_id: str | None = None,
+        resume_existing_attempt: bool = False,
     ) -> AgentRunResult:
         verification_requirements = self._resolve_new_normal_turn_requirements(
             verification_requirements,
@@ -376,6 +387,12 @@ class AgentConversation:
                 }
                 if verification_requirements is not None:
                     runtime_kwargs["verification_requirements"] = verification_requirements
+                if verification_workspace_mutation_id is not None:
+                    runtime_kwargs["verification_workspace_mutation_id"] = (
+                        verification_workspace_mutation_id
+                    )
+                if resume_existing_attempt:
+                    runtime_kwargs["resume_existing_attempt"] = True
                 result = await self._runtime.run(prompt, **runtime_kwargs)
             except asyncio.CancelledError:
                 await self._reload_persisted_state()
@@ -457,6 +474,130 @@ class AgentConversation:
         if not all(isinstance(part, ContentPart) for part in parts):
             raise TypeError("external turn content parts must be canonical")
 
+        response_contract = FinalResponseContract.committed(
+            response,
+            source=ResponseSource.EXTERNAL_RESULT,
+        )
+        return await self._commit_synthetic_turn(
+            prompt,
+            response=response,
+            turn_id=turn_id,
+            execution_id=execution_id,
+            decision=decision,
+            content_parts=parts,
+            sink=sink,
+            verification_requirements=verification_requirements,
+            response_contract=response_contract,
+            persist_response_event=False,
+        )
+
+    async def commit_deterministic_turn(
+        self,
+        prompt: str,
+        *,
+        turn_id: str,
+        execution_id: str,
+        decision: UltracodeDelegationDecision,
+        content_parts: Sequence[ContentPart] = (),
+        verification_requirements: VerificationRequirementsSnapshot | None = None,
+        verification_workspace_mutation_id: str | None = None,
+        workspace_changes: Sequence[str] = (),
+        unverified_items: Sequence[str] = (),
+        blocker: str | None = None,
+        sink: EventSink | None = None,
+    ) -> AgentRunResult:
+        """Commit a parent-owned, evidence-only fallback without a Provider.
+
+        This is deliberately a session-owner seam.  Ultracode may report why
+        adoption failed, but it cannot write assistant history or completion
+        events itself.  The tracker creates the bounded report, and the
+        deterministic fallback is committed through the same atomic turn path
+        as every other final response.
+        """
+
+        tracker = VerificationTracker(requirements=verification_requirements)
+        if verification_workspace_mutation_id is not None:
+            tracker.record_workspace_mutation()
+        report = tracker.report()
+        evidence = FinalizationEvidence(
+            SupervisorReasonCode.NONE,
+            workspace_changes=tuple(workspace_changes),
+            verification=report.confirmed_items,
+            unverified_items=(
+                *report.unverified_items,
+                *tuple(unverified_items),
+                "No additional verification should be claimed without recorded evidence.",
+            ),
+            blocker=blocker,
+            uncertainty=(
+                "The final response is limited to evidence already recorded in the conversation.",
+            ),
+            verification_state=report.state,
+            verification_evidence=report.evidence,
+            verification_workspace_generation=report.workspace_generation,
+            requirement_evaluations=report.requirement_evaluations,
+        )
+        finalization = deterministic_fallback_result(evidence)
+        response_contract = FinalResponseContract.committed(
+            finalization.response,
+            source=ResponseSource.DETERMINISTIC_FALLBACK,
+            verification=report,
+        )
+        parts = tuple(content_parts)
+        if not all(isinstance(part, ContentPart) for part in parts):
+            raise TypeError("deterministic turn content parts must be canonical")
+        return await self._commit_synthetic_turn(
+            prompt,
+            response=finalization.response,
+            turn_id=turn_id,
+            execution_id=execution_id,
+            decision=decision,
+            content_parts=parts,
+            sink=sink,
+            verification_requirements=verification_requirements,
+            verification_workspace_mutation_id=verification_workspace_mutation_id,
+            response_contract=response_contract,
+            verification=report,
+            persist_response_event=True,
+        )
+
+    async def _commit_synthetic_turn(
+        self,
+        prompt: str,
+        *,
+        response: str,
+        turn_id: str,
+        execution_id: str,
+        decision: UltracodeDelegationDecision,
+        content_parts: Sequence[ContentPart],
+        sink: EventSink | None,
+        verification_requirements: VerificationRequirementsSnapshot | None,
+        verification_workspace_mutation_id: str | None = None,
+        response_contract: FinalResponseContract,
+        verification: VerificationReport | None = None,
+        persist_response_event: bool,
+    ) -> AgentRunResult:
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("synthetic turn prompt must not be empty")
+        if (
+            not isinstance(response, str)
+            or not response.strip()
+            or len(response.encode("utf-8")) > MAX_ULTRACODE_RESULT_BYTES
+        ):
+            raise ConfigurationError(
+                "synthetic turn response is outside the bounded result contract"
+            )
+        if not isinstance(turn_id, str) or not turn_id.strip():
+            raise ValueError("synthetic turn id must not be empty")
+        if not isinstance(execution_id, str) or not execution_id.strip():
+            raise ValueError("synthetic execution id must not be empty")
+        if not isinstance(decision, UltracodeDelegationDecision):
+            raise TypeError("synthetic turn decision must be canonical")
+        if not isinstance(response_contract, FinalResponseContract):
+            raise TypeError("response_contract must be a FinalResponseContract")
+        if not response_contract.is_committed or response_contract.response != response:
+            raise ConfigurationError("synthetic turn requires a matching committed response")
+
         async with self._turn_lock:
             session_id = self._session_id
             if session_id is None:
@@ -477,42 +618,52 @@ class AgentConversation:
 
             turn_input = TurnInput(
                 prompt,
-                parts,
+                tuple(content_parts),
                 TurnSource.USER,
                 verification_requirements=verification_requirements,
+                verification_workspace_mutation_id=verification_workspace_mutation_id,
             )
             attempts = await self._store.load_turn_attempts(session_id)
             attempt = next((item for item in attempts if item.turn_id == turn_id), None)
             if attempt is not None:
                 if attempt.input_fingerprint != turn_input.fingerprint:
-                    raise ConfigurationError("external turn identity is bound to different input")
+                    raise ConfigurationError("synthetic turn identity is bound to different input")
                 if attempt.resolution is TurnRecoveryResolution.COMMITTED:
-                    stored_response = await self._load_external_response(
+                    completion = await self._load_committed_completion(
                         session_id,
                         turn_id,
                         execution_id,
                     )
-                    if stored_response is not None and stored_response != response:
-                        raise ConfigurationError("external turn result identity conflicts")
+                    stored_response = completion.get("response") if completion is not None else None
+                    if not isinstance(stored_response, str) or not stored_response.strip():
+                        raise ConfigurationError("synthetic turn committed result is missing")
+                    if stored_response != response:
+                        raise ConfigurationError("synthetic turn result identity conflicts")
+                    stored_contract = (
+                        FinalResponseContract.from_completion_metadata(stored_response, completion)
+                        if completion is not None
+                        else response_contract
+                    )
                     await self._reload_execution_record()
                     return await self._external_result(
                         session_id,
-                        response if stored_response is None else stored_response,
+                        stored_response,
                         turn_id,
                         sink=sink,
                         emit_completion=True,
+                        response_contract=stored_contract,
                     )
                 if (
                     attempt.resolution is not None
                     or attempt.status is TurnRecoveryStatus.INDETERMINATE
                 ):
                     raise ConfigurationError(
-                        "external turn is already resolved or indeterminate; replay is disabled"
+                        "synthetic turn is already resolved or indeterminate; replay is disabled"
                     )
             else:
                 if any(item.resolution is None for item in attempts):
                     raise ConfigurationError(
-                        "session has another unresolved turn; external replay is disabled"
+                        "session has another unresolved turn; synthetic replay is disabled"
                     )
                 await self._store.start_turn_attempt(
                     TurnRecoveryAttempt.create(
@@ -530,26 +681,30 @@ class AgentConversation:
             )
             if not any(isinstance(item, Message) for item in current_items):
                 current_items = (*current_items, Message(Role.SYSTEM, self._runtime.system_prompt))
-            user_message = Message(Role.USER, prompt, content_parts=parts)
+            user_message = Message(Role.USER, prompt, content_parts=tuple(content_parts))
             assistant_message = Message(Role.ASSISTANT, response)
             result_items = (*current_items, user_message, assistant_message)
             sequence = await self._store.next_event_sequence(session_id)
-            response_contract = FinalResponseContract.committed(
-                response,
-                source=ResponseSource.EXTERNAL_RESULT,
+            response_event = (
+                AgentEvent.create(sequence, AgentEventKind.TEXT_DELTA, {"text": response})
+                if persist_response_event
+                else None
             )
+            completion_sequence = sequence + 1 if response_event is not None else sequence
+            event_data: dict[str, object] = {
+                "turn_id": turn_id,
+                "ultracode_execution_id": execution_id,
+                "ultracode_decision": decision.value,
+                "response": response,
+                "step": 0,
+                **response_contract.to_completion_metadata(),
+            }
+            if response_contract.source is ResponseSource.EXTERNAL_RESULT:
+                event_data["external_execution"] = True
             event = AgentEvent.create(
-                sequence,
+                completion_sequence,
                 AgentEventKind.TURN_COMPLETED,
-                {
-                    "turn_id": turn_id,
-                    "ultracode_execution_id": execution_id,
-                    "ultracode_decision": decision.value,
-                    "external_execution": True,
-                    "response": response,
-                    "step": 0,
-                    **response_contract.to_completion_metadata(),
-                },
+                event_data,
             )
             outcome = AgentExecutionOutcome(
                 AgentExecutionStatus.COMPLETED,
@@ -557,13 +712,14 @@ class AgentConversation:
                 finalized=False,
                 recoverable=False,
             )
-            record = SessionExecutionRecord(outcome, sequence, event.created_at)
+            record = SessionExecutionRecord(outcome, completion_sequence, event.created_at)
             await self._store.finalize_turn(
                 session_id,
                 event,
                 result_items,
                 record,
                 turn_id,
+                committed_response_event=response_event,
             )
             self._items = tuple(result_items)
             self._execution_record = record
@@ -574,6 +730,9 @@ class AgentConversation:
                 turn_id,
                 sink=sink,
                 completion_event=event,
+                response_event=response_event,
+                verification=verification,
+                response_contract=response_contract,
             )
 
     async def replay_committed_turn(
@@ -584,6 +743,7 @@ class AgentConversation:
         execution_id: str,
         content_parts: Sequence[ContentPart] = (),
         verification_requirements: VerificationRequirementsSnapshot | None = None,
+        verification_workspace_mutation_id: str | None = None,
         sink: EventSink | None = None,
     ) -> AgentRunResult:
         """Project an already committed parent turn without committing again.
@@ -612,6 +772,7 @@ class AgentConversation:
                 parts,
                 TurnSource.USER,
                 verification_requirements=verification_requirements,
+                verification_workspace_mutation_id=verification_workspace_mutation_id,
             )
             attempts = await self._store.load_turn_attempts(session_id)
             attempt = next((item for item in attempts if item.turn_id == turn_id), None)
@@ -679,8 +840,10 @@ class AgentConversation:
         *,
         sink: EventSink | None,
         completion_event: AgentEvent | None = None,
+        response_event: AgentEvent | None = None,
         emit_completion: bool = False,
         response_contract: FinalResponseContract | None = None,
+        verification: VerificationReport | None = None,
     ) -> AgentRunResult:
         if response_contract is None:
             response_contract = FinalResponseContract.committed(
@@ -689,7 +852,9 @@ class AgentConversation:
             )
         elif response_contract.response != response or not response_contract.is_committed:
             raise ConfigurationError("replayed turn response contract is invalid")
-        delta = AgentEvent.create(0, AgentEventKind.TEXT_DELTA, {"text": response})
+        delta = response_event or AgentEvent.create(
+            0, AgentEventKind.TEXT_DELTA, {"text": response}
+        )
         events: list[AgentEvent] = [delta]
         if sink is not None:
             outcome = sink(delta)
@@ -732,6 +897,7 @@ class AgentConversation:
             self._execution_record.outcome if self._execution_record is not None else None,
             turn_id,
             response_contract=response_contract,
+            verification=verification,
         )
 
     async def inspect_recovery(self) -> tuple[TurnRecoveryInspection, ...]:
@@ -803,6 +969,10 @@ class AgentConversation:
                 if handoff.input.verification_requirements is not None:
                     runtime_kwargs["verification_requirements"] = (
                         handoff.input.verification_requirements
+                    )
+                if handoff.input.verification_workspace_mutation_id is not None:
+                    runtime_kwargs["verification_workspace_mutation_id"] = (
+                        handoff.input.verification_workspace_mutation_id
                     )
                 result = await self._runtime.run(handoff.input.prompt, **runtime_kwargs)
             except asyncio.CancelledError:
