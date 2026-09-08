@@ -1657,9 +1657,9 @@ TestRunner、UI contract 或 UltraCode 集成；这些属于后续工作。
 损坏的 snapshot 会被视为无效恢复输入并失败关闭，不会退化为 Legacy 模式。不增加数据库列或 migration。保存的
 plan 执行不会推断 task-specific requirements；面向用户的 plan handoff 遵循 VF-3c 描述的普通回合 default policy。
 
-当前 UltraCode delegation 路径无法保持结构化 requirements 语义，因此结构化请求会在创建 parent session 或 durable
-execution claim 之前被拒绝。Legacy UltraCode 请求保持既有行为。Requirement discovery、acquisition、blocker producer
-和 UltraCode verification propagation 不属于本切片。
+VF-3b 的 propagation boundary 现在由下方严格限定的 VF-4a MAIN_MAX 集成扩展。结构化 `BOUNDED_SWARM`
+request 仍会在创建 parent session 或 durable execution claim 之前被拒绝；Legacy UltraCode request 保持既有行为。
+Requirement discovery、acquisition、blocker producer 和 BOUNDED_SWARM verification execution 不属于本切片。
 
 ## VF-3c：普通 Agent 验证获取边界
 
@@ -1680,6 +1680,25 @@ generic finalizer projection 使用保守文案：当前检查成功时只能描
 `A recognized verification check passed after the workspace changes.`，不会声称所有测试或所有行为都已验证。
 现有 `VerificationTracker` 仍是唯一可变 verification truth owner，VF-2 仍是 final-response boundary。本切片不增加自动发现、
 framework/package-manager detection、专用 TestRunner、UI/schema 变更或 UltraCode verification integration。
+
+## VF-4a：持久化 MAIN_MAX 验证 snapshot
+
+显式 Ultracode entry 只在 `MAIN_MAX` 分支支持结构化 verification。application 会在持久化 parent `TurnInput`、claim
+durable Ultracode execution 和启动 parent model turn 之前冻结一个 effective `VerificationRequirementsSnapshot`。
+缺少 request 时由 `NormalTurnRequirementsPolicy` 只解析一次；显式 snapshot（包括空 snapshot）保持完全一致。同一个
+snapshot 及其 fingerprint 同时由 `TurnInput` 和不可变 `UltracodeExecution` identity 携带，因此 retry 或 recovery
+改变 request 会成为 identity conflict，而不是重新解释。
+
+既有 `orchestration_ultracode_executions` table 只增加 schema-30 的两个 nullable column：
+`verification_requirements_json` 与 `verification_requirements_fingerprint`。两个 NULL 永久表示 Legacy 模式；结构化
+row 必须是规范、有界且 fingerprint 匹配的 snapshot。Partial、损坏、超限或被篡改的值都会 fail closed。Schema 29 row
+迁移时不改变 Legacy 语义。
+
+MAIN_MAX 将精确持久化 snapshot 交给既有普通 Agent runtime；verification 和 final-response owner 不变。已提交的
+MAIN_MAX parent 恢复时只重放精确 durable completion，不重新调用 Provider、verification、Finalizer 或执行第二个 turn。
+`BOUNDED_SWARM` 继续使用 Legacy `None` requirement 模式；任何结构化 request 都在 durable branch claim 前拒绝，不会到达
+Swarm、worker、adoption 或 Provider。本切片不增加 worker-level verification、result-adoption verification、requirement
+inference、discovery 或 public interface change。
 
 ## 面向 Prompt Cache 的模型请求投影与用量
 
@@ -1853,13 +1872,14 @@ Writable workflow 现在只从实际 parent `ConversationBinding` 所绑定 sess
 保留 reasoning 与保留 backend-call 的结构都会排除；assistant 可见正文可与
 `reasoning_content` 明确分离，后者绝不进入 Relay。
 
-Session schema 29 保留 schema 17 的每个 writable lease 一条一对一、insert-only READY Relay，
+Session schema 30 保留 schema 17 的每个 writable lease 一条一对一、insert-only READY Relay，
 以及下述持久化 Task DAG 表、schema 20 的 predecessor-result Relay 表和 schema 21 的 Task DAG
 recovery-claim fence；schema 22 增加有界 DAG capacity 与 scoped Writable lease policy，schema 23
 增加逐节点 execution-owner identity，schema 24 增加 parallel-aware Leader decision projection，
 schema 25 增加下文的 bounded model-planning attempt/proposal projection，schema 26 增加 bounded
 DAG replan attempt/proposal projection，schema 27 增加下文描述的 bounded Agent Swarm run projection，schema 28 增加下文描述的
 durable Ultracode delegation projection，schema 29 增加下文描述的 durable Result Adoption projection，
+schema 30 增加下文描述的 MAIN_MAX verification snapshot columns，
 并保留后文的持久化 Leader attempt/decision 投影。
 其 identity
 绑定 parent/task/child、lease、worktree、baseline checkpoint、base commit、
@@ -1906,7 +1926,7 @@ Parallel node 通过 typed `TaskDagWritableWorkerFactory` 获得全新的 Writab
 这样既保留冻结的每 worker `asyncio.Lock`，也使每个节点拥有独立的 binding、lease、worktree、
 checkpoint、child session、Parent Relay 和 worker-scoped LSP state。
 
-当前 Session schema 29 在 `task_dags` 与 `task_dag_nodes` 中保存不可变 DAG 定义和有界节点运行投影，
+当前 Session schema 30 在 `task_dags` 与 `task_dag_nodes` 中保存不可变 DAG 定义和有界节点运行投影，
 并在 `task_dag_dependency_relays` 中保存 insert-only 的 predecessor-result Relay，同时在独立的
 `task_dag_recovery_claims` 中保存跨进程 ownership fence。定义和 Relay 发布都是 insert-only；graph
 与 node 生命周期更新使用 generation CAS。成功节点记录精确的 worker task、child session、writable lease、
@@ -1960,7 +1980,7 @@ node definition 与 durable outcome metadata，并对 preview 脱敏、带 finge
 transcript/reasoning/tool argument/output、Relay payload、workspace bytes、checkpoint bytes、Git
 diff、secret 或 arbitrary path。
 
-当前 Session Store schema 29 保留 schema 19 新增的 `leader_attempts` 与 `leader_decisions` 投影。Attempt 绑定精确 DAG
+当前 Session Store schema 30 保留 schema 19 新增的 `leader_attempts` 与 `leader_decisions` 投影。Attempt 绑定精确 DAG
 generation、definition/evidence/objective fingerprint、Leader session、controller owner、turn
 identity 与 durable lifecycle。SQLite write transaction 和 CAS-like state transition 保证同一精确
 snapshot 只有一个 controller 拥有 model request。Controller 必须在 provider call 紧邻之前，使用
@@ -2000,7 +2020,7 @@ CAS；wave seam 只 claim selected ID，创建独立 Writable service，并使�
 填充未选择的 node。`max_parallel=1` 继续兼容 one-node path。
 
 Session schema 24 增加了 parent-session、selected-node 和 selected-generation decision projection，
-并迁移已填充的 schema-23 row；当前 schema 29 保留这些 projection。Crash 后只有每个 selected node 仍在记录的 READY generation，或
+并迁移已填充的 schema-23 row；当前 schema 30 保留这些 projection。Crash 后只有每个 selected node 仍在记录的 READY generation，或
 已经 durable advanced 到 RUNNING/terminal 时，durable wave decision 才能复用；不会推断 provider
 replay 安全。Partial claim、controller race、failure、cancellation、skipped descendant 和
 indeterminate branch 保留既有 Task DAG recovery semantics。Leader 仍不拥有 Writable、Worktree、
@@ -2033,7 +2053,7 @@ Parser 保留冻结的 Task DAG limits：最多 8 个 node、16 条 edge、每 n
 和其他 graph 规则仍由规范 Task DAG service 拒绝。Model text 只是 data，不包含 authority field。
 
 Schema 25 新增 insert-only 的 `orchestration_planning_attempts` 与 `orchestration_plan_proposals`；当前
-schema 29 保留这些 projection。
+schema 30 保留这些 projection。
 Planning attempt 绑定调用方精确 planning ID、真实 parent session、objective/context fingerprint、专用
 planner session/turn、预分配 intended DAG ID、provider lifecycle、proposal fingerprint 和已发布 DAG identity。
 生命周期为 `CLAIMED -> PROVIDER_FENCED -> MODEL_COMMITTED -> PROPOSAL_PUBLISHED -> DAG_PUBLISHED ->
@@ -2159,9 +2179,12 @@ Ultracode marker policy 共用这一边界定义。超过边界且包含 marker 
 Ultracode branch claim 之前选择 `MAIN_MAX`。这是决策前的上限，不是 claim 后的 fallback，恢复仍会
 复用已有的 durable decision。
 
-Session schema 28 增加 insert-once 的 `orchestration_ultracode_executions` projection；当前 schema 29 保留该 projection。不可变
-identity 绑定实际 parent session、精确 parent turn、input/context fingerprint、provider/model/context
-provenance、一个 decision 与一个下游 identity。`BEGIN IMMEDIATE`、process-liveness ownership
+Session schema 28 增加 insert-once 的 `orchestration_ultracode_executions` projection；当前 schema 30 保留该 projection。
+Schema 30 在该 projection 中增加两个 nullable column：`verification_requirements_json` 与
+`verification_requirements_fingerprint`。两个值均为 NULL 时永久保持 legacy 的无结构化 parent requirement
+语义；结构化 row 必须同时包含规范值，且 fingerprint 必须匹配 snapshot。Partial、损坏、超限或非规范值都会
+fail closed。不可变 identity 绑定实际 parent session、精确 parent turn、input/context fingerprint、provider/model/context
+provenance、一个 decision、一个下游 identity，以及存在时精确的 MAIN_MAX parent verification snapshot。`BEGIN IMMEDIATE`、process-liveness ownership
 和 generation CAS 保护 `DECIDED -> MAIN_MAX_RUNNING` 或 `DECIDED -> BOUNDED_SWARM_RUNNING`
 选择；随后只允许 `FINALIZING`、`COMPLETED` 或 `INDETERMINATE`。失败、取消、fence 丢失或
 可观察但不确定的 branch 永远不会切换到另一条 branch。
@@ -2207,7 +2230,7 @@ link-like traversal、special file、仅 mode 变化、Neuro 受保护状态、c
 与 root 外 target 都 fail closed。第一版上限为 8 个 source worker、64 个 target file、target image 总计 32 MiB、
 单个 file image 8 MiB 与 relative path 4 KiB。
 
-Session schema 29 增加 insert-only 的 `result_adoptions` 与逐 target 的 `result_adoption_targets` projection。Durable
+Session schema 29 增加 insert-only 的 `result_adoptions` 与逐 target 的 `result_adoption_targets` projection；当前 schema 30 保留这些 projection。Durable
 lifecycle 为 `CLAIMED -> VERIFIED -> APPLYING -> VERIFYING -> COMPLETED`，终态包括 `CONFLICT`、`FAILED` 与
 `INDETERMINATE`。每个 target 记录 `NOT_STARTED`、`APPLYING`、`RETRYABLE`、`APPLIED`、`CONFLICT`、`FAILED` 或
 `INDETERMINATE`。在任何可观察 target mutation 前，expected pre-image、desired image、operation、path 与 fingerprint
@@ -2227,7 +2250,8 @@ composition slice 提供。详见 [ADR 0143](adr/0143-bounded-durable-result-ado
 Production-shaped acceptance 覆盖真实临时 Git 的 A/B/C/D process boundary：durable Plan 在 controller death 后保留且不重复写入；尝试写入后
 死亡时从 desired image 确认 `APPLIED`；durable `APPLYING` 后出现第三方 image 时变为 `INDETERMINATE`，保留原 bytes 且零 retry write；已完成的
 adoption 由 fresh composition 重入时返回相同 durable result，且不产生新的 filesystem、Plan、target、worker、Worktree、Checkpoint 或 approval
-副作用。Schema 28→29 migration 与重复 schema-29 initialization 会保留旧 rows 与 adoption projection。
+副作用。Schema 28→29 migration 与重复 schema-30 initialization 会保留旧 rows、adoption projection 和可选的
+MAIN_MAX verification snapshot columns。
 
 ### Automatic Ultracode 结果采纳集成
 

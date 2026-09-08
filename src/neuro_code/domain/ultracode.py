@@ -19,6 +19,10 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
+from neuro_code.domain.execution.verification_requirements import (
+    VerificationRequirementsSnapshot,
+)
+
 MAX_ULTRACODE_EXECUTION_ID_BYTES = 128
 MAX_ULTRACODE_PARENT_TURN_ID_BYTES = 512
 MAX_ULTRACODE_FINGERPRINT_BYTES = 64
@@ -191,6 +195,7 @@ class UltracodeExecution:
     updated_at: datetime
     final_response: str | None = None
     final_result_fingerprint: str | None = None
+    verification_requirements: VerificationRequirementsSnapshot | None = None
 
     def __post_init__(self) -> None:
         _safe_identifier(
@@ -255,6 +260,14 @@ class UltracodeExecution:
             field_name="Ultracode final response",
             limit=MAX_ULTRACODE_RESULT_BYTES,
         )
+        if self.verification_requirements is not None and not isinstance(
+            self.verification_requirements,
+            VerificationRequirementsSnapshot,
+        ):
+            raise TypeError(
+                "Ultracode verification requirements must be a "
+                "VerificationRequirementsSnapshot or None"
+            )
         if self.final_result_fingerprint is not None:
             _fingerprint(
                 self.final_result_fingerprint,
@@ -295,6 +308,7 @@ class UltracodeExecution:
             and self.provider_name == other.provider_name
             and self.model_name == other.model_name
             and self.context_affinity == other.context_affinity
+            and self.verification_requirements == other.verification_requirements
         )
 
 

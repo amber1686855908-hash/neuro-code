@@ -147,10 +147,6 @@ class SessionTurnService:
             raise ValueError("conversation runner is bound to a different session")
         effort = getattr(self._runner, "reasoning_effort", None)
         if request.turn_source is TurnSource.USER and effort is ReasoningEffort.ULTRACODE:
-            if request.verification_requirements is not None:
-                raise ConfigurationError(
-                    "Ultracode delegation does not support structured verification requirements"
-                )
             if self._ultracode_delegate is None:
                 raise ConfigurationError("Ultracode delegation entry is not configured")
             return await self._ultracode_delegate(request, sink)

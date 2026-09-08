@@ -2428,8 +2428,8 @@ async def test_spawned_replan_controllers_have_one_winner_and_one_provider_call(
         assert attempt.state is DagReplanAttemptState.COMPLETED
 
 
-def test_schema_29_is_current_and_replan_tables_are_foreign_key_restricted() -> None:
-    assert SCHEMA_VERSION == 29
+def test_schema_30_is_current_and_replan_tables_are_foreign_key_restricted() -> None:
+    assert SCHEMA_VERSION == 30
 
 
 @pytest.mark.asyncio
@@ -2452,7 +2452,7 @@ async def test_schema_25_to_29_migration_preserves_populated_dag_and_session() -
         with closing(sqlite3.connect(database)) as connection:
             assert connection.execute(
                 "SELECT version FROM schema_meta WHERE singleton = 1"
-            ).fetchone() == (29,)
+            ).fetchone() == (30,)
             assert connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' "
                 "AND name IN ('orchestration_dag_replan_attempts', "

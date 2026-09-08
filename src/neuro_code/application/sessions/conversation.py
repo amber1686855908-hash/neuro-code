@@ -421,11 +421,17 @@ class AgentConversation:
         decision: UltracodeDelegationDecision,
         content_parts: Sequence[ContentPart] = (),
         sink: EventSink | None = None,
+        verification_requirements: VerificationRequirementsSnapshot | None = None,
     ) -> AgentRunResult:
         """Commit one already-produced bounded result without calling a Provider.
 
         The exact turn identity is reused for idempotent recovery; a committed
         turn never appends a second assistant message.
+
+        ``verification_requirements`` binds the durable ``TurnInput`` identity
+        for an already-produced external result.  It does not claim that the
+        external result was verification-aware; this boundary continues to
+        use ``EXTERNAL_RESULT`` and is not the MAIN_MAX verification path.
 
         在不调用 Provider 的前提下提交一个已生成的有界结果.恢复时复用精确回合身份,
         已提交回合绝不会再次追加 assistant 消息。
@@ -469,7 +475,12 @@ class AgentConversation:
                 self._source_model = summary.model
                 self._source_context_affinity = summary.context_affinity
 
-            turn_input = TurnInput(prompt, parts, TurnSource.USER)
+            turn_input = TurnInput(
+                prompt,
+                parts,
+                TurnSource.USER,
+                verification_requirements=verification_requirements,
+            )
             attempts = await self._store.load_turn_attempts(session_id)
             attempt = next((item for item in attempts if item.turn_id == turn_id), None)
             if attempt is not None:
@@ -565,12 +576,88 @@ class AgentConversation:
                 completion_event=event,
             )
 
+    async def replay_committed_turn(
+        self,
+        prompt: str,
+        *,
+        turn_id: str,
+        execution_id: str,
+        content_parts: Sequence[ContentPart] = (),
+        verification_requirements: VerificationRequirementsSnapshot | None = None,
+        sink: EventSink | None = None,
+    ) -> AgentRunResult:
+        """Project an already committed parent turn without committing again.
+
+        Recovery reuses the durable completion and its metadata.  It never
+        calls a provider, creates a second attempt, or turns a missing legacy
+        verification report into a successful one.
+        """
+
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("committed turn prompt must not be empty")
+        if not isinstance(turn_id, str) or not turn_id.strip():
+            raise ValueError("committed turn id must not be empty")
+        if not isinstance(execution_id, str) or not execution_id.strip():
+            raise ValueError("committed execution id must not be empty")
+        parts = tuple(content_parts)
+        if not all(isinstance(part, ContentPart) for part in parts):
+            raise TypeError("committed turn content parts must be canonical")
+
+        async with self._turn_lock:
+            session_id = self._session_id
+            if session_id is None:
+                raise ConfigurationError("committed turn recovery requires a persisted session")
+            turn_input = TurnInput(
+                prompt,
+                parts,
+                TurnSource.USER,
+                verification_requirements=verification_requirements,
+            )
+            attempts = await self._store.load_turn_attempts(session_id)
+            attempt = next((item for item in attempts if item.turn_id == turn_id), None)
+            if attempt is None or attempt.resolution is not TurnRecoveryResolution.COMMITTED:
+                raise ConfigurationError("committed turn recovery requires a committed attempt")
+            if attempt.input_fingerprint != turn_input.fingerprint:
+                raise ConfigurationError("committed turn identity is bound to different input")
+            completion = await self._load_committed_completion(
+                session_id,
+                turn_id,
+                execution_id,
+            )
+            if completion is None:
+                raise ConfigurationError("committed turn result is missing its exact response")
+            response = completion.get("response")
+            if not isinstance(response, str) or not response.strip():
+                raise ConfigurationError("committed turn result is missing its exact response")
+            await self._reload_execution_record()
+            return await self._external_result(
+                session_id,
+                response,
+                turn_id,
+                sink=sink,
+                emit_completion=True,
+                response_contract=FinalResponseContract.from_completion_metadata(
+                    response,
+                    completion,
+                ),
+            )
+
     async def _load_external_response(
         self,
         session_id: str,
         turn_id: str,
         execution_id: str,
     ) -> str | None:
+        completion = await self._load_committed_completion(session_id, turn_id, execution_id)
+        response = completion.get("response") if completion is not None else None
+        return response if isinstance(response, str) and response.strip() else None
+
+    async def _load_committed_completion(
+        self,
+        session_id: str,
+        turn_id: str,
+        execution_id: str,
+    ) -> dict[str, object] | None:
         for raw_event in await self._store.load_events(session_id):
             if raw_event.get("kind") != AgentEventKind.TURN_COMPLETED.value:
                 continue
@@ -581,7 +668,7 @@ class AgentConversation:
                 continue
             response = data.get("response")
             if isinstance(response, str) and response.strip():
-                return response
+                return data
         return None
 
     async def _external_result(
@@ -593,11 +680,15 @@ class AgentConversation:
         sink: EventSink | None,
         completion_event: AgentEvent | None = None,
         emit_completion: bool = False,
+        response_contract: FinalResponseContract | None = None,
     ) -> AgentRunResult:
-        response_contract = FinalResponseContract.committed(
-            response,
-            source=ResponseSource.EXTERNAL_RESULT,
-        )
+        if response_contract is None:
+            response_contract = FinalResponseContract.committed(
+                response,
+                source=ResponseSource.EXTERNAL_RESULT,
+            )
+        elif response_contract.response != response or not response_contract.is_committed:
+            raise ConfigurationError("replayed turn response contract is invalid")
         delta = AgentEvent.create(0, AgentEventKind.TEXT_DELTA, {"text": response})
         events: list[AgentEvent] = [delta]
         if sink is not None:

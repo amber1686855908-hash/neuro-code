@@ -1866,7 +1866,7 @@ tool-role, synthetic, tool-call-bearing, media-bearing, preserved reasoning,
 and preserved backend-call structures are excluded; assistant visible prose is
 separable from and never carries its `reasoning_content`.
 
-Session schema 29 retains the schema-17 one-to-one insert-only READY relay per
+Session schema 30 retains the schema-17 one-to-one insert-only READY relay per
 writable lease, the durable Task DAG tables described below, the schema-20
 predecessor-result relay table, and the schema-21 Task DAG recovery-claim
 fence; schema 22 adds bounded DAG capacity and scoped Writable lease policy,
@@ -1938,7 +1938,7 @@ Parallel nodes receive fresh Writable application services from a typed
 `asyncio.Lock` while giving each node independent binding, lease, worktree,
 checkpoint, child session, Parent Relay, and worker-scoped LSP state.
 
-The current Session schema 29 stores immutable DAG definitions and bounded node runtime
+The current Session schema 30 stores immutable DAG definitions and bounded node runtime
 projections in `task_dags` and `task_dag_nodes`, plus insert-only
 `task_dag_dependency_relays` and the separate `task_dag_recovery_claims`
 cross-process ownership fence. Definitions and relay publications are
@@ -2017,7 +2017,7 @@ transcript/reasoning/tool arguments/output, Relay payloads, workspace bytes,
 checkpoint bytes, Git diffs, secrets, or arbitrary paths. The current
 parallel-aware extension is specified by ADR 0137 below.
 
-The current Session Store schema 29 retains the schema-19 `leader_attempts` and
+The current Session Store schema 30 retains the schema-19 `leader_attempts` and
 `leader_decisions` projections. An attempt binds the exact DAG generation,
 definition/evidence/objective fingerprints, Leader session, controller owner,
 turn identity, and durable lifecycle. SQLite write transactions and CAS-like
@@ -2073,7 +2073,7 @@ and uses a structured `TaskGroup`. It never fills unused capacity with an
 unselected node. `max_parallel=1` remains compatible with the one-node path.
 
 Session schema 24 added parent-session, selected-node, and selected-generation
-decision projections and migrated populated schema-23 rows; current schema 29
+decision projections and migrated populated schema-23 rows; current schema 30
 retains them. A durable wave
 decision can be reused after a crash only when each selected node is still at
 its recorded READY generation or has advanced durably to RUNNING/terminal;
@@ -2120,7 +2120,7 @@ other graph rules are still rejected by the canonical Task DAG service. Model
 text is data and contains no authority fields.
 
 Schema 25 added insert-only `orchestration_planning_attempts` and
-`orchestration_plan_proposals`; current schema 29 retains them. A planning attempt binds the caller's exact
+`orchestration_plan_proposals`; current schema 30 retains them. A planning attempt binds the caller's exact
 planning ID, actual parent session, objective/context fingerprints, dedicated
 planner session and turn, a preallocated intended DAG ID, provider lifecycle,
 proposal fingerprint, and published DAG identity. Its lifecycle is
@@ -2297,10 +2297,17 @@ Ultracode branch claim. This is a pre-decision bound, not a post-claim
 fallback, and recovery continues to reuse an existing durable decision.
 
 Session schema 28 added the insert-once
-`orchestration_ultracode_executions` projection; current schema 29 retains it.
+`orchestration_ultracode_executions` projection; current schema 30 retains it.
+Schema 30 adds two nullable columns to that existing projection:
+`verification_requirements_json` and
+`verification_requirements_fingerprint`. Both NULL values preserve the
+legacy absence of a structured parent requirement forever; a structured row
+must contain both canonical values and the fingerprint must match the
+snapshot. Malformed, partial, oversized, or non-canonical values fail closed.
 Its immutable identity binds
 the actual parent session, exact parent turn, input/context fingerprints,
-provider/model/context provenance, one decision, and one downstream identity.
+provider/model/context provenance, one decision, one downstream identity, and
+the exact MAIN_MAX parent verification snapshot when present.
 `BEGIN IMMEDIATE`, process-liveness ownership, and generation CAS protect the
 `DECIDED -> MAIN_MAX_RUNNING` or `DECIDED -> BOUNDED_SWARM_RUNNING` choice.
 The bounded lifecycle then records `FINALIZING`, `COMPLETED`, or
@@ -2323,6 +2330,19 @@ attempt fails closed unless the exact lower Swarm identity already exists and
 can be resumed by the existing Swarm service. There is no latest-row lookup,
 timestamp correlation, text matching, silent fallback, or duplicate assistant
 append.
+
+For a fresh `MAIN_MAX` execution, `None` is resolved exactly once by
+`NormalTurnRequirementsPolicy`; an explicit non-empty or empty
+`VerificationRequirementsSnapshot` is preserved as the effective parent
+input. The snapshot is frozen into both `TurnInput` and the durable Ultracode
+identity before the parent model turn begins. Structured `BOUNDED_SWARM`
+requests fail closed before a durable branch claim (and, for a fresh request,
+before parent-session creation); legacy BOUNDED_SWARM requests continue with
+no structured snapshot. If a MAIN_MAX parent turn is already committed when
+the controller recovers, the existing exact completion is replayed through a
+dedicated projection seam. Recovery performs no provider, verification, or
+finalizer rerun and never uses the external-result commit boundary to
+manufacture a structured verified completion.
 
 The parent `ConversationBinding` remains the capability ceiling. The entry
 adds no filesystem, Bash, LSP, MCP, network, Worktree, Checkpoint, or Writable
@@ -2404,8 +2424,9 @@ a third-party image after durable `APPLYING` becomes `INDETERMINATE` with its
 bytes preserved and no retry write; and a completed adoption re-entered by a
 fresh composition returns the same durable result with no new filesystem,
 plan, target, worker, Worktree, Checkpoint, or approval side effects. Schema
-28-to-29 migration and repeated schema-29 initialization preserve existing
-rows and the adoption projections.
+28-to-29 migration and repeated schema-30 initialization preserve existing
+rows, the adoption projections, and the optional MAIN_MAX verification snapshot
+columns.
 
 ### Automatic Ultracode result adoption integration
 
@@ -3025,11 +3046,12 @@ migration is added. Saved-plan execution does not infer task-specific
 requirements; a user-facing plan handoff follows the normal default policy
 described in VF-3c.
 
-The current UltraCode delegation path cannot preserve structured requirement
-semantics, so a structured request is rejected before parent-session creation
-or a durable execution claim. Legacy UltraCode requests retain their existing
-behavior. Requirement discovery, acquisition, blocker producers, and UltraCode
-verification propagation remain outside this slice.
+The VF-3b propagation boundary is now extended by the narrowly scoped VF-4a
+MAIN_MAX integration described below. Structured `BOUNDED_SWARM` requests
+remain rejected before parent-session creation or a durable execution claim;
+legacy UltraCode requests retain their existing behavior. Requirement
+discovery, acquisition, blocker producers, and BOUNDED_SWARM verification
+execution remain outside this slice.
 
 ## VF-3c normal-agent verification acquisition boundary
 
@@ -3064,6 +3086,36 @@ verified. The existing `VerificationTracker` remains the sole mutable truth
 owner, and VF-2 remains the final-response boundary. This slice adds no
 automatic discovery, framework/package-manager detection, dedicated test
 runner, UI/schema change, or UltraCode verification integration.
+
+## VF-4a durable MAIN_MAX verification snapshot
+
+The explicit Ultracode entry supports structured verification only on its
+`MAIN_MAX` branch. The application freezes one effective
+`VerificationRequirementsSnapshot` before persisting the parent `TurnInput`,
+claiming the durable Ultracode execution, or starting the parent model turn.
+An absent request is resolved once by `NormalTurnRequirementsPolicy`; an
+explicit snapshot, including an empty one, is preserved exactly. The same
+snapshot and its fingerprint are carried by `TurnInput` and the immutable
+`UltracodeExecution` identity, so changing the request on retry or recovery
+is an identity conflict rather than a new interpretation.
+
+The existing `orchestration_ultracode_executions` table gains only the two
+nullable schema-30 columns
+`verification_requirements_json` and
+`verification_requirements_fingerprint`. A pair of NULLs is permanent legacy
+mode. A structured row must contain a canonical, bounded, fingerprint-matched
+snapshot; partial, malformed, oversized, or tampered values fail closed.
+Schema 29 rows migrate without changing their legacy semantics.
+
+MAIN_MAX passes the exact persisted snapshot to the existing normal Agent
+runtime, which remains the sole verification and final-response owner.
+Recovery of a committed MAIN_MAX parent uses the existing durable completion
+through a dedicated replay projection and performs no Provider, verification,
+Finalizer, or duplicate-turn execution. `BOUNDED_SWARM` keeps its legacy
+`None` requirement mode; any structured request is rejected before a durable
+branch claim and does not reach Swarm, workers, adoption, or a Provider. This
+slice does not add worker-level verification, result-adoption verification,
+requirement inference, discovery, or a public interface change.
 
 ## Cache-friendly model request projection and usage
 
