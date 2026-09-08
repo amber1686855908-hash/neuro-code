@@ -26,6 +26,12 @@ from neuro_code.domain.result_adoption import (
 )
 from neuro_code.domain.worktree import WorktreeRepositoryIdentity, WorktreeSnapshot
 
+# This exact durable target error kind records the only production transition
+# from an already observed desired image to an indeterminate outcome.  It lets
+# the parent-workspace freshness projection retain the historical APPLIED fact
+# without adding a schema column or interpreting arbitrary error text.
+RESULT_ADOPTION_POST_APPLY_CONCURRENT_MODIFICATION = "post_apply_concurrent_modification"
+
 
 class ResultAdoptionError(Exception):
     """Bounded fail-closed error at the result-adoption boundary."""
@@ -148,6 +154,21 @@ class ResultAdoptionTargetRecord:
         if isinstance(self.version, bool) or not isinstance(self.version, int) or self.version < 0:
             raise ValueError("result adoption target version must be non-negative")
 
+    @property
+    def reached_applied(self) -> bool:
+        """Return whether this durable target reached its desired image.
+
+        A target may become ``INDETERMINATE`` after it was ``APPLIED`` during
+        final verification.  The transition is represented by the exact
+        canonical error kind above.  An indeterminate target reached before
+        any desired image was observed does not satisfy this projection.
+        """
+
+        return self.state is ResultAdoptionTargetState.APPLIED or (
+            self.state is ResultAdoptionTargetState.INDETERMINATE
+            and self.error_kind == RESULT_ADOPTION_POST_APPLY_CONCURRENT_MODIFICATION
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class ResultAdoptionRecord:
@@ -217,6 +238,22 @@ class ResultAdoptionRecord:
             if record.state is ResultAdoptionTargetState.APPLIED
         )
 
+    @property
+    def parent_workspace_changed(self) -> bool:
+        """Return whether adoption durably reached a desired parent image.
+
+        ``APPLIED`` is an observation that the target's desired image is
+        present.  It does not prove that this controller performed the write:
+        recovery may have observed an image written before a crash.  The
+        projection is therefore deliberately a weaker, durable fact about the
+        parent workspace rather than a causal write receipt.  A multi-target
+        adoption still represents one logical parent-workspace mutation
+        boundary; callers must use the stable ``adoption_id`` to avoid
+        advancing verification more than once when replaying the record.
+        """
+
+        return any(target.reached_applied for target in self.targets)
+
 
 ProcessLivenessProbe = Callable[[int | None], bool]
 
@@ -279,6 +316,7 @@ class ResultAdoptionStore(Protocol):
 
 
 __all__ = [
+    "RESULT_ADOPTION_POST_APPLY_CONCURRENT_MODIFICATION",
     "ParentWorkspaceProjectionReader",
     "ParentWorkspaceSnapshot",
     "ProcessLivenessProbe",

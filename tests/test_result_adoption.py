@@ -23,6 +23,7 @@ from neuro_code.application.permissions.policy import (
 )
 from neuro_code.application.ports.model import ModelCapabilitySet, ModelProvider, ModelToolPolicy
 from neuro_code.application.ports.result_adoption import (
+    RESULT_ADOPTION_POST_APPLY_CONCURRENT_MODIFICATION,
     ParentWorkspaceSnapshot,
     ResultAdoptionError,
     ResultAdoptionTargetRecord,
@@ -33,7 +34,18 @@ from neuro_code.application.ports.task_dag import TaskDagStore
 from neuro_code.application.ports.tools import ToolContext
 from neuro_code.application.ports.writable_subagent import WritableSubagentLeaseStore
 from neuro_code.application.runtime.agent import AgentRunResult
+from neuro_code.application.runtime.verification import (
+    RequirementEvaluationState,
+    VerificationEvidence,
+    VerificationOutcome,
+    VerificationState,
+    VerificationTracker,
+)
 from neuro_code.application.sessions.binding import ConversationBinding, ConversationRunner
+from neuro_code.application.sessions.requirements import (
+    DEFAULT_NORMAL_MUTATION_REQUIREMENT_ID,
+    DEFAULT_NORMAL_REQUIREMENTS,
+)
 from neuro_code.application.settings import ApplicationSettings
 from neuro_code.application.workflows import result_adoption as result_adoption_workflow
 from neuro_code.application.workflows.result_adoption import ResultAdoptionApplicationService
@@ -301,6 +313,7 @@ def _adoption_marker_payload(
         "adoption_id": record.adoption_id,
         "plan_fingerprint": record.plan_fingerprint,
         "state": record.state.value,
+        "parent_workspace_changed": record.parent_workspace_changed,
         "target_states": [target.state.value for target in record.targets],
         "target_versions": [target.version for target in record.targets],
         "call_paths": [call.path for call in calls],
@@ -623,6 +636,19 @@ class _NoopOnceMutation(_RecordingMutation):
         return await super().apply(request, session_id=session_id)
 
 
+class _ConflictAfterFirstMutation(_RecordingMutation):
+    async def apply(
+        self,
+        request: WorkspaceMutationRequest,
+        *,
+        session_id: str,
+    ) -> WorkspaceMutationResult:
+        result = await super().apply(request, session_id=session_id)
+        if request.path == "A.txt":
+            self.parent.set_entry(_entry("C.txt", EXTERNAL_CONTENT_A), path="C.txt")
+        return result
+
+
 class _FailingParentReader:
     def __init__(self, parent: _MutableParent, *, fail_on: int) -> None:
         self.parent = parent
@@ -760,6 +786,7 @@ async def _make_fixture(
     overlap: bool = False,
     parent_conflict: bool = False,
     stale_worker: bool = False,
+    no_changes: bool = False,
 ) -> _Fixture:
     os.makedirs(tmp_path, exist_ok=True)
     repository_path = tmp_path / "parent"
@@ -840,7 +867,9 @@ async def _make_fixture(
             branch=None,
             detached=True,
         )
-        if ordinal == 0:
+        if no_changes:
+            live = baseline
+        elif ordinal == 0:
             live = _projection(
                 head_sha,
                 [_entry("A.txt", DESIRED_CONTENT_A), _entry("B.txt", BASE_CONTENT_B)],
@@ -908,8 +937,8 @@ async def _make_fixture(
             owner_pid=1,
             owner_token=f"worker-owner-{ordinal}",
             final_workspace_fingerprint=final_fingerprint,
-            workspace_changed=True,
-            changed_file_count=1,
+            workspace_changed=not no_changes,
+            changed_file_count=0 if no_changes else 1,
         )
         leases[lease_id] = lease
         nodes.append(
@@ -926,7 +955,7 @@ async def _make_fixture(
                 baseline_checkpoint_id=checkpoint_id.value,
                 relay_id=f"relay-worker-{ordinal}",
                 final_workspace_fingerprint=final_fingerprint,
-                changed_file_count=1,
+                changed_file_count=0 if no_changes else 1,
             )
         )
     if stale_worker:
@@ -1030,7 +1059,73 @@ async def test_adoption_is_three_way_idempotent_and_preserves_unrelated_dirty_fi
     assert len(fixture.mutation.calls) == 2
     persisted = await fixture.store.get_result_adoption(fixture.request.adoption_id)
     assert persisted == result
+    assert result.parent_workspace_changed
+    assert recovered.parent_workspace_changed
+    assert persisted.parent_workspace_changed
     assert all(target.state is ResultAdoptionTargetState.APPLIED for target in persisted.targets)
+
+
+@pytest.mark.asyncio
+async def test_noop_adoption_does_not_project_parent_workspace_change(tmp_path: Path) -> None:
+    fixture = await _make_fixture(tmp_path, no_changes=True)
+
+    result = await fixture.service.adopt(fixture.request)
+
+    assert result.state is ResultAdoptionState.COMPLETED
+    assert result.plan.targets == ()
+    assert result.applied_paths == ()
+    assert not result.parent_workspace_changed
+    assert fixture.mutation.calls == []
+
+    recovered = await fixture.new_service().adopt(fixture.request)
+
+    assert recovered == result
+    assert not recovered.parent_workspace_changed
+    assert fixture.mutation.calls == []
+
+
+@pytest.mark.asyncio
+async def test_one_logical_adoption_advances_parent_verification_once(tmp_path: Path) -> None:
+    fixture = await _make_fixture(tmp_path)
+    adoption = await fixture.service.adopt(fixture.request)
+    replayed = await fixture.new_service().adopt(fixture.request)
+    assert adoption.parent_workspace_changed
+    assert replayed == adoption
+
+    # This models the future VF-4c bridge: one durable adoption record, even
+    # when observed again during recovery, is one parent mutation boundary.
+    tracker = VerificationTracker(requirements=DEFAULT_NORMAL_REQUIREMENTS)
+    seen_adoptions: set[str] = set()
+
+    def record_parent_change(record: Any) -> None:
+        if record.parent_workspace_changed and record.adoption_id not in seen_adoptions:
+            seen_adoptions.add(record.adoption_id)
+            tracker.record_workspace_mutation()
+
+    record_parent_change(adoption)
+    record_parent_change(replayed)
+    assert tracker.workspace_generation == 1
+    tracker.record_verification(
+        VerificationEvidence(
+            "bash",
+            VerificationOutcome.SUCCESS,
+            "1 passed",
+            ("bash:test",),
+            0,
+            (DEFAULT_NORMAL_MUTATION_REQUIREMENT_ID,),
+        )
+    )
+    assert tracker.report().state is VerificationState.PASS
+
+    second = replace(
+        adoption,
+        plan=replace(adoption.plan, adoption_id="adopt-result-adoption-second"),
+    )
+    record_parent_change(second)
+    assert tracker.workspace_generation == 2
+    report = tracker.report()
+    assert report.state is VerificationState.INCOMPLETE
+    assert report.requirement_evaluations[0].state is RequirementEvaluationState.STALE
 
 
 @pytest.mark.asyncio
@@ -1879,7 +1974,24 @@ async def test_result_adoption_reconciles_mutation_failures_and_final_verificati
     )
     assert raced_target is not None
     assert raced_target.state is ResultAdoptionTargetState.INDETERMINATE
+    assert raced_target.error_kind == RESULT_ADOPTION_POST_APPLY_CONCURRENT_MODIFICATION
+    assert raced.parent_workspace_changed
     assert race_fixture.parent.current("A.txt") == _entry("A.txt", EXTERNAL_CONTENT_A)
+
+
+@pytest.mark.asyncio
+async def test_partial_conflict_retains_applied_parent_workspace_fact(tmp_path: Path) -> None:
+    fixture = await _make_fixture(tmp_path)
+    mutation = _ConflictAfterFirstMutation(fixture.parent)
+    fixture.service._mutation = mutation  # type: ignore[attr-defined]
+
+    result = await fixture.service.adopt(fixture.request)
+
+    assert result.state is ResultAdoptionState.CONFLICT
+    assert result.targets[0].state is ResultAdoptionTargetState.APPLIED
+    assert result.targets[1].state is ResultAdoptionTargetState.CONFLICT
+    assert result.parent_workspace_changed
+    assert [call.path for call in mutation.calls] == ["A.txt"]
 
 
 @pytest.mark.asyncio
@@ -1895,6 +2007,7 @@ async def test_parent_same_path_conflict_is_durable_and_has_zero_writes(tmp_path
     target = await fixture.store.get_result_adoption_target(fixture.request.adoption_id, 0)
     assert target is not None
     assert target.state is ResultAdoptionTargetState.CONFLICT
+    assert not result.parent_workspace_changed
 
 
 @pytest.mark.asyncio
@@ -1973,6 +2086,7 @@ async def test_fresh_controller_recovers_applying_target_without_rewriting_desir
     recovered = await fixture.new_service().adopt(fixture.request)
 
     assert recovered.state is ResultAdoptionState.COMPLETED
+    assert recovered.parent_workspace_changed
     assert [call.path for call in fixture.mutation.calls] == ["C.txt"]
 
 
@@ -1993,6 +2107,7 @@ async def test_fresh_controller_marks_neither_image_indeterminate_without_overwr
     target = await fixture.store.get_result_adoption_target(fixture.request.adoption_id, 0)
     assert target is not None
     assert target.state is ResultAdoptionTargetState.INDETERMINATE
+    assert not recovered.parent_workspace_changed
 
 
 @pytest.mark.asyncio
@@ -2604,6 +2719,7 @@ async def test_real_composed_writable_task_dag_and_adoption_preserve_worker_evid
         assert a_payload["adoption_id"] == "adopt-real-composed-a"
         assert a_payload["plan_fingerprint"] == a_plan_fingerprint
         assert a_payload["state"] == ResultAdoptionState.COMPLETED.value
+        assert a_payload["parent_workspace_changed"] is True
         assert a_payload["target_states"] == [
             ResultAdoptionTargetState.APPLIED.value,
             ResultAdoptionTargetState.APPLIED.value,
@@ -2612,6 +2728,7 @@ async def test_real_composed_writable_task_dag_and_adoption_preserve_worker_evid
         a_record = await application.store.get_result_adoption("adopt-real-composed-a")
         assert a_record is not None
         assert a_record.state is ResultAdoptionState.COMPLETED
+        assert a_record.parent_workspace_changed
         assert a_record.plan_fingerprint == a_plan_fingerprint
         assert (repository_path / "A.txt").read_bytes() == DESIRED_CONTENT_A
         assert (repository_path / "C.txt").read_bytes() == DESIRED_CONTENT_C
@@ -2654,6 +2771,7 @@ async def test_real_composed_writable_task_dag_and_adoption_preserve_worker_evid
         )
 
         assert result.state is ResultAdoptionState.COMPLETED
+        assert result.parent_workspace_changed
         assert [call.path for call in recovery_mutation.calls] == ["C.txt"]
         assert (repository_path / "A.txt").read_bytes() == DESIRED_CONTENT_A
         assert (repository_path / "B.txt").read_bytes() == BASE_CONTENT_B
@@ -2722,6 +2840,7 @@ async def test_real_composed_writable_task_dag_and_adoption_preserve_worker_evid
         assert c_payload["adoption_id"] == "adopt-real-composed-c"
         assert c_payload["plan_fingerprint"] == c_l1.plan_fingerprint
         assert c_payload["state"] == ResultAdoptionState.INDETERMINATE.value
+        assert c_payload["parent_workspace_changed"] is False
         assert c_payload["target_states"] == [
             ResultAdoptionTargetState.INDETERMINATE.value,
             ResultAdoptionTargetState.NOT_STARTED.value,
@@ -2731,6 +2850,7 @@ async def test_real_composed_writable_task_dag_and_adoption_preserve_worker_evid
         assert c_after_l2 is not None
         assert c_after_l2.plan == c_l1.plan
         assert c_after_l2.state is ResultAdoptionState.INDETERMINATE
+        assert c_after_l2.parent_workspace_changed is False
         assert c_after_l2.targets[0].state is ResultAdoptionTargetState.INDETERMINATE
         assert c_after_l2.targets[0].observed_fingerprint == workspace_entry_fingerprint(
             _entry("A.txt", EXTERNAL_CONTENT_A)
@@ -2769,6 +2889,7 @@ async def test_real_composed_writable_task_dag_and_adoption_preserve_worker_evid
         d_payload = json.loads(d_marker.read_text(encoding="ascii"))
         assert d_payload["adoption_id"] == "adopt-real-composed-d"
         assert d_payload["state"] == ResultAdoptionState.COMPLETED.value
+        assert d_payload["parent_workspace_changed"] is True
         assert d_payload["call_paths"] == []
         d_before_l2 = await application.store.get_result_adoption("adopt-real-composed-d")
         assert d_before_l2 is not None
@@ -2803,6 +2924,7 @@ async def test_real_composed_writable_task_dag_and_adoption_preserve_worker_evid
         assert d_payload_recovered["adoption_id"] == "adopt-real-composed-d"
         assert d_payload_recovered["plan_fingerprint"] == d_before_l2.plan_fingerprint
         assert d_payload_recovered["state"] == ResultAdoptionState.COMPLETED.value
+        assert d_payload_recovered["parent_workspace_changed"] is True
         assert d_payload_recovered["target_states"] == [
             ResultAdoptionTargetState.APPLIED.value,
             ResultAdoptionTargetState.APPLIED.value,
