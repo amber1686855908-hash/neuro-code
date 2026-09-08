@@ -1687,7 +1687,12 @@ framework/package-manager detection、专用 TestRunner、UI/schema 变更或 Ul
 durable Ultracode execution 和启动 parent model turn 之前冻结一个 effective `VerificationRequirementsSnapshot`。
 缺少 request 时由 `NormalTurnRequirementsPolicy` 只解析一次；显式 snapshot（包括空 snapshot）保持完全一致。同一个
 snapshot 及其 fingerprint 同时由 `TurnInput` 和不可变 `UltracodeExecution` identity 携带，因此 retry 或 recovery
-改变 request 会成为 identity conflict，而不是重新解释。
+改变 request 会成为 identity conflict，而不是重新解释。VF-4c 将同一规则扩展到结构化 `BOUNDED_SWARM`：它不会在
+Swarm 之前创建旧式 parent attempt，也不会提交 lower Swarm response，而是先运行 canonical Swarm、采纳 durable
+result，再使用精确 snapshot 及（若 adoption 改变了 parent）一个 adoption identity 作为 parent mutation seed 启动真实
+parent `AgentRuntime`。Verification、finalization 和 committed response 仍由 parent runtime 拥有。未解决的 adoption
+会通过 parent-owned deterministic fallback 结束，不会宣称 verification 成功。带 NULL snapshot 的 Legacy
+`BOUNDED_SWARM` row 继续使用历史 external-result path。
 
 既有 `orchestration_ultracode_executions` table 只增加 schema-30 的两个 nullable column：
 `verification_requirements_json` 与 `verification_requirements_fingerprint`。两个 NULL 永久表示 Legacy 模式；结构化
@@ -1696,9 +1701,34 @@ row 必须是规范、有界且 fingerprint 匹配的 snapshot。Partial、损�
 
 MAIN_MAX 将精确持久化 snapshot 交给既有普通 Agent runtime；verification 和 final-response owner 不变。已提交的
 MAIN_MAX parent 恢复时只重放精确 durable completion，不重新调用 Provider、verification、Finalizer 或执行第二个 turn。
-`BOUNDED_SWARM` 继续使用 Legacy `None` requirement 模式；任何结构化 request 都在 durable branch claim 前拒绝，不会到达
-Swarm、worker、adoption 或 Provider。本切片不增加 worker-level verification、result-adoption verification、requirement
-inference、discovery 或 public interface change。
+VF-4a 保持带 NULL requirement snapshot 的 Legacy `BOUNDED_SWARM` row 不变；结构化 BOUNDED_SWARM 支持由下方 VF-4c
+规定。本切片不增加 worker-level verification、result-adoption verification、requirement inference、discovery 或
+public interface change。
+
+## VF-4c：结构化 BOUNDED_SWARM parent verification
+
+VF-4c 在不改变 Swarm、worker、Planner、Leader、DAG 或 Result Adoption owner 的前提下完成 `BOUNDED_SWARM` 的结构化
+verification 路径。新的 request 缺少声明时由 `NormalTurnRequirementsPolicy` 只解析一次；显式非空和空 snapshot 保持
+完全一致。Effective snapshot 持久化在既有 schema-30 Ultracode columns 与 parent `TurnInput` 中。已持久化的结构化
+row 必须使用同一个 snapshot 恢复；Legacy NULL row 永远保持 Legacy，尝试改变 mode 或 snapshot identity 会 fail closed。
+不增加 schema 31。
+
+结构化 execution 只有一个 durable orchestration identity，不会预先创建旧式 external parent attempt。它运行 canonical
+bounded Swarm，通过既有 Result Adoption service 采纳 durable result，然后使用原始 prompt、parent turn identity、execution
+identity 和精确 snapshot 调用 parent `AgentRuntime`。当 `parent_workspace_changed` 为 true 时，将稳定的 `adoption_id`
+作为一个 parent mutation seed 传入；parent `VerificationTracker` 会在第一个 model step 前只记录这一个事实。任何层都不会
+直接修改 tracker generation，也不会导入 worker verification evidence。
+
+只有 parent runtime 可以生成 parent committed response。成功 adoption 会穿过既有 VF-2 final-response boundary，并可执行
+正常的 parent tools 与 verification。Conflict 或 indeterminate adoption 不会变成 verification `FAIL`，而是通过
+parent-owned deterministic、truth-safe fallback 结束；该 fallback 不是 lower Swarm response。结构化 recovery 复用精确的
+Swarm、adoption、parent-attempt 和 committed-response identity，不会重放已完成的 lower work、重复调用 Provider 或
+Finalizer、创建第二个 turn，或提交重复 assistant item。
+
+Legacy BOUNDED_SWARM path、MAIN_MAX 行为、CLI/TUI/ACP projection、permission/sandbox 边界和既有 schema 保持兼容。
+Worker 继续在不携带 parent requirements 的模式下运行；requirement discovery、verification acquisition、TestRunner/
+framework detection 和 public verification UI 不在本切片范围内。VF-4c 完成 Verification Foundation 序列；后续工作属于
+产品能力或 stabilization，而不是新的 verification-foundation slice。
 
 ## 面向 Prompt Cache 的模型请求投影与用量
 
@@ -2266,7 +2296,10 @@ runtime truth owner。`ResultAdoptionRecord.parent_workspace_changed` 在至少�
 [ADR 0144](adr/0144-automatic-ultracode-result-adoption-integration.md) 增加显式 `ULTRACODE` entry 与内部 Result Adoption
 core 之间唯一的有界 composition seam。`MAIN_MAX` 保持普通单智能体语义，并执行零次 adoption activity。`BOUNDED_SWARM`
 必须先产生精确的 canonical terminal `AgentSwarmResult`，再把这个 typed result 与实际 parent `ConversationBinding` 传给
-Result Adoption。只有 adoption 达到 `COMPLETED` 后才提交 parent external turn；只有 parent commit 成功后 Ultracode 才达到
+Result Adoption。Legacy execution 在 adoption 达到 `COMPLETED` 后提交有界 external result；结构化 execution 则在 adoption
+之后启动真实 parent AgentRuntime，由既有 VerificationTracker 在 durable target 到达 `APPLIED` 时只记录一次 mutation seed，
+并由该 runtime 提交唯一的 parent response。Conflict 或 indeterminate outcome 通过同一个 parent-owned deterministic fallback
+接缝结束；lower Swarm response 绝不会被当作已验证的 parent truth。只有选定的 parent completion path 成功后 Ultracode 才达到
 `COMPLETED`。
 
 Adoption identity 从精确的 Ultracode execution 与 Swarm run identity 确定性推导。`CONFLICT`、`FAILED` 与

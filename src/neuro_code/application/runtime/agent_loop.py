@@ -115,6 +115,7 @@ from neuro_code.domain.execution import (
     TurnCancellationPolicy,
     TurnInput,
     TurnRecoveryAttempt,
+    TurnRecoveryStatus,
     TurnSource,
     VerificationRequirementsSnapshot,
 )
@@ -300,6 +301,8 @@ class AgentLoopRunner:
         turn_source: TurnSource = TurnSource.USER,
         verification_required: bool = False,
         verification_requirements: VerificationRequirementsSnapshot | None = None,
+        verification_workspace_mutation_id: str | None = None,
+        resume_existing_attempt: bool = False,
     ) -> AgentRunResult:
         prompt_parts = tuple(content_parts)
         if ultracode_execution_id is not None and (
@@ -322,6 +325,19 @@ class AgentLoopRunner:
             raise TypeError("cancellation_policy must be a TurnCancellationPolicy")
         if not isinstance(verification_required, bool):
             raise TypeError("verification_required must be a bool")
+        if verification_workspace_mutation_id is not None and (
+            not isinstance(verification_workspace_mutation_id, str)
+            or not verification_workspace_mutation_id.strip()
+            or "\x00" in verification_workspace_mutation_id
+            or len(verification_workspace_mutation_id.encode("utf-8")) > 512
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in verification_workspace_mutation_id
+            )
+        ):
+            raise ValueError("verification workspace mutation id must be a bounded safe identifier")
+        if not isinstance(resume_existing_attempt, bool):
+            raise TypeError("resume_existing_attempt must be a bool")
         if verification_requirements is not None and not isinstance(
             verification_requirements,
             VerificationRequirementsSnapshot,
@@ -341,6 +357,11 @@ class AgentLoopRunner:
             verification_required=verification_required,
             requirements=verification_requirements,
         )
+        if verification_workspace_mutation_id is not None:
+            # Result Adoption supplies one durable parent-workspace fact.  The
+            # tracker remains the sole owner of generation; this seed is only
+            # the exact first mutation observation for the new parent run.
+            verification_tracker.record_workspace_mutation()
         turn_started_at = monotonic()
         context_items = list(initial_items)
         messages = [item for item in context_items if isinstance(item, Message)]
@@ -386,13 +407,6 @@ class AgentLoopRunner:
         if plan_execution_requested and self._context_builder.plan is None:
             raise ConfigurationError("cannot execute a plan that has not been saved")
         session_task: SessionTask | None = None
-        if self._session_store is not None and session_id is not None:
-            open_attempts = await self._session_store.load_open_turn_attempts(session_id)
-            if open_attempts:
-                raise ConfigurationError(
-                    "session has an unresolved interrupted turn; explicitly abandon it "
-                    "before starting another turn"
-                )
         queued_plan_task: SessionTask | None = None
         if plan_execution_requested:
             assert self._session_store is not None
@@ -429,35 +443,54 @@ class AgentLoopRunner:
                 plan_execution_requested,
                 session_task.task_id if session_task is not None else plan_execution_task_id,
                 verification_requirements=verification_requirements,
+                verification_workspace_mutation_id=verification_workspace_mutation_id,
             )
-            attempt = TurnRecoveryAttempt.create(
-                turn_id=turn_id,
-                session_id=session_id,
-                input=turn_input,
-                task_id=(
-                    session_task.task_id
-                    if session_task is not None
-                    else queued_plan_task.task_id
-                    if queued_plan_task is not None
-                    else None
-                ),
-                accepted_at=datetime.now(UTC),
-            )
-            if plan_execution_requested:
-                if queued_plan_task is None:
-                    assert session_task is not None
-                    session_task = await self._session_store.start_plan_turn_attempt(
-                        attempt,
-                        task=session_task,
-                    )
-                else:
-                    session_task = await self._session_store.start_plan_turn_attempt(
-                        attempt,
-                        queued_task_id=queued_plan_task.task_id,
-                        started_at=datetime.now(UTC),
+            attempts = await self._session_store.load_turn_attempts(session_id)
+            exact_attempt = next((item for item in attempts if item.turn_id == turn_id), None)
+            open_attempts = [item for item in attempts if item.resolution is None]
+            if resume_existing_attempt and exact_attempt is not None:
+                if exact_attempt.input_fingerprint != turn_input.fingerprint:
+                    raise ConfigurationError("resumed turn input identity conflicts")
+                if exact_attempt.status is not TurnRecoveryStatus.SAFELY_RETRYABLE:
+                    raise ConfigurationError("resumed turn attempt is not safely retryable")
+                if any(item.turn_id != turn_id for item in open_attempts):
+                    raise ConfigurationError(
+                        "session has another unresolved interrupted turn; recovery is disabled"
                     )
             else:
-                await self._session_store.start_turn_attempt(attempt)
+                if open_attempts:
+                    raise ConfigurationError(
+                        "session has an unresolved interrupted turn; explicitly abandon it "
+                        "before starting another turn"
+                    )
+                attempt = TurnRecoveryAttempt.create(
+                    turn_id=turn_id,
+                    session_id=session_id,
+                    input=turn_input,
+                    task_id=(
+                        session_task.task_id
+                        if session_task is not None
+                        else queued_plan_task.task_id
+                        if queued_plan_task is not None
+                        else None
+                    ),
+                    accepted_at=datetime.now(UTC),
+                )
+                if plan_execution_requested:
+                    if queued_plan_task is None:
+                        assert session_task is not None
+                        session_task = await self._session_store.start_plan_turn_attempt(
+                            attempt,
+                            task=session_task,
+                        )
+                    else:
+                        session_task = await self._session_store.start_plan_turn_attempt(
+                            attempt,
+                            queued_task_id=queued_plan_task.task_id,
+                            started_at=datetime.now(UTC),
+                        )
+                else:
+                    await self._session_store.start_turn_attempt(attempt)
 
         recorder = TurnEventRecorder(
             sink=sink,

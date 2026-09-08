@@ -2283,7 +2283,14 @@ class _ProductionPlanningProvider:
             None,
         )
         if node_id is None:
-            raise AssertionError("worker fixture could not identify its node")
+            # Structured BOUNDED_SWARM now runs the real parent AgentRuntime
+            # after adoption.  A parent request has no planning-node marker;
+            # keep this fixture's ordinary terminal response deterministic so
+            # the test exercises the parent verification boundary rather than
+            # pretending the parent is another worker.
+            self._state.zero_tool_calls += 1
+            yield ModelCompleted("stop", response_text="planned DAG completed")
+            return
         if not tools:
             raise AssertionError("Writable worker unexpectedly received no tools")
         if node_id == "d":

@@ -143,6 +143,8 @@ class ConversationRunner(Protocol):
         turn_id: str | None = None,
         ultracode_execution_id: str | None = None,
         verification_requirements: VerificationRequirementsSnapshot | None = None,
+        verification_workspace_mutation_id: str | None = None,
+        resume_existing_attempt: bool = False,
     ) -> AgentRunResult: ...
 
     async def ensure_persisted_session(self) -> str: ...
@@ -156,6 +158,22 @@ class ConversationRunner(Protocol):
         execution_id: str,
         decision: UltracodeDelegationDecision,
         content_parts: Sequence[ContentPart] = (),
+        sink: EventSink | None = None,
+    ) -> AgentRunResult: ...
+
+    async def commit_deterministic_turn(
+        self,
+        prompt: str,
+        *,
+        turn_id: str,
+        execution_id: str,
+        decision: UltracodeDelegationDecision,
+        content_parts: Sequence[ContentPart] = (),
+        verification_requirements: VerificationRequirementsSnapshot | None = None,
+        verification_workspace_mutation_id: str | None = None,
+        workspace_changes: Sequence[str] = (),
+        unverified_items: Sequence[str] = (),
+        blocker: str | None = None,
         sink: EventSink | None = None,
     ) -> AgentRunResult: ...
 

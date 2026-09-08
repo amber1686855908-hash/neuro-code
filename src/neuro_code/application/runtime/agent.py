@@ -375,6 +375,8 @@ class AgentRuntime:
         turn_source: TurnSource = TurnSource.USER,
         verification_required: bool = False,
         verification_requirements: VerificationRequirementsSnapshot | None = None,
+        verification_workspace_mutation_id: str | None = None,
+        resume_existing_attempt: bool = False,
     ) -> AgentRunResult:
         """Run one agent turn through the canonical main loop.
 
@@ -397,6 +399,8 @@ class AgentRuntime:
             turn_source=turn_source,
             verification_required=verification_required,
             verification_requirements=verification_requirements,
+            verification_workspace_mutation_id=verification_workspace_mutation_id,
+            resume_existing_attempt=resume_existing_attempt,
         )
 
     async def trigger_context_compaction(

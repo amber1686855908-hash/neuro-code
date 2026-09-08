@@ -284,8 +284,13 @@ class UltracodeExecution:
             self.final_response is None or self.final_result_fingerprint is None
         ):
             raise ValueError("completed Ultracode execution requires its terminal result")
-        if self.state is UltracodeExecutionState.FINALIZING and (
-            self.final_response is None or self.final_result_fingerprint is None
+        if (
+            self.state is UltracodeExecutionState.FINALIZING
+            and (self.final_response is None or self.final_result_fingerprint is None)
+            and not (
+                self.decision is UltracodeDelegationDecision.BOUNDED_SWARM
+                and self.verification_requirements is not None
+            )
         ):
             raise ValueError("finalizing Ultracode execution requires its pending result")
 
