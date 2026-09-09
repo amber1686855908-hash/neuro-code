@@ -1561,6 +1561,39 @@ class _FakeRuntimeFactory:
         return self.runtime
 
 
+class _CancelAfterLeaseTransitionStore:
+    """Test-only seam for cancellation after a durable lease CAS succeeds."""
+
+    def __init__(
+        self,
+        delegate: SqliteSessionStore,
+        target_state: WritableSubagentWorkspaceState,
+    ) -> None:
+        self._delegate = delegate
+        self._target_state = target_state
+        self.injected = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+    async def compare_and_transition_writable_subagent_lease(
+        self,
+        lease: WritableSubagentWorkspaceLease,
+        *,
+        expected_version: int,
+        expected_state: WritableSubagentWorkspaceState,
+    ) -> WritableSubagentWorkspaceLease:
+        transitioned = await self._delegate.compare_and_transition_writable_subagent_lease(
+            lease,
+            expected_version=expected_version,
+            expected_state=expected_state,
+        )
+        if not self.injected and transitioned.state is self._target_state:
+            self.injected = True
+            raise asyncio.CancelledError
+        return transitioned
+
+
 class _CrashGuardProvider:
     provider_name = "fixture"
     model_name = "fixture-model"
@@ -7359,6 +7392,42 @@ extensions = [".py", ".txt"]
             self.assertIs(task.status, SessionTaskStatus.CANCELLED)
             self.assertTrue(factory.runtime.closed)
             self.assertIsNotNone(await store.get_parent_context_relay_for_lease(leases[0].lease_id))
+
+    async def test_cancellation_after_durable_transition_reloads_authoritative_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (
+                service,
+                store,
+                _parent,
+                _worktrees,
+                _checkpoints,
+                factory,
+                _parent_capabilities,
+                parent_session_id,
+            ) = await self._service(root)
+            race_store = _CancelAfterLeaseTransitionStore(
+                store,
+                WritableSubagentWorkspaceState.BASELINE_READY,
+            )
+            service._lease_store = cast(WritableSubagentLeaseStore, race_store)
+
+            with self.assertRaises(asyncio.CancelledError):
+                await service.run_subagent(
+                    RunWritableSubagentRequest(parent_session_id, "cancel after durable CAS"),
+                )
+
+            self.assertTrue(race_store.injected)
+            self.assertIsNone(factory.runtime)
+            leases = await store.list_writable_subagent_leases(parent_session_id=parent_session_id)
+            self.assertEqual(len(leases), 1)
+            self.assertIs(leases[0].state, WritableSubagentWorkspaceState.PRESERVED)
+            self.assertIsNotNone(leases[0].worktree)
+            self.assertIsNotNone(leases[0].baseline_checkpoint_id)
+            self.assertEqual(leases[0].error_kind, "CancelledError")
+            task = await store.get_session_task(parent_session_id, leases[0].parent_task_id)
+            self.assertIsNotNone(task)
+            self.assertIs(task.status, SessionTaskStatus.CANCELLED)
 
     async def test_service_validates_entry_points_and_initializes_idempotently(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

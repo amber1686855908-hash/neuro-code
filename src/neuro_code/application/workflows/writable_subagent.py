@@ -120,6 +120,45 @@ def _same_repository(
     )
 
 
+def _same_writable_lease_cleanup_identity(
+    local: WritableSubagentWorkspaceLease,
+    durable: WritableSubagentWorkspaceLease,
+) -> bool:
+    """Accept only the same owner while allowing durable lifecycle progress.
+
+    A cancelled await may leave the caller with a lease snapshot from before a
+    successful durable transition.  The fields that identify the logical lease
+    and its execution owner must still match; optional derived fields may only
+    have been filled in by the durable snapshot.
+    """
+
+    if (
+        local.lease_id != durable.lease_id
+        or local.parent_session_id != durable.parent_session_id
+        or local.parent_task_id != durable.parent_task_id
+        or local.worktree_id != durable.worktree_id
+        or local.parent_capability_fingerprint != durable.parent_capability_fingerprint
+        or local.parent_workspace_root != durable.parent_workspace_root
+        or local.parent_repository != durable.parent_repository
+        or local.base_commit_sha != durable.base_commit_sha
+        or local.canonical_child_root != durable.canonical_child_root
+        or local.execution_scope is not durable.execution_scope
+        or local.owner_pid != durable.owner_pid
+        or local.owner_token != durable.owner_token
+    ):
+        return False
+    for local_value, durable_value in (
+        (local.worktree, durable.worktree),
+        (local.baseline_checkpoint_id, durable.baseline_checkpoint_id),
+        (local.child_session_id, durable.child_session_id),
+        (local.capability_fingerprint, durable.capability_fingerprint),
+        (local.grant_fingerprint, durable.grant_fingerprint),
+    ):
+        if local_value is not None and local_value != durable_value:
+            return False
+    return True
+
+
 @runtime_checkable
 class WritableWorktreeApplication(Protocol):
     @property
@@ -639,6 +678,7 @@ class WritableSubagentApplicationService:
         lease: WritableSubagentWorkspaceLease,
         failure: BaseException,
     ) -> WritableSubagentWorkspaceLease:
+        lease = await self._reload_lease_for_cleanup(lease)
         if lease.state.terminal:
             return lease
         return await self._transition(
@@ -702,6 +742,7 @@ class WritableSubagentApplicationService:
         lease: WritableSubagentWorkspaceLease,
         failure: BaseException | None,
     ) -> WritableSubagentWorkspaceLease:
+        lease = await self._reload_lease_for_cleanup(lease)
         if lease.state.terminal:
             return lease
         error_kind = type(failure).__name__ if failure is not None else None
@@ -746,6 +787,21 @@ class WritableSubagentApplicationService:
                 error_kind=error_kind,
             ),
         )
+
+    async def _reload_lease_for_cleanup(
+        self,
+        lease: WritableSubagentWorkspaceLease,
+    ) -> WritableSubagentWorkspaceLease:
+        """Reconcile a possibly stale local lease before terminal cleanup."""
+
+        durable = await self._lease_store.get_writable_subagent_lease(lease.lease_id)
+        if durable is None:
+            raise ConfigurationError("writable subagent lease disappeared during cleanup")
+        if not _same_writable_lease_cleanup_identity(lease, durable):
+            raise ConfigurationError(
+                "writable subagent lease owner identity changed during cleanup"
+            )
+        return durable
 
     async def _close_runtime(
         self,
