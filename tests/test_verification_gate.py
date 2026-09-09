@@ -36,6 +36,7 @@ from neuro_code.application.runtime.verification import (
     RequirementEvaluationState,
     VerificationBlockReason,
     VerificationState,
+    validate_explicit_verification_command,
 )
 from neuro_code.application.sessions.requirements import DEFAULT_NORMAL_REQUIREMENTS
 from neuro_code.domain.conversation.context import ModelContext
@@ -53,6 +54,7 @@ from neuro_code.domain.execution import (
     VerificationRequirement,
     VerificationRequirementsSnapshot,
 )
+from neuro_code.domain.permissions import MAX_VERIFICATION_COMMAND_BYTES
 from neuro_code.domain.tools import ToolDefinition, ToolResult
 from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
 from neuro_code.shared.errors import ProviderError
@@ -180,6 +182,28 @@ class _FixtureTool:
         return self._result
 
 
+class _BlockingVerificationTool:
+    definition = ToolDefinition(
+        name="bash",
+        description="Blocking verification fixture",
+        input_schema={"type": "object", "additionalProperties": False},
+    )
+    side_effecting = True
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    async def execute(
+        self,
+        arguments: Mapping[str, object],
+        context: ToolContext,
+    ) -> ToolResult:
+        del arguments, context
+        self.started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("blocking verification fixture unexpectedly completed")
+
+
 class _RecordingFinalizer:
     def __init__(self, response: str = "evidence-aware response") -> None:
         self.response = response
@@ -282,6 +306,7 @@ def _runtime(
     finalizer: object | None = None,
     session_store: SqliteSessionStore | None = None,
     permissions: PermissionManager | None = None,
+    verification_command: str | None = None,
 ) -> AgentRuntime:
     return AgentRuntime(
         provider=provider,
@@ -295,7 +320,307 @@ def _runtime(
         tool_context=ToolContext(root),
         session_store=session_store,
         finalizer_factory=_factory(finalizer) if finalizer is not None else None,
+        verification_command=verification_command,
     )
+
+
+def test_explicit_verification_command_uses_one_bounded_canonical_contract() -> None:
+    boundary_command = "pytest -q " + "x" * (MAX_VERIFICATION_COMMAND_BYTES - len("pytest -q "))
+    assert validate_explicit_verification_command(boundary_command) == boundary_command
+    assert validate_explicit_verification_command("uv run ruff check .") == "uv run ruff check ."
+    invalid = (
+        "",
+        "echo not verification",
+        "pytest -q && echo unsafe",
+        "pytest -q\n",
+        "pytest -q\x00",
+        boundary_command + "x",
+    )
+    for command in invalid:
+        with pytest.raises((TypeError, ValueError)):
+            validate_explicit_verification_command(command)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("verification_result", "expected_state"),
+    [
+        (ToolResult("2 passed"), VerificationState.PASS),
+        (ToolResult("1 failed", is_error=True), VerificationState.FAIL),
+    ],
+)
+async def test_explicit_command_runs_once_after_mutation_and_records_real_outcome(
+    tmp_path: Path,
+    verification_result: ToolResult,
+    expected_state: VerificationState,
+) -> None:
+    finalizer = _RecordingFinalizer("truthful committed response")
+    provider = _ScriptedProvider(
+        (
+            (_mutation_call(), ModelCompleted("tool_calls")),
+            _terminal_candidate("PROVISIONAL_FALSE_SUCCESS_SENTINEL"),
+        )
+    )
+    bash = _FixtureTool("bash", verification_result, side_effecting=False)
+    result = await _runtime(
+        tmp_path,
+        provider,
+        _Tools(
+            (
+                _FixtureTool("mutate", ToolResult("changed"), side_effecting=True),
+                bash,
+            )
+        ),
+        _FixedWorkspaceObserver(),
+        finalizer=finalizer,
+        verification_command="uv run pytest -q",
+    ).run("change files")
+
+    assert bash.calls == [{"command": "uv run pytest -q"}]
+    assert result.verification is not None
+    assert result.verification.state is expected_state
+    assert finalizer.calls[0][1].verification_state is expected_state
+    assert result.response == "truthful committed response"
+    assert "PROVISIONAL_FALSE_SUCCESS_SENTINEL" not in repr(result.events)
+
+
+@pytest.mark.asyncio
+async def test_explicit_command_does_not_run_for_a_read_only_turn(tmp_path: Path) -> None:
+    provider = _ScriptedProvider(((_terminal_candidate("visible")),))
+    bash = _FixtureTool("bash", ToolResult("must not run"), side_effecting=False)
+
+    def unexpected_factory(*_args: object) -> object:
+        raise AssertionError("read-only turns must not invoke verification finalization")
+
+    result = await _runtime(
+        tmp_path,
+        provider,
+        _Tools((bash,)),
+        _FixedWorkspaceObserver(changed=False),
+        finalizer=unexpected_factory,
+        verification_command="pytest -q",
+    ).run("answer")
+
+    assert bash.calls == []
+    assert result.response == "visible"
+    assert _text_events(result.events) == ["visible"]
+
+
+@pytest.mark.asyncio
+async def test_current_verification_skips_a_second_explicit_command(tmp_path: Path) -> None:
+    provider = _ScriptedProvider(
+        (
+            (_mutation_call(), ModelCompleted("tool_calls")),
+            (_verification_call(), ModelCompleted("tool_calls")),
+            _terminal_candidate("candidate"),
+        )
+    )
+    bash = _FixtureTool("bash", ToolResult("2 passed"), side_effecting=False)
+    finalizer = _RecordingFinalizer("already verified response")
+    result = await _runtime(
+        tmp_path,
+        provider,
+        _Tools(
+            (
+                _FixtureTool("mutate", ToolResult("changed"), side_effecting=True),
+                bash,
+            )
+        ),
+        _FixedWorkspaceObserver(),
+        finalizer=finalizer,
+        verification_command="pytest -q",
+    ).run("change and verify")
+
+    assert bash.calls == [{"command": "pytest -q"}]
+    assert result.verification is not None
+    assert result.verification.state is VerificationState.PASS
+
+
+@pytest.mark.asyncio
+async def test_stale_verification_triggers_one_new_explicit_command(tmp_path: Path) -> None:
+    provider = _ScriptedProvider(
+        (
+            (_mutation_call("mutate-1"), ModelCompleted("tool_calls")),
+            (_verification_call(), ModelCompleted("tool_calls")),
+            (_mutation_call("mutate-2"), ModelCompleted("tool_calls")),
+            _terminal_candidate("candidate"),
+        )
+    )
+    bash = _FixtureTool("bash", ToolResult("2 passed"), side_effecting=False)
+    result = await _runtime(
+        tmp_path,
+        provider,
+        _Tools(
+            (
+                _FixtureTool("mutate", ToolResult("changed"), side_effecting=True),
+                bash,
+            )
+        ),
+        _FixedWorkspaceObserver(),
+        finalizer=_RecordingFinalizer("fresh response"),
+        verification_command="pytest -q",
+    ).run("change twice")
+
+    assert bash.calls == [{"command": "pytest -q"}, {"command": "pytest -q"}]
+    assert result.verification is not None
+    assert result.verification.workspace_generation == 2
+    assert result.verification.state is VerificationState.PASS
+
+
+@pytest.mark.asyncio
+async def test_verification_command_self_mutation_is_observed_before_evidence(
+    tmp_path: Path,
+) -> None:
+    provider = _ScriptedProvider(
+        (
+            (_mutation_call(), ModelCompleted("tool_calls")),
+            _terminal_candidate("candidate"),
+        )
+    )
+    bash = _FixtureTool("bash", ToolResult("2 passed"), side_effecting=True)
+    result = await _runtime(
+        tmp_path,
+        provider,
+        _Tools(
+            (
+                _FixtureTool("mutate", ToolResult("changed"), side_effecting=True),
+                bash,
+            )
+        ),
+        _FixedWorkspaceObserver(),
+        finalizer=_RecordingFinalizer("self-mutating check response"),
+        verification_command="pytest -q",
+    ).run("change files")
+
+    assert bash.calls == [{"command": "pytest -q"}]
+    assert result.verification is not None
+    assert result.verification.workspace_generation == 2
+    assert result.verification.state is VerificationState.PASS
+
+
+@pytest.mark.asyncio
+async def test_explicit_command_permission_denial_is_not_executed_or_reported_as_pass(
+    tmp_path: Path,
+) -> None:
+    provider = _ScriptedProvider(
+        (
+            (_mutation_call(), ModelCompleted("tool_calls")),
+            _terminal_candidate("candidate"),
+        )
+    )
+    bash = _FixtureTool("bash", ToolResult("must not run"), side_effecting=True)
+    result = await _runtime(
+        tmp_path,
+        provider,
+        _Tools(
+            (
+                _FixtureTool("mutate", ToolResult("changed"), side_effecting=True),
+                bash,
+            )
+        ),
+        _FixedWorkspaceObserver(),
+        finalizer=_RecordingFinalizer("permission-limited response"),
+        permissions=PermissionManager(
+            mode=PermissionMode.DONT_ASK,
+            rules=(PermissionRule(PermissionEffect.ALLOW, "mutate"),),
+        ),
+        verification_command="pytest -q",
+    ).run("change files")
+
+    evaluation = _requirement_evaluation(result)
+    assert bash.calls == []
+    assert evaluation.state is RequirementEvaluationState.BLOCKED
+    assert evaluation.blocker_reason is VerificationBlockReason.POLICY_RESTRICTION
+    assert result.verification is not None
+    assert result.verification.evidence == ()
+    assert result.verification.state is VerificationState.INCOMPLETE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rule_effect", [PermissionEffect.ASK, PermissionEffect.DENY])
+async def test_explicit_rule_denial_does_not_fabricate_a_verification_blocker(
+    tmp_path: Path,
+    rule_effect: PermissionEffect,
+) -> None:
+    provider = _ScriptedProvider(
+        (
+            (_mutation_call(), ModelCompleted("tool_calls")),
+            _terminal_candidate("candidate"),
+        )
+    )
+    bash = _FixtureTool("bash", ToolResult("must not run"), side_effecting=True)
+    result = await _runtime(
+        tmp_path,
+        provider,
+        _Tools(
+            (
+                _FixtureTool("mutate", ToolResult("changed"), side_effecting=True),
+                bash,
+            )
+        ),
+        _FixedWorkspaceObserver(),
+        finalizer=_RecordingFinalizer("rule-limited response"),
+        permissions=PermissionManager(
+            interactive=False,
+            mode=PermissionMode.BYPASS,
+            rules=(
+                PermissionRule(PermissionEffect.ALLOW, "mutate"),
+                PermissionRule(rule_effect, "bash:pytest*"),
+            ),
+        ),
+        verification_command="pytest -q",
+    ).run("change files")
+
+    evaluation = _requirement_evaluation(result)
+    assert bash.calls == []
+    assert evaluation.state is RequirementEvaluationState.NO_EVIDENCE
+    assert evaluation.blocker_reason is None
+    assert result.verification is not None
+    assert result.verification.state is VerificationState.INCOMPLETE
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_explicit_verification_does_not_commit_a_response(
+    tmp_path: Path,
+) -> None:
+    store = SqliteSessionStore(tmp_path / "sessions.db")
+    await store.initialize()
+    session_id = await store.create_session(str(tmp_path), "gate-scripted", "gate-model")
+    provider = _ScriptedProvider(
+        (
+            (_mutation_call(), ModelCompleted("tool_calls")),
+            _terminal_candidate("PROVISIONAL_FALSE_SUCCESS_SENTINEL"),
+        )
+    )
+    bash = _BlockingVerificationTool()
+    runtime = _runtime(
+        tmp_path,
+        provider,
+        _Tools(
+            (
+                _FixtureTool("mutate", ToolResult("changed"), side_effecting=True),
+                bash,
+            )
+        ),
+        _FixedWorkspaceObserver(),
+        session_store=store,
+        verification_command="pytest -q",
+    )
+    task = asyncio.create_task(runtime.run("cancel verification", session_id=session_id))
+    await bash.started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    persisted_events = await store.load_events(session_id)
+    assert "PROVISIONAL_FALSE_SUCCESS_SENTINEL" not in repr(persisted_events)
+    assert not any(
+        event["kind"] == AgentEventKind.TURN_COMPLETED.value for event in persisted_events
+    )
+    attempts = await store.load_turn_attempts(session_id)
+    assert len(attempts) == 1
+    assert attempts[0].resolution is TurnRecoveryResolution.CANCELLED
 
 
 def _text_events(events: Sequence[AgentEvent]) -> list[object]:

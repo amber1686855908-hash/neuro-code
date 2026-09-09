@@ -79,6 +79,7 @@ def _application_settings(
             else reasoning_effort or ReasoningEffort.HIGH
         ),
         resume_id=getattr(args, "resume", None),
+        verification_command=getattr(args, "verify_command", None),
     )
 
 

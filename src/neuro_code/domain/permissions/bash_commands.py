@@ -24,13 +24,16 @@ _SENSITIVE_ENV = frozenset(
 )
 _SEPARATORS = frozenset({"&&", "||", ";", "|"})
 _WRAPPERS = frozenset({"timeout", "nice", "ionice", "chrt", "stdbuf", "env"})
+MAX_VERIFICATION_COMMAND_BYTES = 4 * 1024
 
 __all__ = [
+    "MAX_VERIFICATION_COMMAND_BYTES",
     "BashCommandAnalysis",
     "BashCommandFamily",
     "BashCommandSegment",
     "analyze_bash_command",
     "classify_bash_command_family",
+    "validate_verification_command",
 ]
 
 
@@ -487,3 +490,31 @@ def classify_bash_command_family(script: str) -> BashCommandFamily | None:
     if _classify_git_read(words):
         return BashCommandFamily.GIT_READ
     return None
+
+
+def validate_verification_command(value: object) -> str:
+    """Validate one explicit command against the trusted verification shapes.
+
+    This domain contract deliberately accepts only the already-recognized
+    ``pytest`` and static-check command families.  It does not normalize the
+    command, inspect a workspace, or execute anything.
+    """
+
+    if not isinstance(value, str):
+        raise TypeError("verification command must be a string")
+    if not value.strip():
+        raise ValueError("verification command must not be empty")
+    try:
+        command_bytes = len(value.encode("utf-8"))
+    except UnicodeEncodeError as error:
+        raise ValueError("verification command must be valid UTF-8") from error
+    if command_bytes > MAX_VERIFICATION_COMMAND_BYTES:
+        raise ValueError(
+            f"verification command must be at most {MAX_VERIFICATION_COMMAND_BYTES} bytes"
+        )
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError("verification command must not contain control characters")
+    family = classify_bash_command_family(value)
+    if family not in {BashCommandFamily.TEST, BashCommandFamily.STATIC_CHECK}:
+        raise ValueError("verification command must be a recognized pytest or static-check command")
+    return value

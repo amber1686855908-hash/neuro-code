@@ -58,6 +58,30 @@ Inspect effective configuration without exposing secrets:
 PYTHONPATH=src python -m neuro_code inspect --json
 ```
 
+### Explicit verification
+
+Opt into one bounded verification command for ordinary user turns with an
+explicit launch option:
+
+```bash
+uv run neuro -p "Update the parser" --verify-command "uv run pytest -q"
+uv run neuro agent -p "Update the parser" --verify-command "uv run pytest -q"
+uv run neuro code --verify-command "uv run ruff check ."
+```
+
+The command is executed at most once after a workspace mutation when the
+current verification report still needs evidence. It uses the normal Bash
+permission, workspace, sandbox, cancellation, and event pipeline. Only the
+existing recognized `pytest` and static-check command families are accepted;
+unknown, malformed, or oversized commands are rejected before execution. This
+option is explicit and does not discover tests, infer requirements, detect a
+framework, or provide a dedicated test runner. A generic successful result
+means only that the recognized command succeeded for the current workspace; it
+does not claim that all relevant tests ran or that the requested behavior was
+fully validated. The same option is available to the normal TUI launch through
+the shared application settings boundary; ACP does not expose it in this
+slice.
+
 ## Partial ACP v1 stdio
 
 `neuro-code acp` serves a workspace-bound partial ACP v1 implementation over

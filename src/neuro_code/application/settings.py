@@ -10,8 +10,10 @@ from pathlib import Path
 from neuro_code.application.execution_policy import ExecutionBudgetPolicy, ExecutionProfile
 from neuro_code.application.permissions.policy import PermissionMode, PermissionRule
 from neuro_code.application.runtime.supervision import ExecutionControlMode
+from neuro_code.application.runtime.verification import validate_explicit_verification_command
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
 from neuro_code.domain.execution import ExecutionBudget
+from neuro_code.shared.errors import ConfigurationError
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,11 +36,17 @@ class ApplicationSettings:
     execution_control_mode: ExecutionControlMode = ExecutionControlMode.FINALIZE_TERMINAL
     resume_id: str | None = None
     execution_profile: ExecutionProfile = ExecutionProfile.NORMAL
+    verification_command: str | None = None
     _execution_budget: ExecutionBudget = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.execution_profile, ExecutionProfile):
             raise TypeError("execution_profile must be an ExecutionProfile")
+        try:
+            verification_command = validate_explicit_verification_command(self.verification_command)
+        except (TypeError, ValueError) as error:
+            raise ConfigurationError(f"invalid verification command: {error}") from error
+        object.__setattr__(self, "verification_command", verification_command)
         budget = ExecutionBudgetPolicy.resolve(
             self.execution_profile,
             max_steps=self.max_steps,

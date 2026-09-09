@@ -24,6 +24,7 @@ from neuro_code.domain.execution.tasks import TurnSource
 from neuro_code.domain.execution.verification_requirements import (
     VerificationRequirementsSnapshot,
 )
+from neuro_code.domain.permissions.bash_commands import validate_verification_command
 
 MAX_TURN_INPUT_BYTES = 256 * 1024
 MAX_RECOVERY_REASON_BYTES = 512
@@ -132,6 +133,7 @@ class TurnInput:
     plan_execution_task_id: str | None = None
     verification_requirements: VerificationRequirementsSnapshot | None = None
     verification_workspace_mutation_id: str | None = None
+    verification_command: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.prompt, str):
@@ -159,6 +161,8 @@ class TurnInput:
                 self.verification_workspace_mutation_id,
                 field_name="verification_workspace_mutation_id",
             )
+        if self.verification_command is not None:
+            validate_verification_command(self.verification_command)
 
     @property
     def background(self) -> bool:
@@ -180,6 +184,8 @@ class TurnInput:
             payload["verification_requirements"] = self.verification_requirements.to_dict()
         if self.verification_workspace_mutation_id is not None:
             payload["verification_workspace_mutation_id"] = self.verification_workspace_mutation_id
+        if self.verification_command is not None:
+            payload["verification_command"] = self.verification_command
         return payload
 
     def canonical_json(self) -> str:
@@ -208,6 +214,9 @@ class TurnInput:
         mutation_id = value.get("verification_workspace_mutation_id")
         if mutation_id is not None and not isinstance(mutation_id, str):
             raise ValueError("turn input workspace mutation id is invalid")
+        verification_command = value.get("verification_command")
+        if verification_command is not None and not isinstance(verification_command, str):
+            raise ValueError("turn input verification command is invalid")
         if not isinstance(prompt, str) or not isinstance(raw_parts, list):
             raise ValueError("turn input payload is invalid")
         if not isinstance(raw_source, str):
@@ -228,6 +237,7 @@ class TurnInput:
             task_id,
             verification_requirements=verification_requirements,
             verification_workspace_mutation_id=mutation_id,
+            verification_command=verification_command,
         )
 
 

@@ -560,6 +560,29 @@ api_key_env = "FIXTURE_KEY"
         self.assertTrue(all(item.execution_budget.max_tool_rounds == 96 for item in settings))
         self.assertTrue(all(item.execution_budget.max_tool_calls == 384 for item in settings))
 
+    def test_cli_verification_command_is_available_for_root_agent_and_tui(self) -> None:
+        parser = build_parser()
+        settings = tuple(
+            _application_settings(parser.parse_args(arguments))
+            for arguments in (
+                ("--verify-command", "uv run pytest -q", "agent", "-p", "answer"),
+                ("agent", "-p", "answer", "--verify-command", "uv run pytest -q"),
+                ("code", "--verify-command", "uv run ruff check ."),
+            )
+        )
+
+        self.assertEqual(settings[0].verification_command, "uv run pytest -q")
+        self.assertEqual(settings[1].verification_command, "uv run pytest -q")
+        self.assertEqual(settings[2].verification_command, "uv run ruff check .")
+
+    def test_cli_rejects_unrecognized_verification_command_at_settings_boundary(self) -> None:
+        args = build_parser().parse_args(
+            ("agent", "-p", "answer", "--verify-command", "echo unsafe")
+        )
+
+        with self.assertRaisesRegex(ConfigurationError, "invalid verification command"):
+            _application_settings(args)
+
     def test_cli_max_steps_compatibility_override_scales_complete_budget(self) -> None:
         settings = _application_settings(
             build_parser().parse_args(

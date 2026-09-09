@@ -39,6 +39,23 @@ uv run neuro
 uv run neuro-code -p "Explain this repository"
 ```
 
+### 显式执行验证
+
+可以通过显式启动参数，为普通用户回合指定一个有界的验证命令：
+
+```bash
+uv run neuro-code -p "更新解析器" --verify-command "uv run pytest -q"
+uv run neuro-code agent -p "更新解析器" --verify-command "uv run pytest -q"
+uv run neuro-code code --verify-command "uv run ruff check ."
+```
+
+工作区发生修改且当前验证报告仍需要证据时，该命令最多执行一次。执行会复用普通 Bash
+工具的权限、工作区、sandbox、取消和事件流水线。只接受现有已识别的 `pytest` 与静态检查
+命令族；未知、格式错误或超出大小限制的命令会在执行前拒绝。本选项必须由用户显式提供，
+不会发现测试、推断要求、检测框架，也不提供专用测试运行器。通用成功结果只表示当前工作区
+中的已识别命令成功，不表示所有相关测试都已执行，也不表示请求的行为已得到完整验证。普通
+TUI 启动也通过共享的应用设置边界使用该选项；本切片不向 ACP 暴露该选项。
+
 ## 核心能力
 
 - **Coding workflow** — 无头 prompt 和 Textual TUI 共享同一个事件驱动运行时。内置工具覆盖受边界约束的文件查看与搜索、精确替换编辑、Bash、后台任务和计划。
