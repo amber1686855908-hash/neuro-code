@@ -565,6 +565,7 @@ api_key_env = "FIXTURE_KEY"
         settings = tuple(
             _application_settings(parser.parse_args(arguments))
             for arguments in (
+                ("--verify-command", "uv run pytest -q"),
                 ("--verify-command", "uv run pytest -q", "agent", "-p", "answer"),
                 ("agent", "-p", "answer", "--verify-command", "uv run pytest -q"),
                 ("code", "--verify-command", "uv run ruff check ."),
@@ -573,7 +574,43 @@ api_key_env = "FIXTURE_KEY"
 
         self.assertEqual(settings[0].verification_command, "uv run pytest -q")
         self.assertEqual(settings[1].verification_command, "uv run pytest -q")
-        self.assertEqual(settings[2].verification_command, "uv run ruff check .")
+        self.assertEqual(settings[2].verification_command, "uv run pytest -q")
+        self.assertEqual(settings[3].verification_command, "uv run ruff check .")
+
+    def test_cli_rejects_root_verification_command_for_non_run_commands(self) -> None:
+        invalid_arguments = (
+            ("--verify-command", "pytest -q", "acp"),
+            (
+                "--verify-command",
+                "pytest -q",
+                "subagent",
+                "inspect repository",
+                "--parent-session",
+                "parent-session",
+            ),
+            (
+                "--verify-command",
+                "pytest -q",
+                "subagents",
+                "resume",
+                "subagent-task",
+                "--parent-session",
+                "parent-session",
+            ),
+        )
+
+        for arguments in invalid_arguments:
+            with self.subTest(command=arguments[2]):
+                errors = io.StringIO()
+                with redirect_stderr(errors):
+                    exit_code = run(arguments, services=BootstrapCliServices())
+
+                self.assertEqual(exit_code, 2)
+                self.assertEqual(
+                    errors.getvalue(),
+                    "configuration error: --verify-command is only valid for normal, "
+                    "agent, or code runs\n",
+                )
 
     def test_cli_rejects_unrecognized_verification_command_at_settings_boundary(self) -> None:
         args = build_parser().parse_args(

@@ -24,7 +24,10 @@ from neuro_code.interfaces.cli.inspection import (
 from neuro_code.interfaces.cli.parser import build_parser
 from neuro_code.interfaces.cli.session_io import export_session, import_session
 from neuro_code.interfaces.cli.sessions import run_sessions_command
-from neuro_code.interfaces.cli.settings import _application_settings
+from neuro_code.interfaces.cli.settings import (
+    _application_settings,
+    _validate_verification_command_surface,
+)
 from neuro_code.interfaces.cli.subagents import run_subagent, run_subagent_lifecycle
 from neuro_code.shared.errors import ConfigurationError, NeuroCodeError
 
@@ -41,6 +44,7 @@ def run(argv: Sequence[str] | None, *, services: CliServices) -> int:
     parser = build_parser()
     args = parser.parse_args(tuple(sys.argv[1:] if argv is None else argv))
     try:
+        _validate_verification_command_surface(args)
         if args.command == "version":
             return run_version_command(args)
         if args.command == "inspect":
