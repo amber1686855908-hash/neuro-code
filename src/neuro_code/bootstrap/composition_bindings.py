@@ -618,6 +618,9 @@ class CompositionBindingMixin(CompositionRootMixin):
                 execution_control_mode=self.settings.execution_control_mode,
                 final_output_gate_enabled=final_output_gate_enabled,
                 normal_requirements_enabled=normal_requirements_enabled,
+                verification_command=(
+                    self.settings.verification_command if normal_requirements_enabled else None
+                ),
                 compaction_runtime_gate=compaction_gate,
                 provider_context_window=(
                     ProviderContextWindow(

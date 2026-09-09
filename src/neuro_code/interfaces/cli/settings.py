@@ -47,11 +47,22 @@ def _rules(args: argparse.Namespace) -> tuple[PermissionRule, ...]:
     return deny + allow
 
 
+def _validate_verification_command_surface(args: argparse.Namespace) -> None:
+    """Reject root-level verification options for non-run command families."""
+    if "verify_command" in vars(args) and getattr(args, "command", None) not in {
+        None,
+        "agent",
+        "code",
+    }:
+        raise ConfigurationError("--verify-command is only valid for normal, agent, or code runs")
+
+
 def _application_settings(
     args: argparse.Namespace,
     *,
     reasoning_effort: ReasoningEffort | None = None,
 ) -> ApplicationSettings:
+    _validate_verification_command_surface(args)
     return ApplicationSettings(
         cwd=args.cwd,
         provider=args.provider,
@@ -79,6 +90,7 @@ def _application_settings(
             else reasoning_effort or ReasoningEffort.HIGH
         ),
         resume_id=getattr(args, "resume", None),
+        verification_command=getattr(args, "verify_command", None),
     )
 
 

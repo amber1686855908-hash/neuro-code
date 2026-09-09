@@ -28,7 +28,11 @@ from neuro_code.domain.execution import (
     VerificationRequirementsSnapshot,
     require_requirement_id,
 )
-from neuro_code.domain.permissions import BashCommandFamily, classify_bash_command_family
+from neuro_code.domain.permissions import (
+    BashCommandFamily,
+    classify_bash_command_family,
+    validate_verification_command,
+)
 from neuro_code.shared.redaction import redact_sensitive_text
 
 MAX_VERIFICATION_EVIDENCE_ITEMS = 4
@@ -876,6 +880,24 @@ def verification_scope_for_tool(
     return ()
 
 
+def validate_explicit_verification_command(value: object) -> str | None:
+    """Validate an optional launch command at an application boundary.
+
+    The domain command contract and the existing runtime scope projection use
+    the same conservative Bash classifier.  Keeping this helper here gives
+    settings and runtime callers one application-facing validation seam while
+    leaving command execution to ``ToolExecutor``.
+    """
+
+    if value is None:
+        return None
+    command = validate_verification_command(value)
+    scope = verification_scope_for_tool("bash", {"command": command})
+    if scope not in {("bash:test",), ("bash:static_check",)}:
+        raise ValueError("verification command is outside the recognized verification scope")
+    return command
+
+
 def resolve_verification_coverage(
     requirements: VerificationRequirementsSnapshot | None,
     tool_name: str,
@@ -952,5 +974,6 @@ __all__ = [
     "VerificationTracker",
     "build_verification_evidence",
     "resolve_verification_coverage",
+    "validate_explicit_verification_command",
     "verification_scope_for_tool",
 ]

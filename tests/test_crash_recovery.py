@@ -1439,10 +1439,19 @@ class CrashRecoveryTests(unittest.IsolatedAsyncioTestCase):
         seeded_payload = seeded.to_dict()
         self.assertEqual(seeded_payload["verification_workspace_mutation_id"], "adoption-1")
         self.assertEqual(TurnInput.from_dict(seeded_payload), seeded)
+        commanded = TurnInput(
+            "commanded input",
+            verification_command="uv run pytest -q",
+        )
+        commanded_payload = commanded.to_dict()
+        self.assertEqual(commanded_payload["verification_command"], "uv run pytest -q")
+        self.assertEqual(TurnInput.from_dict(commanded_payload), commanded)
         legacy = TurnInput("legacy input")
         self.assertNotIn("verification_requirements", legacy.to_dict())
         self.assertNotIn("verification_workspace_mutation_id", legacy.to_dict())
+        self.assertNotIn("verification_command", legacy.to_dict())
         self.assertEqual(TurnInput.from_dict(legacy.to_dict()), legacy)
+        self.assertNotEqual(commanded.fingerprint, legacy.fingerprint)
         self.assertNotEqual(structured.fingerprint, legacy.fingerprint)
         with self.assertRaises(ValueError):
             TurnInput.from_dict(
@@ -1454,6 +1463,15 @@ class CrashRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     },
                 }
             )
+
+        for command in ("echo unsafe", "pytest -q\x00"):
+            with self.subTest(command=command), self.assertRaises(ValueError):
+                TurnInput.from_dict(
+                    {
+                        **legacy.to_dict(),
+                        "verification_command": command,
+                    }
+                )
 
         malformed = (
             None,
@@ -1699,6 +1717,27 @@ class CrashRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(retry.input.verification_requirements, snapshot)
+        self.assertEqual(retry.input.fingerprint, input_value.fingerprint)
+
+    async def test_safe_retry_preserves_the_explicit_verification_command(self) -> None:
+        input_value = TurnInput(
+            "retry commanded input",
+            verification_command="uv run pytest -q",
+        )
+        attempt = TurnRecoveryAttempt.create(
+            turn_id="turn-commanded-retry",
+            session_id=self.session_id,
+            input=input_value,
+            accepted_at=datetime.now(UTC),
+        )
+        await self.store.start_turn_attempt(attempt)
+
+        retry = await TurnRecoveryService(self.store).require_safe_retry(
+            self.session_id,
+            attempt.turn_id,
+        )
+
+        self.assertEqual(retry.input.verification_command, "uv run pytest -q")
         self.assertEqual(retry.input.fingerprint, input_value.fingerprint)
 
     async def test_recovery_service_rejects_a_disappearing_attempt(self) -> None:

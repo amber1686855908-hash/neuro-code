@@ -76,13 +76,16 @@ from neuro_code.application.runtime.tool_scheduler import (
     ToolScheduler,
 )
 from neuro_code.application.runtime.verification import (
+    RequirementEvaluationState,
     VerificationReport,
     VerificationTracker,
+    validate_explicit_verification_command,
 )
 from neuro_code.application.sessions.lifecycle import (
     SessionLifecycleService,
     StartSessionRequest,
 )
+from neuro_code.application.sessions.requirements import DEFAULT_NORMAL_MUTATION_REQUIREMENT_ID
 from neuro_code.application.sessions.task_queries import (
     GetSessionTaskRequest,
     SessionTaskQueryService,
@@ -302,9 +305,11 @@ class AgentLoopRunner:
         verification_required: bool = False,
         verification_requirements: VerificationRequirementsSnapshot | None = None,
         verification_workspace_mutation_id: str | None = None,
+        verification_command: str | None = None,
         resume_existing_attempt: bool = False,
     ) -> AgentRunResult:
         prompt_parts = tuple(content_parts)
+        verification_command = validate_explicit_verification_command(verification_command)
         if ultracode_execution_id is not None and (
             not isinstance(ultracode_execution_id, str)
             or not ultracode_execution_id.strip()
@@ -444,6 +449,7 @@ class AgentLoopRunner:
                 session_task.task_id if session_task is not None else plan_execution_task_id,
                 verification_requirements=verification_requirements,
                 verification_workspace_mutation_id=verification_workspace_mutation_id,
+                verification_command=verification_command,
             )
             attempts = await self._session_store.load_turn_attempts(session_id)
             exact_attempt = next((item for item in attempts if item.turn_id == turn_id), None)
@@ -860,6 +866,7 @@ class AgentLoopRunner:
             )
 
         workspace_evidence: list[str] = []
+        verification_acquisition_attempted = False
 
         def record_workspace_evidence(report: WorkspaceChangeReport) -> None:
             for change in report.files:
@@ -870,6 +877,84 @@ class AgentLoopRunner:
                 workspace_evidence.append(
                     f"{change.status} {path} (+{change.additions}/-{change.deletions})"
                 )
+
+        async def maybe_acquire_explicit_verification() -> None:
+            """Run the configured verification command once at the final gate.
+
+            The command is intentionally represented as an ordinary Bash tool
+            call.  That keeps permission, sandbox, cancellation, recovery,
+            observation, and workspace-generation ownership in their existing
+            collaborators.
+            """
+
+            nonlocal verification_acquisition_attempted
+            if verification_acquisition_attempted or verification_command is None:
+                return
+            if (
+                not self._final_output_gate_enabled
+                or turn_source is not TurnSource.USER
+                or plan_execution_requested
+                or ultracode_execution_id is not None
+                or verification_requirements is None
+                or DEFAULT_NORMAL_MUTATION_REQUIREMENT_ID
+                not in verification_requirements.requirement_ids
+                or verification_tracker.workspace_generation <= 0
+            ):
+                return
+            report = verification_tracker.report()
+            evaluation = next(
+                (
+                    item
+                    for item in report.requirement_evaluations
+                    if item.requirement_id == DEFAULT_NORMAL_MUTATION_REQUIREMENT_ID
+                ),
+                None,
+            )
+            if evaluation is None or evaluation.state not in {
+                RequirementEvaluationState.NO_EVIDENCE,
+                RequirementEvaluationState.STALE,
+            }:
+                return
+
+            verification_acquisition_attempted = True
+            call = ToolCall(
+                f"verification-{uuid.uuid4().hex}",
+                "bash",
+                {"command": verification_command},
+            )
+            assistant_message = Message(Role.ASSISTANT, tool_calls=(call,))
+            messages.append(assistant_message)
+            if persist_turn_context:
+                context_items.append(assistant_message)
+            observation = await self._tool_executor.execute(
+                call,
+                messages,
+                context_items,
+                emit,
+                session_id,
+                interrupted_observation_sink=verification_tracker.observe,
+                workspace_change_sink=(
+                    record_workspace_evidence
+                    if self._execution_control_mode is ExecutionControlMode.FINALIZE_TERMINAL
+                    else None
+                ),
+                recovery_started_sink=(
+                    (
+                        lambda tool_id, tool_name, side_effecting: recorder.record_tool_started(
+                            tool_id=tool_id,
+                            tool_name=tool_name,
+                            side_effecting=side_effecting,
+                        )
+                    )
+                    if self._session_store is not None
+                    and session_id is not None
+                    and turn_id is not None
+                    else None
+                ),
+                verification_requirements=verification_requirements,
+            )
+            if observation is not None:
+                verification_tracker.observe(observation)
 
         def finalization_evidence(
             decision: SupervisorDecision | None,
@@ -905,6 +990,7 @@ class AgentLoopRunner:
             *,
             step: int,
         ) -> AgentRunResult:
+            await maybe_acquire_explicit_verification()
             if (
                 decision.reason_code is SupervisorReasonCode.MODEL_CALL_BUDGET
                 and step >= self._max_steps
@@ -947,6 +1033,7 @@ class AgentLoopRunner:
 
             if candidate.is_committed:
                 raise ConfigurationError("gated terminal candidate must remain provisional")
+            await maybe_acquire_explicit_verification()
             await emit(
                 AgentEventKind.FINALIZING_STARTED,
                 {

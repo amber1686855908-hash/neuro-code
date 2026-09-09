@@ -37,6 +37,8 @@ from neuro_code.application.runtime.supervision import (
     create_observing_supervisor,
 )
 from neuro_code.application.runtime.tool_pipeline import ToolExecutor
+from neuro_code.application.runtime.verification import validate_explicit_verification_command
+from neuro_code.application.sessions.requirements import NormalTurnRequirementsPolicy
 from neuro_code.domain.conversation.context import ModelContext, estimate_context_tokens
 from neuro_code.domain.conversation.interaction_mode import InteractionMode
 from neuro_code.domain.conversation.messages import (
@@ -60,6 +62,7 @@ from neuro_code.shared.errors import ConfigurationError
 __all__ = ["AgentRunResult", "AgentRuntime", "EventSink"]
 
 FinalizerFactory = Callable[[ModelProvider, int, tuple[str, ...]], Finalizer]
+_USE_CONFIGURED_VERIFICATION_COMMAND = object()
 
 
 def _create_finalizer(
@@ -112,6 +115,7 @@ class AgentRuntime:
         # Only the user-facing normal binding produces the default structured
         # requirement.  Internal orchestration bindings opt out explicitly.
         normal_requirements_enabled: bool = True,
+        verification_command: str | None = None,
         compaction_runtime_gate: ContextCompactionRuntimeGate | None = None,
         provider_context_window: ProviderContextWindow | None = None,
         tool_hooks: Sequence[ToolPipelineHook] = (),
@@ -139,6 +143,10 @@ class AgentRuntime:
             raise TypeError("final_output_gate_enabled must be a bool")
         if not isinstance(normal_requirements_enabled, bool):
             raise TypeError("normal_requirements_enabled must be a bool")
+        try:
+            verification_command = validate_explicit_verification_command(verification_command)
+        except (TypeError, ValueError) as error:
+            raise ConfigurationError(f"invalid verification command: {error}") from error
         if compaction_runtime_gate is not None and not isinstance(
             compaction_runtime_gate,
             ContextCompactionRuntimeGate,
@@ -172,6 +180,7 @@ class AgentRuntime:
         self._finalizer_factory = finalizer_factory or _create_finalizer
         self._finalizer_max_attempts = finalizer_max_attempts
         self._normal_requirements_enabled = normal_requirements_enabled
+        self._verification_command = verification_command if normal_requirements_enabled else None
         self._compaction_runtime_gate = compaction_runtime_gate
         self._auto_permission_mode = (
             PermissionMode.BYPASS
@@ -322,6 +331,12 @@ class AgentRuntime:
 
         return self._normal_requirements_enabled
 
+    @property
+    def verification_command(self) -> str | None:
+        """Return the explicit command configured for normal user turns."""
+
+        return self._verification_command
+
     def _model_items_with_reasoning_guidance(
         self,
         items: Sequence[SessionItem],
@@ -376,12 +391,28 @@ class AgentRuntime:
         verification_required: bool = False,
         verification_requirements: VerificationRequirementsSnapshot | None = None,
         verification_workspace_mutation_id: str | None = None,
+        verification_command: str | None | object = _USE_CONFIGURED_VERIFICATION_COMMAND,
         resume_existing_attempt: bool = False,
     ) -> AgentRunResult:
         """Run one agent turn through the canonical main loop.
 
         通过规范主循环运行一个 Agent 回合."""
 
+        effective_verification_command = (
+            self._verification_command
+            if verification_command is _USE_CONFIGURED_VERIFICATION_COMMAND
+            else validate_explicit_verification_command(verification_command)
+        )
+        effective_requirements = verification_requirements
+        if (
+            effective_verification_command is not None
+            and effective_requirements is None
+            and self._normal_requirements_enabled
+            and turn_source is TurnSource.USER
+            and ultracode_execution_id is None
+            and not plan_execution_requested
+        ):
+            effective_requirements = NormalTurnRequirementsPolicy.resolve(None)
         return await self._loop_runner.run(
             prompt,
             sink=sink,
@@ -398,8 +429,9 @@ class AgentRuntime:
             cancellation_policy=cancellation_policy,
             turn_source=turn_source,
             verification_required=verification_required,
-            verification_requirements=verification_requirements,
+            verification_requirements=effective_requirements,
             verification_workspace_mutation_id=verification_workspace_mutation_id,
+            verification_command=effective_verification_command,
             resume_existing_attempt=resume_existing_attempt,
         )
 

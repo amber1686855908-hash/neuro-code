@@ -79,6 +79,12 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
         help="agent review depth (default: high, or the saved TUI preference)",
     )
     parser.add_argument("--resume", metavar="SESSION_ID", help="resume an existing session")
+    parser.add_argument(
+        "--verify-command",
+        metavar="COMMAND",
+        default=argparse.SUPPRESS,
+        help="explicit bounded pytest or static-check command after workspace changes",
+    )
 
 
 def _add_acp_arguments(parser: argparse.ArgumentParser) -> None:

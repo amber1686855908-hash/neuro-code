@@ -965,6 +965,9 @@ class AgentConversation:
                     "source_model": self._source_model,
                     "source_context_affinity": self._source_context_affinity,
                     "session_id": self._session_id,
+                    # Pass the persisted value even when it is None so a
+                    # current launch setting cannot alter an exact retry.
+                    "verification_command": handoff.input.verification_command,
                 }
                 if handoff.input.verification_requirements is not None:
                     runtime_kwargs["verification_requirements"] = (
