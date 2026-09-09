@@ -718,6 +718,14 @@ ConPTY 创建会原子组合伪控制台与 Job 列表属性，终止/关闭作�
 协议 framing、授权和背压定义完成前，该基础有意不通过 ACP 暴露。详见
 [ADR 0034](adr/0034-bounded-owned-interactive-terminal-sessions.md)。
 
+普通本地 CLI/TUI binding 还可以暴露有界的附加终端工具
+`create_terminal`、`terminal_output`、`terminal_write`、`terminal_resize`、
+`terminal_wait` 和 `terminal_kill`。它们访问同一个由 binding 拥有的 manager；终端 ID
+和游标输出是不透明、有界、仅存于内存且仅限同一进程的。binding 替换或关闭时会关闭其
+所有终端，进程崩溃后不会恢复终端。TUI 只展示一个选中的会话，而不是终端模拟器；附加
+终端也不是验证证据。ACP、子代理、planner 和 UltraCode worker 不会获得这组本地工具；
+ACP 现有的 client-terminal 契约保持不变。
+
 运行时计时使用单调时钟。`MODEL_THINKING_COMPLETED` 测量每个模型步骤从发出请求到首个
 可见或可行动结果的时间，并不宣称能够读取供应商私有推理遥测。工具终态事件携带耗时，
 `TURN_COMPLETED` 则在稳定助手节点之后显示整轮摘要。工具调用、权限路径、输出预览、

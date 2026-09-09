@@ -43,6 +43,7 @@ from neuro_code.application.ports.result_adoption import (
     WorkspaceMutationResult,
 )
 from neuro_code.application.ports.storage import SessionStore
+from neuro_code.application.ports.terminal import TerminalCreationAuthorization
 from neuro_code.application.ports.tool_pipeline import ToolPipelineHook
 from neuro_code.application.ports.tools import (
     FilesystemTargetProvider,
@@ -729,15 +730,21 @@ class ToolExecutor:
             ) -> AgentEvent:
                 return await emit(kind, dict(data))
 
+            execution_context = replace(
+                self._tool_context,
+                filesystem_access_plan=filesystem_access_plan,
+                interaction_event_sink=interaction_event_sink,
+                web_search_event_sink=web_search_event_sink,
+                terminal_creation_authorization=(
+                    TerminalCreationAuthorization(call.id)
+                    if call.name == "create_terminal"
+                    else None
+                ),
+            )
             try:
                 result = await tool.execute(
                     call.arguments,
-                    replace(
-                        self._tool_context,
-                        filesystem_access_plan=filesystem_access_plan,
-                        interaction_event_sink=interaction_event_sink,
-                        web_search_event_sink=web_search_event_sink,
-                    ),
+                    execution_context,
                 )
             except (ToolError, OSError, UnicodeError) as error:
                 result = ToolResult(f"{type(error).__name__}: {error}", is_error=True)

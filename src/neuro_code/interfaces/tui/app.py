@@ -90,6 +90,7 @@ from neuro_code.interfaces.tui.controllers.provider import ProviderControllerMix
 from neuro_code.interfaces.tui.controllers.runtime import RuntimeControllerMixin
 from neuro_code.interfaces.tui.controllers.session import SessionControllerMixin
 from neuro_code.interfaces.tui.controllers.tasks import TaskControllerMixin
+from neuro_code.interfaces.tui.controllers.terminals import AttachedTerminalControllerMixin
 from neuro_code.interfaces.tui.controllers.tool_activity.events import ToolActivityEventsMixin
 from neuro_code.interfaces.tui.controllers.tool_activity.inspector import (
     ToolActivityInspectorMixin,
@@ -121,7 +122,11 @@ from neuro_code.interfaces.tui.theme import (
     TEXT_MUTED,
     TEXTUAL_THEME,
 )
-from neuro_code.interfaces.tui.widgets import ConversationMessage, PromptInput
+from neuro_code.interfaces.tui.widgets import (
+    AttachedTerminalPanel,
+    ConversationMessage,
+    PromptInput,
+)
 from neuro_code.shared.ui_language import UiLanguage
 
 
@@ -157,6 +162,7 @@ class NeuroCodeApp(
     PlanControllerMixin,
     TaskControllerMixin,
     BackgroundControllerMixin,
+    AttachedTerminalControllerMixin,
     TranscriptControllerMixin,
     RuntimeControllerMixin,
     App[None],
@@ -450,6 +456,31 @@ class NeuroCodeApp(
         overflow: hidden hidden;
     }
 
+    #attached-terminal-panel {
+        height: auto;
+        max-height: 12;
+        padding: 0 1;
+        background: $surface;
+        color: $text-secondary;
+        border-top: solid $border;
+    }
+
+    #attached-terminal-output {
+        height: auto;
+        max-height: 7;
+        overflow-y: auto;
+        color: $text-primary;
+    }
+
+    #attached-terminal-input {
+        height: 1;
+        margin: 0;
+    }
+
+    #attached-terminal-help {
+        color: $text-muted;
+    }
+
     """
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("ctrl+c", "cancel_turn", "Cancel", priority=True, show=False),
@@ -471,6 +502,17 @@ class NeuroCodeApp(
             show=False,
         ),
         Binding("tab", "complete_slash_command", "Complete", priority=True, show=False),
+        Binding(
+            "ctrl+shift+t",
+            "focus_attached_terminal",
+            "Terminal",
+            priority=True,
+            show=False,
+        ),
+        Binding("ctrl+]", "attached_terminal_next", "Next terminal", show=False),
+        Binding("ctrl+[", "attached_terminal_previous", "Previous terminal", show=False),
+        Binding("ctrl+shift+x", "attached_terminal_stop", "Stop terminal", show=False),
+        Binding("ctrl+shift+r", "attached_terminal_resize", "Resize terminal", show=False),
     ]
 
     def __init__(
@@ -676,6 +718,12 @@ class NeuroCodeApp(
             SystemClipboardWriter() if clipboard_writer is None else clipboard_writer
         )
         self._last_clipboard_write = ClipboardWriteResult(native_copied=False)
+        self._attached_terminal_session_ids = ()
+        self._attached_terminal_selected_id = None
+        self._attached_terminal_offsets = {}
+        self._attached_terminal_output = {}
+        self._attached_terminal_focused = False
+        self._attached_terminal_polling = False
 
     def copy_to_clipboard(self, text: str) -> None:
         """Copy through the native adapter while retaining Textual's OSC 52 fallback.
@@ -732,6 +780,7 @@ class NeuroCodeApp(
             yield Static(id="header-space")
             yield Static(id="clock")
         yield VerticalScroll(id="transcript")
+        yield AttachedTerminalPanel(id="attached-terminal-panel")
         with Vertical(id="composer"):
             yield Static(id="turn-activity")
             with Horizontal(id="prompt-row"):
@@ -782,6 +831,7 @@ class NeuroCodeApp(
             )
         if self._task_controller is not None:
             self.set_interval(_TASK_POLL_SECONDS, self._poll_background_tasks)
+        self.set_interval(0.25, self._poll_attached_terminals)
         self.set_interval(
             _LOADING_ANIMATION_TICK_SECONDS,
             self._advance_model_loading_animation,

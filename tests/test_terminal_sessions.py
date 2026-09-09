@@ -20,6 +20,7 @@ from neuro_code.application.ports.sandbox import (
     SandboxedProcessRequest,
 )
 from neuro_code.application.ports.terminal import (
+    TerminalCreationAuthorization,
     TerminalEofHandler,
     TerminalErrorHandler,
     TerminalOutputHandler,
@@ -442,6 +443,34 @@ class LocalInteractiveTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
                 )
             self.assertEqual(rejected_platform.spawn_calls, [])
             await rejected.shutdown()
+
+    async def test_pipeline_authorization_skips_duplicate_manager_approval(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            platform = _FakeTerminalPlatform()
+            manager = self._manager(
+                root,
+                platform,
+                permissions=PermissionManager(),
+            )
+            session = await manager.create_exec(
+                "create-terminal-call",
+                "python",
+                ("-V",),
+                cwd=".",
+                env={},
+                size=TerminalSize(80, 24),
+                output_capacity=100,
+                authorization=TerminalCreationAuthorization("create-terminal-call"),
+            )
+            self.assertEqual(1, len(platform.spawn_calls))
+            self.assertIs(await manager.get_session(session.session_id), session)
+            self.assertEqual((session,), await manager.list_sessions())
+            self.assertIsNone(await manager.get_session("terminal-missing"))
+            await session.close()
+            self.assertIsNone(await manager.get_session(session.session_id))
+            self.assertEqual((), await manager.list_sessions())
+            await manager.shutdown()
 
     async def test_workspace_and_sandbox_boundaries_precede_spawn(self) -> None:
         with TemporaryDirectory() as directory:

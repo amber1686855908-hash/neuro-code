@@ -5,11 +5,31 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 from neuro_code.application.ports.sandbox import LocalProcessLifecycleCapability
 from neuro_code.domain.terminal.models import TerminalOutputChunk, TerminalSignal, TerminalSize
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalCreationAuthorization:
+    """One runtime-owned authorization hand-off for model terminal creation.
+
+    The token is created only after ``ToolExecutor`` has completed the normal
+    model-tool permission flow.  It is intentionally bound to one tool-call
+    identity so a terminal tool cannot reuse approval for another call.
+
+    模型创建终端的一次运行时授权交接.令牌只在 ToolExecutor 完成正常模型工具权限流程后
+    创建,并绑定到单个工具调用身份,避免不同调用复用审批结果.
+    """
+
+    call_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.call_id, str) or not self.call_id or "\x00" in self.call_id:
+            raise ValueError("terminal creation authorization call ID is invalid")
 
 
 class InteractiveTerminalSession(Protocol):
@@ -52,7 +72,12 @@ class InteractiveTerminalManager(Protocol):
         env: Mapping[str, str],
         size: TerminalSize,
         output_capacity: int,
+        authorization: TerminalCreationAuthorization | None = None,
     ) -> InteractiveTerminalSession: ...
+
+    async def get_session(self, session_id: str) -> InteractiveTerminalSession | None: ...
+
+    async def list_sessions(self) -> tuple[InteractiveTerminalSession, ...]: ...
 
     async def shutdown(self) -> None: ...
 
@@ -101,6 +126,7 @@ class TerminalPlatform(Protocol):
 __all__ = [
     "InteractiveTerminalManager",
     "InteractiveTerminalSession",
+    "TerminalCreationAuthorization",
     "TerminalEofHandler",
     "TerminalErrorHandler",
     "TerminalOutputHandler",

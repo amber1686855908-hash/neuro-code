@@ -102,6 +102,12 @@ class TuiAppControllerMixin:
     # second object or weakening the strict mypy configuration.
     if TYPE_CHECKING:
         _runner: ConversationRunner
+        _attached_terminal_session_ids: tuple[str, ...]
+        _attached_terminal_selected_id: str | None
+        _attached_terminal_offsets: dict[str, int]
+        _attached_terminal_output: dict[str, str]
+        _attached_terminal_focused: bool
+        _attached_terminal_polling: bool
         _user_interaction: TuiUserInteraction | None
         _turn_service: SessionTurnService | None
         _approval_controller: ApprovalController | None

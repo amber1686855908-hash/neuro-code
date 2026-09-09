@@ -37,7 +37,10 @@ from neuro_code.application.ports.sandbox import (
     LocalWorkspaceAccessMode,
     SandboxedProcessRequest,
 )
-from neuro_code.application.ports.terminal import TerminalPlatformSession
+from neuro_code.application.ports.terminal import (
+    TerminalCreationAuthorization,
+    TerminalPlatformSession,
+)
 from neuro_code.application.ports.workspace import WorkspacePathResolver
 from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.terminal.models import (
@@ -365,6 +368,7 @@ class LocalInteractiveTerminalManager:
         env: Mapping[str, str],
         size: TerminalSize,
         output_capacity: int,
+        authorization: TerminalCreationAuthorization | None = None,
     ) -> LocalInteractiveTerminalSession:
         argv = _validated_argv(executable, arguments)
         if not isinstance(call_id, str) or not call_id or "\x00" in call_id:
@@ -410,7 +414,7 @@ class LocalInteractiveTerminalManager:
                 "environment_fingerprint": _environment_fingerprint(environment),
                 "rows": size.rows,
             }
-            await self._authorize(call_id, permission_arguments)
+            await self._authorize(call_id, permission_arguments, authorization=authorization)
             request = self._build_process_request(
                 argv,
                 resolved_cwd=resolved_cwd,
@@ -482,7 +486,19 @@ class LocalInteractiveTerminalManager:
                 0
             ]
 
-    async def _authorize(self, call_id: str, arguments: Mapping[str, object]) -> None:
+    async def _authorize(
+        self,
+        call_id: str,
+        arguments: Mapping[str, object],
+        *,
+        authorization: TerminalCreationAuthorization | None,
+    ) -> None:
+        if authorization is not None:
+            if not isinstance(authorization, TerminalCreationAuthorization):
+                raise PermissionDenied("interactive terminal authorization is invalid")
+            if authorization.call_id != call_id:
+                raise PermissionDenied("interactive terminal authorization does not match call")
+            return
         decision = self._permissions.decide(
             "create_terminal",
             arguments,
@@ -504,6 +520,16 @@ class LocalInteractiveTerminalManager:
         approval = await self._approver.request(request)
         if not approval.allowed:
             raise PermissionDenied(f"interactive terminal denied: {approval.reason}")
+
+    async def get_session(self, session_id: str) -> LocalInteractiveTerminalSession | None:
+        if not isinstance(session_id, str) or not session_id or "\x00" in session_id:
+            raise TerminalError("terminal session ID is invalid")
+        async with self._registry_lock:
+            return self._sessions.get(session_id)
+
+    async def list_sessions(self) -> tuple[LocalInteractiveTerminalSession, ...]:
+        async with self._registry_lock:
+            return tuple(self._sessions.values())
 
     def _build_process_request(
         self,

@@ -20,6 +20,7 @@ from collections.abc import Collection, Iterable
 from neuro_code.application.ports.client_filesystem import ClientFileSystem
 from neuro_code.application.ports.client_terminal import ClientTerminal
 from neuro_code.application.ports.lsp import LanguageServerService
+from neuro_code.application.ports.terminal import InteractiveTerminalManager
 from neuro_code.application.ports.tools import Tool
 from neuro_code.application.ports.user_interaction import UserInteractionPort
 from neuro_code.domain.sandbox.models import SandboxProfile
@@ -87,6 +88,7 @@ def default_tool_registry(
     allowed_tool_names: Collection[str] | None = None,
     client_file_system: ClientFileSystem | None = None,
     client_terminal: ClientTerminal | None = None,
+    interactive_terminals: InteractiveTerminalManager | None = None,
     user_interaction: UserInteractionPort | None = None,
     lsp_service: LanguageServerService | None = None,
 ) -> ToolRegistry:
@@ -163,6 +165,26 @@ def default_tool_registry(
                 ClientTerminalOutputTool(),
                 ClientTerminalWaitTool(),
                 ClientTerminalKillTool(),
+            )
+        )
+    if interactive_terminals is not None and client_terminal is None:
+        from neuro_code.infrastructure.tools.interactive_terminal import (
+            CreateTerminalTool,
+            TerminalKillTool,
+            TerminalOutputTool,
+            TerminalResizeTool,
+            TerminalWaitTool,
+            TerminalWriteTool,
+        )
+
+        tools.extend(
+            (
+                CreateTerminalTool(),
+                TerminalOutputTool(),
+                TerminalWriteTool(),
+                TerminalResizeTool(),
+                TerminalWaitTool(),
+                TerminalKillTool(),
             )
         )
     if enable_background_tasks:

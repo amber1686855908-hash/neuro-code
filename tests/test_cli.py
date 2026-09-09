@@ -198,6 +198,11 @@ class GatedCliProvider:
         yield ModelCompleted("stop")
 
 
+class BackgroundTaskScopeFixture:
+    async def shutdown(self) -> None:
+        pass
+
+
 class BackgroundTaskSupervisorFixture:
     def __init__(self) -> None:
         self.shutdown_calls = 0
@@ -206,9 +211,9 @@ class BackgroundTaskSupervisorFixture:
         self,
         *,
         local_process_sandbox: object | None = None,
-    ) -> BackgroundTaskSupervisorFixture:
+    ) -> BackgroundTaskScopeFixture:
         del local_process_sandbox
-        return self
+        return BackgroundTaskScopeFixture()
 
     async def shutdown(self) -> None:
         self.shutdown_calls += 1
@@ -276,8 +281,9 @@ class CliApplicationFixture:
         *,
         resume_id: str | None = None,
         user_interaction: object | None = None,
+        enable_local_attached_terminals: bool = False,
     ) -> SimpleNamespace:
-        del user_interaction
+        del user_interaction, enable_local_attached_terminals
         self.operations.append("create_binding")
         self.created_resume_ids.append(resume_id)
         return SimpleNamespace(runner=self.runner)

@@ -286,6 +286,7 @@ class BootstrapCliServices:
                         resume_id=resume_id,
                         reasoning_effort=reasoning_effort_,
                         user_interaction=user_interaction_,
+                        enable_local_attached_terminals=True,
                     )
 
                 binding = await compose_scoped(config, args.resume)

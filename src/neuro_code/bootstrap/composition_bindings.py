@@ -74,6 +74,7 @@ from neuro_code.application.sessions.conversation import AgentConversation
 from neuro_code.application.sessions.summary import (
     GetSessionSummaryRequest,
 )
+from neuro_code.application.sessions.terminal_sessions import LocalInteractiveTerminalManager
 from neuro_code.application.web_fetch.service import WebFetchService
 from neuro_code.application.web_search.service import WebSearchService
 from neuro_code.application.workflows.subagent_capabilities import SubagentCapabilitySet
@@ -103,7 +104,11 @@ from neuro_code.infrastructure.tools.web_search import WebSearchTool
 from neuro_code.infrastructure.tools.workspace_diff import WorkspaceMutationJournal
 from neuro_code.infrastructure.web_fetch.local import LocalWebFetcher
 from neuro_code.infrastructure.workspace.changes import MultiRootWorkspaceChangeObserver
-from neuro_code.infrastructure.workspace.paths import FilesystemWorkspaceIdentity, workspaces_match
+from neuro_code.infrastructure.workspace.paths import (
+    FilesystemWorkspaceIdentity,
+    FilesystemWorkspacePathResolver,
+    workspaces_match,
+)
 from neuro_code.shared.errors import ConfigurationError
 
 
@@ -198,6 +203,7 @@ class CompositionBindingMixin(CompositionRootMixin):
         # integration is implemented; user-facing bindings keep the default.
         final_output_gate_enabled: bool = True,
         normal_requirements_enabled: bool = True,
+        enable_local_attached_terminals: bool = False,
     ) -> ConversationBinding:
         if self._closed:
             raise RuntimeError("application composition is closed")
@@ -298,6 +304,44 @@ class CompositionBindingMixin(CompositionRootMixin):
             else ExecutionBudgetPolicy.from_max_steps(max_steps)
         )
 
+        approval_service = ToolApprovalService(approver) if approver is not None else None
+        persisted_rules: tuple[PermissionRule, ...] = ()
+        if self.settings.permission_rules_path is not None:
+            try:
+                persisted_rules = PermissionRuleStore(self.settings.permission_rules_path).load()
+            except ValueError as error:
+                raise ConfigurationError(str(error)) from error
+        permissions = PermissionManager(
+            mode=self.settings.permission_mode,
+            rules=(
+                *persisted_rules,
+                *self.settings.permission_rules,
+                *(
+                    PermissionRule(PermissionEffect.ASK, tool.definition.name)
+                    for tool in additional_tools
+                ),
+            ),
+            interactive=approval_service is not None,
+        )
+
+        precreated_local_process_sandbox: LocalProcessSandbox | None = None
+        interactive_terminals: LocalInteractiveTerminalManager | None = None
+        if enable_local_attached_terminals and client_terminal is None:
+            precreated_local_process_sandbox = self._local_process_sandbox_factory(
+                selected_config.sandbox_profile,
+                selected_config.cwd,
+                selected_config.state_dir,
+            )
+            interactive_terminals = LocalInteractiveTerminalManager(
+                workspace=selected_config.cwd,
+                workspace_path_resolver=FilesystemWorkspacePathResolver(),
+                permissions=permissions,
+                approver=approver,
+                sandbox_profile=selected_config.sandbox_profile,
+                local_process_sandbox=precreated_local_process_sandbox,
+                protected_environment_variables=(selected_config.protected_environment_variables),
+            )
+
         # Validate collisions before opening the binding-owned background scope.
         # Tool construction is pure wiring, so this preserves the existing
         # cleanup guarantee when an additional tool conflicts with a built-in.
@@ -307,6 +351,7 @@ class CompositionBindingMixin(CompositionRootMixin):
             allowed_tool_names=allowed_tool_names,
             client_file_system=client_file_system,
             client_terminal=client_terminal,
+            interactive_terminals=interactive_terminals,
             user_interaction=user_interaction,
         )
         for tool in additional_tools:
@@ -331,10 +376,14 @@ class CompositionBindingMixin(CompositionRootMixin):
             LocalProcessSandbox,
             LanguageServerManager,
         ]:
-            local_process_sandbox = self._local_process_sandbox_factory(
-                selected_config.sandbox_profile,
-                selected_config.cwd,
-                selected_config.state_dir,
+            local_process_sandbox = (
+                precreated_local_process_sandbox
+                if precreated_local_process_sandbox is not None
+                else self._local_process_sandbox_factory(
+                    selected_config.sandbox_profile,
+                    selected_config.cwd,
+                    selected_config.state_dir,
+                )
             )
             lsp_service = LanguageServerManager(
                 config=selected_config,
@@ -459,6 +508,7 @@ class CompositionBindingMixin(CompositionRootMixin):
                     allowed_tool_names=allowed_tool_names,
                     client_file_system=client_file_system,
                     client_terminal=client_terminal,
+                    interactive_terminals=interactive_terminals,
                     user_interaction=user_interaction,
                     lsp_service=lsp_service,
                 )
@@ -519,7 +569,6 @@ class CompositionBindingMixin(CompositionRootMixin):
             compaction_gate = ContextCompactionRuntimeGate(
                 ContextCompactionTriggerService(compaction_persistence)
             )
-            approval_service = ToolApprovalService(approver) if approver is not None else None
             # Build a per-binding instruction tracker that re-discovers
             # AGENTS.md files from the workspace root toward the current
             # focus directory.  File-access tools call ``check_path()`` to
@@ -554,26 +603,6 @@ class CompositionBindingMixin(CompositionRootMixin):
             def skill_provider() -> SkillDiscoveryResult | None:
                 return skill_tracker.current_result()
 
-            persisted_rules: tuple[PermissionRule, ...] = ()
-            if self.settings.permission_rules_path is not None:
-                try:
-                    persisted_rules = PermissionRuleStore(
-                        self.settings.permission_rules_path
-                    ).load()
-                except ValueError as error:
-                    raise ConfigurationError(str(error)) from error
-            permissions = PermissionManager(
-                mode=self.settings.permission_mode,
-                rules=(
-                    *persisted_rules,
-                    *self.settings.permission_rules,
-                    *(
-                        PermissionRule(PermissionEffect.ASK, tool.definition.name)
-                        for tool in additional_tools
-                    ),
-                ),
-                interactive=approval_service is not None,
-            )
             lsp_service.set_visibility_policy(permissions)
             workspace_change_observer = self._workspace_change_observer_factory()
             if additional_workspace_roots:
@@ -603,6 +632,7 @@ class CompositionBindingMixin(CompositionRootMixin):
                     skill_tracker=skill_tracker,
                     client_file_system=client_file_system,
                     client_terminal=client_terminal,
+                    interactive_terminals=interactive_terminals,
                     output_artifact_store=FileToolOutputArtifactStore(
                         selected_config.state_dir / "tool-output",
                         redaction_values=selected_config.redaction_values(os.environ),
@@ -677,20 +707,37 @@ class CompositionBindingMixin(CompositionRootMixin):
 
             async def close_binding_resources() -> None:
                 self._lsp_services.discard(lsp_service)
-                await lsp_service.close()
-                await task_scope.shutdown()
+                self._binding_scopes.discard(resource_scope)
+                terminal_error: BaseException | None = None
+                if interactive_terminals is not None:
+                    try:
+                        await interactive_terminals.shutdown()
+                    except BaseException as error:
+                        terminal_error = error
+                try:
+                    await lsp_service.close()
+                finally:
+                    await task_scope.shutdown()
+                if terminal_error is not None:
+                    raise terminal_error
 
-            return ConversationBinding(
+            resource_scope = ConversationBindingResourceScope(close_binding_resources)
+            binding = ConversationBinding(
                 runner=conversation,
                 provider=provider,
                 background_tasks=task_scope,
                 capabilities=binding_capabilities,
-                resource_scope=ConversationBindingResourceScope(close_binding_resources),
+                interactive_terminals=interactive_terminals,
+                resource_scope=resource_scope,
                 workspace_root=selected_config.cwd,
                 workspace_mutation=runtime.workspace_mutation,
             )
+            self._binding_scopes.add(resource_scope)
+            return binding
         except BaseException:
             self._lsp_services.discard(lsp_service)
+            if interactive_terminals is not None:
+                await asyncio.shield(interactive_terminals.shutdown())
             await asyncio.shield(lsp_service.close())
             if task_scope is not None:
                 await asyncio.shield(task_scope.shutdown())

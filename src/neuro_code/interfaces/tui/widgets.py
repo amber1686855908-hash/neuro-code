@@ -13,10 +13,11 @@ from rich.markdown import Markdown
 from rich.table import Table
 from rich.text import Text
 from textual import events
-from textual.app import RenderResult
+from textual.app import ComposeResult, RenderResult
 from textual.binding import Binding, BindingType
+from textual.containers import Vertical
 from textual.message import Message as TextualMessage
-from textual.widgets import Button, Static, TextArea
+from textual.widgets import Button, Input, Static, TextArea
 
 from neuro_code.interfaces.tui.state import (
     _PROMPT_MARK,
@@ -92,6 +93,71 @@ class AssistantMarkdown(Markdown):
 
     def __str__(self) -> str:
         return self.markup
+
+
+class AttachedTerminalPanel(Vertical):
+    """Conversation-local viewport for one binding's attached terminals.
+
+    The panel renders bounded terminal output as plain ``Text`` and sends
+    input/focus intent back to its controller.  Terminal sessions and their
+    lifecycle remain outside the widget.
+
+    当前会话绑定的附加终端 viewport.输出始终以普通 Text 安全渲染,输入和焦点意图交给
+    controller;终端会话及其生命周期不由 widget 持有.
+    """
+
+    class InputSubmitted(TextualMessage):
+        def __init__(self, panel: AttachedTerminalPanel, value: str) -> None:
+            self.panel = panel
+            self.value = value
+            super().__init__()
+
+    class FocusChatRequested(TextualMessage):
+        def __init__(self, panel: AttachedTerminalPanel) -> None:
+            self.panel = panel
+            super().__init__()
+
+    def __init__(self, *, id: str | None = None) -> None:
+        super().__init__(id=id)
+        self.display = False
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="attached-terminal-summary")
+        yield Static(id="attached-terminal-output")
+        yield Input(id="attached-terminal-input")
+        yield Static(id="attached-terminal-help")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        value = event.value
+        event.input.value = ""
+        self.post_message(self.InputSubmitted(self, value))
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key == "escape":
+            event.stop()
+            self.post_message(self.FocusChatRequested(self))
+
+    def update_sessions(self, text: str) -> None:
+        self.query_one("#attached-terminal-summary", Static).update(Text(text))
+
+    def update_output(self, text: str) -> None:
+        self.query_one("#attached-terminal-output", Static).update(Text(text))
+
+    def update_help(self, text: str) -> None:
+        self.query_one("#attached-terminal-help", Static).update(Text(text))
+
+    def set_input_placeholder(self, text: str) -> None:
+        self.query_one("#attached-terminal-input", Input).placeholder = text
+
+    def focus_input(self) -> None:
+        self.query_one("#attached-terminal-input", Input).focus()
+
+    def clear_input(self) -> None:
+        self.query_one("#attached-terminal-input", Input).value = ""
+
+    def blur_input(self) -> None:
+        self.query_one("#attached-terminal-input", Input).blur()
 
 
 class ConversationMessage(Static):
@@ -347,6 +413,7 @@ class ToolFeedbackMessage(ConversationMessage, can_focus=True):
 __all__ = [
     "AssistantMarkdown",
     "AssistantMessage",
+    "AttachedTerminalPanel",
     "ConversationMessage",
     "MenuOptionButton",
     "PromptInput",

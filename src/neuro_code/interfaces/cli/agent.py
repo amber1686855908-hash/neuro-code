@@ -40,6 +40,7 @@ async def run_agent(args: argparse.Namespace, services: CliServices) -> int:
         binding = await application.create_binding(
             resume_id=args.resume,
             user_interaction=CliUserInteraction(interactive=args.output_format == "plain"),
+            enable_local_attached_terminals=True,
         )
 
         async def stream_event(event: AgentEvent) -> None:
