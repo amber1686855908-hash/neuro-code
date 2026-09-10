@@ -43,7 +43,7 @@ from neuro_code.application.ports.result_adoption import (
     WorkspaceMutationResult,
 )
 from neuro_code.application.ports.storage import SessionStore
-from neuro_code.application.ports.terminal import TerminalCreationAuthorization
+from neuro_code.application.ports.terminal import _issue_terminal_creation_authorization
 from neuro_code.application.ports.tool_pipeline import ToolPipelineHook
 from neuro_code.application.ports.tools import (
     FilesystemTargetProvider,
@@ -736,7 +736,7 @@ class ToolExecutor:
                 interaction_event_sink=interaction_event_sink,
                 web_search_event_sink=web_search_event_sink,
                 terminal_creation_authorization=(
-                    TerminalCreationAuthorization(call.id)
+                    _issue_terminal_creation_authorization(call.id, call.arguments)
                     if call.name == "create_terminal"
                     else None
                 ),

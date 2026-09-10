@@ -22,6 +22,7 @@ from neuro_code.application.ports.terminal import (
 )
 from neuro_code.application.ports.tools import ToolContext
 from neuro_code.domain.terminal.models import (
+    DEFAULT_TERMINAL_OUTPUT_CAPACITY,
     MAX_TERMINAL_DIMENSION,
     MAX_TERMINAL_OUTPUT_BYTES,
     MAX_TERMINAL_READ_BYTES,
@@ -41,7 +42,6 @@ _MAX_ENVIRONMENT_VALUE_BYTES = 4 * 1024
 _MAX_ENVIRONMENT_TOTAL_BYTES = 64 * 1024
 _MAX_TERMINAL_ID_BYTES = 128
 _MAX_TERMINAL_WAIT_SECONDS = 60.0
-_DEFAULT_OUTPUT_CAPACITY = 256 * 1024
 _MAX_TERMINAL_OFFSET = (1 << 63) - 1
 
 
@@ -234,7 +234,7 @@ class CreateTerminalTool:
             ),
         )
         output_capacity = _integer(
-            arguments.get("output_capacity", _DEFAULT_OUTPUT_CAPACITY),
+            arguments.get("output_capacity", DEFAULT_TERMINAL_OUTPUT_CAPACITY),
             name="output_capacity",
             minimum=1,
             maximum=MAX_TERMINAL_OUTPUT_BYTES,

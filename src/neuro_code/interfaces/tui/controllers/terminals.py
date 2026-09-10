@@ -19,6 +19,7 @@ from neuro_code.application.ports.terminal import (
 )
 from neuro_code.domain.terminal.models import (
     MAX_TERMINAL_DIMENSION,
+    MAX_TERMINAL_OUTPUT_BYTES,
     MAX_TERMINAL_READ_BYTES,
     MAX_TERMINAL_WRITE_BYTES,
     TerminalSize,
@@ -130,7 +131,13 @@ class AttachedTerminalControllerMixin(TuiAppControllerMixin):
             self._attached_terminal_offsets[selected.session_id] = chunk.next_offset
             decoded = self._attached_terminal_safe_text(chunk.data)
             if chunk.dropped_bytes:
-                output = decoded
+                dropped_bytes = min(chunk.dropped_bytes, MAX_TERMINAL_OUTPUT_BYTES)
+                dropped = ui_text(
+                    self._language,
+                    "terminal.output_dropped",
+                    bytes=dropped_bytes,
+                )
+                output = f"{dropped}\n{decoded}" if decoded else dropped
             else:
                 output = self._attached_terminal_output.get(selected.session_id, "") + decoded
             self._attached_terminal_output[selected.session_id] = (

@@ -414,7 +414,17 @@ class LocalInteractiveTerminalManager:
                 "environment_fingerprint": _environment_fingerprint(environment),
                 "rows": size.rows,
             }
-            await self._authorize(call_id, permission_arguments, authorization=authorization)
+            await self._authorize(
+                call_id,
+                permission_arguments,
+                authorization=authorization,
+                executable=executable,
+                request_arguments=arguments,
+                cwd=cwd,
+                env=env,
+                size=size,
+                output_capacity=output_capacity,
+            )
             request = self._build_process_request(
                 argv,
                 resolved_cwd=resolved_cwd,
@@ -489,19 +499,31 @@ class LocalInteractiveTerminalManager:
     async def _authorize(
         self,
         call_id: str,
-        arguments: Mapping[str, object],
+        permission_arguments: Mapping[str, object],
         *,
         authorization: TerminalCreationAuthorization | None,
+        executable: str,
+        request_arguments: Sequence[str],
+        cwd: str,
+        env: Mapping[str, str],
+        size: TerminalSize,
+        output_capacity: int,
     ) -> None:
         if authorization is not None:
-            if not isinstance(authorization, TerminalCreationAuthorization):
-                raise PermissionDenied("interactive terminal authorization is invalid")
-            if authorization.call_id != call_id:
-                raise PermissionDenied("interactive terminal authorization does not match call")
-            return
+            if type(authorization) is TerminalCreationAuthorization and authorization._consume(
+                call_id=call_id,
+                executable=executable,
+                arguments=request_arguments,
+                cwd=cwd,
+                env=env,
+                size=size,
+                output_capacity=output_capacity,
+            ):
+                return
+            raise PermissionDenied("interactive terminal authorization is invalid or mismatched")
         decision = self._permissions.decide(
             "create_terminal",
-            arguments,
+            permission_arguments,
             side_effecting=True,
         )
         if decision.effect is PermissionEffect.DENY:
@@ -513,7 +535,7 @@ class LocalInteractiveTerminalManager:
         request = build_permission_request(
             call_id,
             "create_terminal",
-            arguments,
+            permission_arguments,
             decision.reason,
             scope_context=self._permission_scope_context,
         )

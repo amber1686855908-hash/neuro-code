@@ -25,6 +25,7 @@ class _Session:
         self.writes: list[bytes] = []
         self.resizes: list[TerminalSize] = []
         self.closed = False
+        self.dropped_bytes = 0
 
     @property
     def size(self) -> TerminalSize:
@@ -39,10 +40,12 @@ class _Session:
     ) -> TerminalOutputChunk:
         del wait_seconds
         data = self._output[after_offset : after_offset + max_bytes]
+        dropped_bytes = self.dropped_bytes
+        self.dropped_bytes = 0
         return TerminalOutputChunk(
             data,
             next_offset=after_offset + len(data),
-            dropped_bytes=0,
+            dropped_bytes=dropped_bytes,
             eof=self.closed and after_offset + len(data) == len(self._output),
         )
 
@@ -194,6 +197,38 @@ class AttachedTerminalTuiTests(unittest.IsolatedAsyncioTestCase):
                 "没有附加终端。", str(panel.query_one("#attached-terminal-summary").renderable)
             )
             self.assertFalse(panel.display)
+
+    async def test_dropped_output_is_explicit_and_localized(self) -> None:
+        manager = _Manager(output=b"retained output\n")
+        session = manager.sessions["terminal-1"]
+        session.dropped_bytes = 32_768
+        app = NeuroCodeApp(
+            _Runner(manager),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 32)):
+            await app._poll_attached_terminals()
+            output = str(app.query_one("#attached-terminal-output").renderable)
+            self.assertIn("32768 terminal output bytes dropped.", output)
+            self.assertIn("retained output", output)
+
+        chinese_manager = _Manager(output="保留输出\n".encode())
+        chinese_manager.sessions["terminal-1"].dropped_bytes = 32_768
+        chinese_app = NeuroCodeApp(
+            _Runner(chinese_manager),
+            language=UiLanguage.SIMPLIFIED_CHINESE,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+        async with chinese_app.run_test(size=(100, 32)):
+            await chinese_app._poll_attached_terminals()
+            output = str(chinese_app.query_one("#attached-terminal-output").renderable)
+            self.assertIn("已丢弃 32768 字节终端输出。", output)
+            self.assertIn("保留输出", output)
 
 
 if __name__ == "__main__":

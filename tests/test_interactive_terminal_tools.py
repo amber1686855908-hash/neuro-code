@@ -2,23 +2,43 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from typing import Any
 
 from neuro_code.application.permissions.contracts import PermissionApproval, PermissionRequest
-from neuro_code.application.permissions.policy import PermissionManager, PermissionMode
+from neuro_code.application.permissions.policy import (
+    PermissionEffect,
+    PermissionManager,
+    PermissionMode,
+    PermissionRule,
+)
+from neuro_code.application.ports.sandbox import (
+    LocalProcessLifecycleCapability,
+    LocalProcessSandbox,
+    OwnedLocalProcess,
+    SandboxedProcessRequest,
+)
 from neuro_code.application.ports.terminal import (
+    InteractiveTerminalManager,
     InteractiveTerminalSession,
     TerminalCreationAuthorization,
+    TerminalEofHandler,
+    TerminalErrorHandler,
+    TerminalOutputHandler,
+    TerminalPlatformSession,
 )
 from neuro_code.application.ports.tools import ToolContext
 from neuro_code.application.runtime.context_builder import ContextBuilder
 from neuro_code.application.runtime.tool_pipeline import ToolExecutor
+from neuro_code.application.sessions.binding import ConversationBindingResourceScope
+from neuro_code.application.sessions.terminal_sessions import LocalInteractiveTerminalManager
 from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
 from neuro_code.domain.conversation.interaction_mode import InteractionMode
 from neuro_code.domain.conversation.messages import ToolCall
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
+from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.terminal import TerminalOutputChunk, TerminalSignal, TerminalSize
 from neuro_code.infrastructure.tools.interactive_terminal import (
     CreateTerminalTool,
@@ -29,6 +49,7 @@ from neuro_code.infrastructure.tools.interactive_terminal import (
     TerminalWriteTool,
 )
 from neuro_code.infrastructure.tools.registry import ToolRegistry, default_tool_registry
+from neuro_code.infrastructure.workspace.paths import FilesystemWorkspacePathResolver
 from neuro_code.shared.errors import TerminalError, ToolError
 
 
@@ -149,8 +170,109 @@ class _Approver:
         return self.approval
 
 
-def _context(root: Path, manager: _Manager) -> ToolContext:
+def _context(root: Path, manager: InteractiveTerminalManager) -> ToolContext:
     return ToolContext(root, interactive_terminals=manager)
+
+
+class _AcceptancePlatformSession:
+    lifecycle_capability = LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT
+
+    def __init__(self, platform: _AcceptancePlatform) -> None:
+        self._platform = platform
+        self.process_id = 9001
+        self.writes: list[bytes] = []
+        self.resizes: list[TerminalSize] = []
+        self.exit_code: int | None = None
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        self.writes.append(data)
+        self._platform.emit(b"stdin acknowledged\n")
+
+    def resize(self, size: TerminalSize) -> None:
+        self.resizes.append(size)
+
+    def send_signal(self, signal: TerminalSignal) -> None:
+        del signal
+
+    def poll_exit(self) -> int | None:
+        return self.exit_code
+
+    def close(self) -> None:
+        self.closed = True
+        self.exit_code = 0
+
+
+class _AcceptancePlatform:
+    lifecycle_capability = LocalProcessLifecycleCapability.PROCESS_GROUP_BEST_EFFORT
+
+    def __init__(self) -> None:
+        self.session = _AcceptancePlatformSession(self)
+        self.spawn_started = threading.Event()
+        self._on_output: TerminalOutputHandler | None = None
+        self._on_eof: TerminalEofHandler | None = None
+        self._on_error: TerminalErrorHandler | None = None
+        self.spawn_arguments: tuple[str, ...] = ()
+
+    def spawn_exec(
+        self,
+        executable: str,
+        arguments: tuple[str, ...],
+        *,
+        cwd: Path,
+        env: dict[str, str],
+        size: TerminalSize,
+        on_output: TerminalOutputHandler,
+        on_eof: TerminalEofHandler,
+        on_error: TerminalErrorHandler,
+    ) -> TerminalPlatformSession:
+        del cwd, env, size
+        self.spawn_arguments = (executable, *arguments)
+        self._on_output = on_output
+        self._on_eof = on_eof
+        self._on_error = on_error
+        self.spawn_started.set()
+        on_output(b"READY\n")
+        return self.session
+
+    def emit(self, data: bytes) -> None:
+        assert self._on_output is not None
+        self._on_output(data)
+
+
+class _AcceptanceSandbox(LocalProcessSandbox):
+    def __init__(self, platform: _AcceptancePlatform) -> None:
+        self.platform = platform
+        self.requests: list[SandboxedProcessRequest] = []
+
+    @property
+    def lifecycle_capability(self) -> LocalProcessLifecycleCapability:
+        return self.platform.lifecycle_capability
+
+    async def spawn(self, request: SandboxedProcessRequest) -> OwnedLocalProcess:
+        raise AssertionError(f"unexpected non-terminal spawn: {request.purpose.value}")
+
+    def spawn_terminal(
+        self,
+        request: SandboxedProcessRequest,
+        *,
+        size: TerminalSize,
+        on_output: TerminalOutputHandler,
+        on_eof: TerminalEofHandler,
+        on_error: TerminalErrorHandler,
+    ) -> TerminalPlatformSession:
+        self.requests.append(request)
+        assert request.executable is not None
+        return self.platform.spawn_exec(
+            request.executable,
+            request.arguments,
+            cwd=request.cwd,
+            env=request.environment_policy.variables,
+            size=size,
+            on_output=on_output,
+            on_eof=on_eof,
+            on_error=on_error,
+        )
 
 
 class InteractiveTerminalToolTests(unittest.IsolatedAsyncioTestCase):
@@ -232,9 +354,182 @@ class InteractiveTerminalToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(1, len(approver.requests))
             self.assertEqual(1, len(manager.create_calls))
             authorization = manager.create_calls[0]["authorization"]
-            self.assertEqual(TerminalCreationAuthorization("create-1"), authorization)
+            self.assertIsInstance(authorization, TerminalCreationAuthorization)
             self.assertIn(AgentEventKind.TOOL_STARTED, [event.kind for event in events])
             self.assertIn(AgentEventKind.TOOL_COMPLETED, [event.kind for event in events])
+
+            with self.assertRaises(TypeError):
+                TerminalCreationAuthorization("create-1")  # type: ignore[call-arg]
+
+    async def test_end_to_end_local_terminal_lifecycle_uses_one_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            platform = _AcceptancePlatform()
+            approver = _Approver(PermissionApproval.allow_once())
+            permissions = PermissionManager(
+                mode=PermissionMode.DEFAULT,
+                rules=(
+                    PermissionRule(PermissionEffect.ASK, "create_terminal"),
+                    PermissionRule(PermissionEffect.ALLOW, "terminal_write"),
+                    PermissionRule(PermissionEffect.ALLOW, "terminal_resize"),
+                    PermissionRule(PermissionEffect.ALLOW, "terminal_kill"),
+                ),
+                interactive=True,
+            )
+            manager = LocalInteractiveTerminalManager(
+                workspace=root,
+                workspace_path_resolver=FilesystemWorkspacePathResolver(),
+                permissions=permissions,
+                approver=approver,
+                sandbox_profile=SandboxProfile.OFF,
+                local_process_sandbox=_AcceptanceSandbox(platform),
+                protected_environment_variables=frozenset({"PRIVATE"}),
+            )
+            executor = ToolExecutor(
+                tools=ToolRegistry(
+                    [
+                        CreateTerminalTool(),
+                        TerminalOutputTool(),
+                        TerminalWriteTool(),
+                        TerminalResizeTool(),
+                        TerminalWaitTool(),
+                        TerminalKillTool(),
+                    ]
+                ),
+                permissions=permissions,
+                approver=approver,
+                tool_context=_context(root, manager),
+                session_store=None,
+                workspace_change_observer=_workspace_observer(),
+                context_builder=_context_builder(),
+            )
+            events: list[AgentEvent] = []
+
+            async def emit(kind: AgentEventKind, data: dict[str, object]) -> AgentEvent:
+                event = AgentEvent.create(len(events) + 1, kind, data)
+                events.append(event)
+                return event
+
+            async def execute(call: ToolCall) -> dict[str, Any]:
+                observation = await executor.execute(
+                    call,
+                    [],
+                    [],
+                    emit,
+                    "acceptance-session",
+                )
+                self.assertIsNotNone(observation)
+                completed = [
+                    event
+                    for event in events
+                    if event.kind is AgentEventKind.TOOL_COMPLETED
+                    and event.data.get("id") == call.id
+                ]
+                self.assertEqual(1, len(completed))
+                content = completed[0].data.get("content")
+                self.assertIsInstance(content, str)
+                return json.loads(content)
+
+            create_payload = await execute(
+                ToolCall(
+                    "create-1",
+                    "create_terminal",
+                    {
+                        "command": "python",
+                        "args": ["-c", "print('fixture')"],
+                        "cwd": ".",
+                        "env": {"PRIVATE": "not-approved-in-summary"},
+                        "columns": 80,
+                        "rows": 24,
+                        "output_capacity": 4_096,
+                    },
+                )
+            )
+            self.assertTrue(platform.spawn_started.is_set())
+            self.assertEqual(["python", "-c", "print('fixture')"], list(platform.spawn_arguments))
+            self.assertEqual(1, len(approver.requests))
+            self.assertIn("print('fixture')", approver.requests[0].summary)
+            self.assertNotIn("not-approved-in-summary", approver.requests[0].summary)
+            self.assertEqual("running", create_payload["status"])
+
+            sessions = await manager.list_sessions()
+            self.assertEqual(1, len(sessions))
+            terminal_id = sessions[0].session_id
+            first_output = await execute(
+                ToolCall(
+                    "output-1",
+                    "terminal_output",
+                    {"terminal_id": terminal_id, "max_bytes": 6},
+                )
+            )
+            self.assertEqual("READY\n", first_output["data"])
+            first_offset = first_output["next_offset"]
+            self.assertEqual(6, first_offset)
+
+            platform.emit(b"later\n")
+            later_output = await execute(
+                ToolCall(
+                    "output-2",
+                    "terminal_output",
+                    {"terminal_id": terminal_id, "after_offset": first_offset},
+                )
+            )
+            self.assertEqual("later\n", later_output["data"])
+            later_offset = later_output["next_offset"]
+
+            await execute(
+                ToolCall(
+                    "write-1",
+                    "terminal_write",
+                    {"terminal_id": terminal_id, "text": "input", "newline": True},
+                )
+            )
+            self.assertEqual([b"input\n"], platform.session.writes)
+            input_output = await execute(
+                ToolCall(
+                    "output-3",
+                    "terminal_output",
+                    {"terminal_id": terminal_id, "after_offset": later_offset},
+                )
+            )
+            self.assertEqual("stdin acknowledged\n", input_output["data"])
+
+            await execute(
+                ToolCall(
+                    "resize-1",
+                    "terminal_resize",
+                    {"terminal_id": terminal_id, "columns": 100, "rows": 40},
+                )
+            )
+            self.assertEqual([TerminalSize(100, 40)], platform.session.resizes)
+            waiting = await execute(
+                ToolCall(
+                    "wait-1",
+                    "terminal_wait",
+                    {"terminal_id": terminal_id, "timeout_seconds": 0},
+                )
+            )
+            self.assertEqual(
+                {"terminal_id": terminal_id, "status": "running", "exit_code": None},
+                waiting,
+            )
+
+            stopped = await execute(
+                ToolCall("kill-1", "terminal_kill", {"terminal_id": terminal_id})
+            )
+            self.assertEqual("exited", stopped["status"])
+            self.assertEqual(0, stopped["exit_code"])
+            self.assertTrue(platform.session.closed)
+            self.assertEqual((), await manager.list_sessions())
+            self.assertEqual(
+                1,
+                sum(event.kind is AgentEventKind.TOOL_APPROVAL_REQUESTED for event in events),
+            )
+
+            resource_scope = ConversationBindingResourceScope(manager.shutdown)
+            await resource_scope.close()
+            await resource_scope.close()
+            self.assertEqual((), await manager.list_sessions())
 
     async def test_denying_model_terminal_write_never_reaches_session(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

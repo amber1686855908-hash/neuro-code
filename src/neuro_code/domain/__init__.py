@@ -171,6 +171,7 @@ from neuro_code.domain.task_dag_result_relay import (
     render_task_dag_dependency_relay,
 )
 from neuro_code.domain.terminal.models import (
+    DEFAULT_TERMINAL_OUTPUT_CAPACITY,
     MAX_TERMINAL_DIMENSION,
     MAX_TERMINAL_OUTPUT_BYTES,
     MAX_TERMINAL_READ_BYTES,
@@ -226,6 +227,7 @@ __all__ = [
     "COMPACTION_SOURCE_FINGERPRINT_BYTES",
     "DEFAULT_BACKGROUND_WAKE_COOLDOWN_SECONDS",
     "DEFAULT_BACKGROUND_WAKE_MAX_PER_SESSION",
+    "DEFAULT_TERMINAL_OUTPUT_CAPACITY",
     "MAX_BACKGROUND_TASK_WAIT_IDS",
     "MAX_BACKGROUND_WAKE_COUNT",
     "MAX_BACKGROUND_WAKE_TASK_IDS",
