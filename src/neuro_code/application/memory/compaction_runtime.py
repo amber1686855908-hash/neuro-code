@@ -491,8 +491,8 @@ def build_automatic_context_compaction_runtime_request(
         if usage_override.capacity_tokens != provider_window.capacity_tokens:
             raise ValueError("usage_override capacity must match provider_window")
         if (
-            usage_override.provider_window is not None
-            and usage_override.provider_window != provider_window
+            usage_override.provider_window is None
+            or usage_override.provider_window != provider_window
         ):
             raise ValueError("usage_override provider_window must match provider_window")
         usage = usage_override

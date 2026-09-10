@@ -207,6 +207,7 @@ class AgentLoopRunner:
     管理一个 Agent 回合的步骤循环和最终化编排."""
 
     __slots__ = (
+        "_active_provider_window",
         "_compaction_runtime_gate",
         "_context_builder",
         "_execution_budget",
@@ -291,6 +292,7 @@ class AgentLoopRunner:
         self._tool_scheduler: ToolScheduler[_ScheduledToolOutcome] = ToolScheduler(tools)
         self._compaction_runtime_gate = compaction_runtime_gate
         self._provider_context_window = provider_context_window
+        self._active_provider_window = provider_context_window
         self._provider_max_output_tokens = provider_max_output_tokens
 
     @property
@@ -534,7 +536,12 @@ class AgentLoopRunner:
         finalize_turn_completion = recorder.finalize_turn_completion
 
         supervisor: AgentExecutionSupervisor | None = None
-        active_provider_window = self._provider_context_window
+        # Keep the binding-lifetime request budget separate from the currently
+        # selected provider identity.  A failover selection may expose a larger
+        # capacity, but a later request can still fall back to a smaller or
+        # unknown candidate.
+        request_budget_window = self._provider_context_window
+        active_provider_window = self._active_provider_window
         active_compaction_item: DurableCompactionItem | None = None
         has_completed_model_step = False
         segment_number = 1
@@ -777,14 +784,16 @@ class AgentLoopRunner:
             step: int,
             usage_context: ModelContext,
             usage_override: CompactionContextUsage | None = None,
+            provider_window_override: ProviderContextWindow | None = None,
         ) -> SupervisorDecision | None:
             nonlocal active_compaction_item
             gate = self._compaction_runtime_gate
+            compaction_window = provider_window_override or active_provider_window
             if (
                 self._execution_control_mode is not ExecutionControlMode.FINALIZE_TERMINAL
                 or (not has_completed_model_step and usage_override is None)
                 or gate is None
-                or active_provider_window is None
+                or compaction_window is None
                 or self._session_store is None
                 or session_id is None
             ):
@@ -800,7 +809,7 @@ class AgentLoopRunner:
                 source_context=source_context,
                 usage_context=usage_context,
                 boundary=ContextCompactionRuntimeBoundary(safe_point, step),
-                provider_window=active_provider_window,
+                provider_window=compaction_window,
                 protected_item_count=(
                     1
                     if source_context.items
@@ -1335,7 +1344,7 @@ class AgentLoopRunner:
                         model=self._provider.model_name,
                         context_affinity=getattr(self._provider, "context_affinity", None),
                         reasoning_effort=context.reasoning_effort,
-                        provider_window=active_provider_window,
+                        provider_window=request_budget_window,
                         max_output_tokens=self._provider_max_output_tokens,
                         compaction_attempted=False,
                     )
@@ -1375,7 +1384,7 @@ class AgentLoopRunner:
                         model=self._provider.model_name,
                         context_affinity=getattr(self._provider, "context_affinity", None),
                         reasoning_effort=context.reasoning_effort,
-                        provider_window=active_provider_window,
+                        provider_window=request_budget_window,
                         max_output_tokens=self._provider_max_output_tokens,
                         compaction_attempted=preflight_compaction_attempted,
                     )
@@ -1385,19 +1394,30 @@ class AgentLoopRunner:
                     )
                     if preflight.status is ContextPreflightStatus.COMPACTION_REQUIRED:
                         capacity = preflight.capacity_tokens
-                        if capacity is None or active_provider_window is None:
+                        if (
+                            capacity is None
+                            or request_budget_window is None
+                            or active_provider_window is None
+                        ):
                             raise ConfigurationError(
                                 "actionable context preflight must have a provider capacity"
                             )
+                        compaction_window = ProviderContextWindow(
+                            active_provider_window.provider_name,
+                            active_provider_window.model_name,
+                            request_budget_window.capacity_tokens,
+                            active_provider_window.context_affinity,
+                        )
                         compaction_decision = await maybe_compact_context(
                             ContextCompactionSafePoint.BEFORE_MODEL_REQUEST,
                             step=step,
                             usage_context=context,
                             usage_override=CompactionContextUsage.from_provider_window(
                                 max(preflight.estimated_input_tokens, capacity),
-                                active_provider_window,
+                                compaction_window,
                                 estimated=True,
                             ),
+                            provider_window_override=compaction_window,
                         )
                         preflight_compaction_attempted = True
                         if compaction_decision is not None:
@@ -1415,7 +1435,7 @@ class AgentLoopRunner:
                             model=self._provider.model_name,
                             context_affinity=getattr(self._provider, "context_affinity", None),
                             reasoning_effort=context.reasoning_effort,
-                            provider_window=active_provider_window,
+                            provider_window=request_budget_window,
                             max_output_tokens=self._provider_max_output_tokens,
                             compaction_attempted=preflight_compaction_attempted,
                         )
@@ -1516,9 +1536,10 @@ class AgentLoopRunner:
                     )
                     # A failover provider can keep its selected candidate across
                     # turns without announcing it again. Retain the last explicit
-                    # selection so the next turn never falls back to stale primary
-                    # context-window metadata.
-                    self._provider_context_window = active_provider_window
+                    # selection for compaction identity, while the separate
+                    # request budget remains the binding-lifetime failover-safe
+                    # capacity supplied at composition time.
+                    self._active_provider_window = active_provider_window
                     if active_compaction_item is not None and (
                         active_compaction_item.provider_name != selected.provider
                         or active_compaction_item.model_name != selected.model

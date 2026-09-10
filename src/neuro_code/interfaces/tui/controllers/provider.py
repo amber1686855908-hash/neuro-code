@@ -74,6 +74,10 @@ class ProviderControllerMixin(TuiAppControllerMixin):
         if self._plan_controller is not None:
             self._plan = self._plan_controller.plan
         self._context_window_tokens = result.context_window_tokens
+        self._context_preflight_status = None
+        self._context_preflight_capacity_tokens = None
+        self._context_preflight_total_tokens = False
+        self._context_preflight_notice = None
         if result.changed:
             self._context_used_tokens = 0
             self._context_usage_estimated = True

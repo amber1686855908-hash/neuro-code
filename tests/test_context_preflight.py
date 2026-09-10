@@ -270,6 +270,11 @@ class ContextPreflightRuntimeTests(unittest.IsolatedAsyncioTestCase):
             active_window = ProviderContextWindow("fixture", "fixture-model", 1_000)
             stale_window = ProviderContextWindow("other", "other-model", 2_000)
             same_capacity_other_window = ProviderContextWindow("other", "other-model", 1_000)
+            identityless_usage = CompactionContextUsage(
+                used_tokens=10,
+                capacity_tokens=1_000,
+                estimated=True,
+            )
 
             with self.assertRaisesRegex(ValueError, "usage_override capacity"):
                 build_automatic_context_compaction_runtime_request(
@@ -287,6 +292,67 @@ class ContextPreflightRuntimeTests(unittest.IsolatedAsyncioTestCase):
                         estimated=True,
                     ),
                 )
+            with self.assertRaisesRegex(ValueError, "usage_override provider_window"):
+                build_automatic_context_compaction_runtime_request(
+                    service,
+                    source_context=ModelContext((Message(Role.USER, "source"),)),
+                    usage_context=ModelContext((Message(Role.USER, "usage"),)),
+                    boundary=ContextCompactionRuntimeBoundary(
+                        ContextCompactionSafePoint.BEFORE_MODEL_REQUEST,
+                        0,
+                    ),
+                    provider_window=active_window,
+                    usage_override=identityless_usage,
+                )
+
+            active_window = ProviderContextWindow(
+                "fixture",
+                "fixture-model",
+                1_000,
+                "profile-v1:fixture",
+            )
+            identity_variants = (
+                ProviderContextWindow("other", "fixture-model", 1_000, "profile-v1:fixture"),
+                ProviderContextWindow("fixture", "other-model", 1_000, "profile-v1:fixture"),
+                ProviderContextWindow("fixture", "fixture-model", 1_000, "profile-v1:other"),
+            )
+            for variant in identity_variants:
+                with (
+                    self.subTest(variant=variant),
+                    self.assertRaisesRegex(ValueError, "usage_override provider_window"),
+                ):
+                    build_automatic_context_compaction_runtime_request(
+                        service,
+                        source_context=ModelContext((Message(Role.USER, "source"),)),
+                        usage_context=ModelContext((Message(Role.USER, "usage"),)),
+                        boundary=ContextCompactionRuntimeBoundary(
+                            ContextCompactionSafePoint.BEFORE_MODEL_REQUEST,
+                            0,
+                        ),
+                        provider_window=active_window,
+                        usage_override=CompactionContextUsage.from_provider_window(
+                            10,
+                            variant,
+                            estimated=True,
+                        ),
+                    )
+            exact_usage = CompactionContextUsage.from_provider_window(
+                10,
+                active_window,
+                estimated=True,
+            )
+            request = build_automatic_context_compaction_runtime_request(
+                service,
+                source_context=ModelContext((Message(Role.USER, "source"),)),
+                usage_context=ModelContext((Message(Role.USER, "usage"),)),
+                boundary=ContextCompactionRuntimeBoundary(
+                    ContextCompactionSafePoint.BEFORE_MODEL_REQUEST,
+                    0,
+                ),
+                provider_window=active_window,
+                usage_override=exact_usage,
+            )
+            self.assertIs(request.trigger.usage, exact_usage)
             with self.assertRaisesRegex(ValueError, "usage_override provider_window"):
                 build_automatic_context_compaction_runtime_request(
                     service,

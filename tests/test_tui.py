@@ -3299,6 +3299,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             provider_name="fixture",
             model_name="fixture-model",
             cwd=Path("/workspace"),
+            context_window_tokens=100_000,
         )
 
         async with app.run_test(size=(90, 24)) as pilot:
@@ -3330,7 +3331,7 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             provider_name="fixture",
             model_name="fixture-model",
             cwd=Path("/workspace"),
-            context_window_tokens=1_000,
+            context_window_tokens=100_000,
         )
 
         async with app.run_test(size=(100, 24)) as pilot:
@@ -3340,9 +3341,9 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                     AgentEventKind.CONTEXT_PREFLIGHT,
                     {
                         "status": "compaction_required",
-                        "estimated_input_tokens": 800,
-                        "estimated_total_tokens": 1_100,
-                        "capacity_tokens": 1_000,
+                        "estimated_input_tokens": 50_000,
+                        "estimated_total_tokens": 55_000,
+                        "capacity_tokens": 50_000,
                     },
                 )
             )
@@ -3366,9 +3367,9 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                     AgentEventKind.CONTEXT_PREFLIGHT,
                     {
                         "status": "safe",
-                        "estimated_input_tokens": 600,
-                        "estimated_total_tokens": 900,
-                        "capacity_tokens": 1_000,
+                        "estimated_input_tokens": 40_000,
+                        "estimated_total_tokens": 45_000,
+                        "capacity_tokens": 50_000,
                     },
                 )
             )
@@ -3386,14 +3387,43 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                     AgentEventKind.CONTEXT_PREFLIGHT,
                     {
                         "status": "blocked",
-                        "estimated_input_tokens": 900,
-                        "estimated_total_tokens": 1_200,
-                        "capacity_tokens": 1_000,
+                        "estimated_input_tokens": 50_000,
+                        "estimated_total_tokens": 55_000,
+                        "capacity_tokens": 50_000,
                     },
                 )
             )
             await pilot.pause()
             self.assertIn("exceeds the available budget", app.entries[-1].text)
+            context = app.query_one("#runtime-secondary", Static)
+            self.assertIn("110.0%", rendered_text(app, context.renderable))
+            self.assertIn("55,000 / 50,000", str(context.tooltip))
+
+            await app._handle_event(
+                AgentEvent.create(
+                    1,
+                    AgentEventKind.PROVIDER_SELECTED,
+                    {
+                        "provider": "fixture",
+                        "model": "fixture-model",
+                        "context_window_tokens": 100_000,
+                    },
+                )
+            )
+            await pilot.pause()
+            self.assertIn("55.0%", rendered_text(app, context.renderable))
+            self.assertIn("55,000 / 100,000", str(context.tooltip))
+
+            await app._handle_event(
+                AgentEvent.create(
+                    1,
+                    AgentEventKind.CONTEXT_USAGE_UPDATED,
+                    {"used_tokens": 85000, "estimated": False},
+                )
+            )
+            await pilot.pause()
+            self.assertIn("85.0%", rendered_text(app, context.renderable))
+            self.assertIn("85,000 / 100,000", str(context.tooltip))
 
     async def test_runtime_budget_telemetry_is_not_rendered_in_the_tui(self) -> None:
         app = NeuroCodeApp(

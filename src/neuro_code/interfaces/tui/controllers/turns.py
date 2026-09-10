@@ -66,6 +66,10 @@ class TurnControllerMixin(TuiAppControllerMixin):
         self._write_entry("user", prompt)
         self._context_used_tokens += 4 + estimate_text_tokens(prompt)
         self._context_usage_estimated = True
+        self._context_preflight_status = None
+        self._context_preflight_capacity_tokens = None
+        self._context_preflight_total_tokens = False
+        self._context_preflight_notice = None
         self._refresh_runtime_bar()
         self._assistant_parts.clear()
         self._first_token_seen = False
@@ -75,9 +79,6 @@ class TurnControllerMixin(TuiAppControllerMixin):
         self._terminal_execution_recoverable = False
         self._finalizing = False
         self._turn_usage_reported = False
-        self._context_preflight_status = None
-        self._context_preflight_total_tokens = False
-        self._context_preflight_notice = None
         self._begin_pending_assistant()
         self._turn_worker = self.run_worker(
             self._run_prompt(prompt),
@@ -349,11 +350,24 @@ class TurnControllerMixin(TuiAppControllerMixin):
             if isinstance(used_tokens, int) and not isinstance(used_tokens, bool):
                 self._context_used_tokens = max(0, used_tokens)
                 self._context_usage_estimated = data.get("estimated") is not False
+                self._context_preflight_status = None
+                self._context_preflight_capacity_tokens = None
                 self._context_preflight_total_tokens = False
+                self._context_preflight_notice = None
                 self._turn_usage_reported = not self._context_usage_estimated
                 self._refresh_runtime_bar()
         elif event.kind is AgentEventKind.CONTEXT_PREFLIGHT:
             status = data.get("status")
+            if isinstance(status, str):
+                self._context_preflight_status = status
+            capacity_tokens = data.get("capacity_tokens")
+            self._context_preflight_capacity_tokens = (
+                capacity_tokens
+                if isinstance(capacity_tokens, int)
+                and not isinstance(capacity_tokens, bool)
+                and capacity_tokens > 0
+                else None
+            )
             estimated_input_tokens = data.get("estimated_input_tokens")
             if isinstance(estimated_input_tokens, int) and not isinstance(
                 estimated_input_tokens,
@@ -378,7 +392,6 @@ class TurnControllerMixin(TuiAppControllerMixin):
                 self._turn_usage_reported = False
                 self._refresh_runtime_bar()
             if isinstance(status, str):
-                self._context_preflight_status = status
                 notice_key = {
                     "compaction_required": "context.preflight.compaction_required",
                     "blocked": "context.preflight.blocked",
@@ -421,6 +434,10 @@ class TurnControllerMixin(TuiAppControllerMixin):
                 and context_window_tokens > 0
                 else None
             )
+            self._context_preflight_status = None
+            self._context_preflight_capacity_tokens = None
+            self._context_preflight_total_tokens = False
+            self._context_preflight_notice = None
             self._refresh_runtime_bar()
             key = (
                 "provider.fallback_selected"
