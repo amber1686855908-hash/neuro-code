@@ -116,6 +116,12 @@ class CompositionLifecycleMixin(CompositionRootMixin):
         if self._closed:
             return
         self._closed = True
+        binding_scopes = tuple(self._binding_scopes)
+        self._binding_scopes.clear()
+        await asyncio.gather(
+            *(scope.close() for scope in binding_scopes),
+            return_exceptions=True,
+        )
         lsp_services = tuple(self._lsp_services)
         self._lsp_services.clear()
         await asyncio.gather(

@@ -18,6 +18,7 @@ from neuro_code.application.ports.instructions import InstructionDiscovery
 from neuro_code.application.ports.skills import SkillDiscovery
 from neuro_code.application.ports.storage import SessionStore
 from neuro_code.application.sessions import SessionApplicationService
+from neuro_code.application.sessions.binding import ConversationBindingResourceScope
 from neuro_code.application.sessions.summary import SessionSummaryQueryService
 from neuro_code.application.settings import ApplicationSettings
 from neuro_code.bootstrap.composition_bindings import CompositionBindingMixin
@@ -94,6 +95,7 @@ class ApplicationComposition(
         )
         self._workspace_change_observer_factory = workspace_change_observer_factory
         self._lsp_services: set[LanguageServerManager] = set()
+        self._binding_scopes: set[ConversationBindingResourceScope] = set()
         self._closed = False
 
 

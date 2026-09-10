@@ -185,6 +185,7 @@ _TUI_CANONICAL_CLASS_OWNERS = {
     "AssistantMarkdown": "neuro_code.interfaces.tui.widgets",
     "ConversationMessage": "neuro_code.interfaces.tui.widgets",
     "AssistantMessage": "neuro_code.interfaces.tui.widgets",
+    "AttachedTerminalPanel": "neuro_code.interfaces.tui.widgets",
     "PromptInput": "neuro_code.interfaces.tui.widgets",
     "ToolFeedbackMessage": "neuro_code.interfaces.tui.widgets",
     "TranscriptCopyScreen": "neuro_code.interfaces.tui.screens.transcript",
@@ -209,6 +210,7 @@ _TUI_CANONICAL_CLASS_OWNERS = {
     "PlanControllerMixin": "neuro_code.interfaces.tui.controllers.plans",
     "TaskControllerMixin": "neuro_code.interfaces.tui.controllers.tasks",
     "BackgroundControllerMixin": "neuro_code.interfaces.tui.controllers.background",
+    "AttachedTerminalControllerMixin": "neuro_code.interfaces.tui.controllers.terminals",
     "TranscriptControllerMixin": "neuro_code.interfaces.tui.controllers.transcript",
     "RuntimeControllerMixin": "neuro_code.interfaces.tui.controllers.runtime",
 }
@@ -1632,6 +1634,7 @@ def test_canonical_tool_modules_are_the_only_tool_implementations() -> None:
         "neuro_code.infrastructure.tools.filesystem_search",
         "neuro_code.infrastructure.tools.filesystem_security",
         "neuro_code.infrastructure.tools.interaction",
+        "neuro_code.infrastructure.tools.interactive_terminal",
         "neuro_code.infrastructure.tools.lsp",
         "neuro_code.infrastructure.tools.plans",
         "neuro_code.infrastructure.tools.registry",

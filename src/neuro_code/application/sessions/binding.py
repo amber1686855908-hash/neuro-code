@@ -23,6 +23,7 @@ from neuro_code.application.memory.compaction_runtime import (
 from neuro_code.application.ports.background_tasks import BackgroundTaskManager
 from neuro_code.application.ports.model import ModelProvider
 from neuro_code.application.ports.result_adoption import WorkspaceMutationPort
+from neuro_code.application.ports.terminal import InteractiveTerminalManager
 from neuro_code.application.ports.tools import Tool
 from neuro_code.application.runtime.agent import AgentRunResult, EventSink
 from neuro_code.application.sessions.recovery import TurnRecoveryInspection
@@ -243,6 +244,10 @@ class ConversationBinding:
     provider: ModelProvider
     background_tasks: BackgroundTaskManager | None = None
     capabilities: SubagentCapabilitySet | None = None
+    interactive_terminals: InteractiveTerminalManager | None = field(
+        default=None,
+        kw_only=True,
+    )
     resource_scope: ConversationBindingResourceScope | None = field(
         default=None,
         kw_only=True,
@@ -256,6 +261,8 @@ class ConversationBinding:
         if self.resource_scope is not None:
             await self.resource_scope.close()
             return
+        if self.interactive_terminals is not None:
+            await self.interactive_terminals.shutdown()
         if self.background_tasks is not None:
             await self.background_tasks.shutdown()
 

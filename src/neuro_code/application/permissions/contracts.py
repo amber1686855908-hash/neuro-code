@@ -131,6 +131,53 @@ def _bounded_text(value: object, *, limit: int) -> str:
     return f"{sanitized[:limit]}\n… [truncated]"
 
 
+def _bounded_json_string(value: object, *, limit: int) -> str:
+    """Render one argv item without shell interpretation or unbounded output."""
+
+    text = value if isinstance(value, str) else "(not provided)"
+    text = text.replace("\x00", "�")
+    rendered = json.dumps(text, ensure_ascii=False, separators=(",", ":"))
+    if len(rendered) <= limit:
+        return rendered
+    marker = "… [truncated]"
+    for prefix_length in range(len(text), -1, -1):
+        candidate = json.dumps(
+            text[:prefix_length] + marker,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        if len(candidate) <= limit:
+            return candidate
+    return json.dumps("…", ensure_ascii=False, separators=(",", ":"))
+
+
+def _bounded_argv(command: object, arguments: object, *, limit: int) -> str:
+    """Render the complete executable/argv shape for an approval summary.
+
+    Every argument keeps a position in the JSON-like list.  Long values are
+    individually marked as truncated, and no shell quoting is used.
+    """
+
+    values = (
+        (command, *arguments)
+        if isinstance(arguments, list | tuple)
+        else (command, "(invalid args)")
+    )
+    if all(isinstance(value, str) for value in values):
+        rendered = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+        if len(rendered) <= limit:
+            return rendered
+    item_limit = max(3, (limit - 2 - 2 * len(values)) // max(1, len(values)))
+    rendered_items = [_bounded_json_string(value, limit=item_limit) for value in values]
+    rendered = "[" + ",".join(rendered_items) + "]"
+    if len(rendered) <= limit:
+        return rendered
+    # The terminal tool caps its argv count well below this fallback.  Keep
+    # all positions visible even when a non-canonical caller supplies more.
+    marker = json.dumps("…", ensure_ascii=False, separators=(",", ":"))
+    return "[" + ",".join(marker for _ in values) + "]"
+
+
 def _scope_json_default(value: object) -> object:
     if isinstance(value, Mapping):
         return dict(value)
@@ -156,7 +203,7 @@ def build_permission_request(
         summary = f"Run shell command:\n{_bounded_text(command, limit=2_000)}"
         cacheable = isinstance(command, str) and analyze_bash_command(command).complete
     elif tool_name == "create_terminal":
-        command = _bounded_text(arguments.get("command"), limit=2_000)
+        command = _bounded_argv(arguments.get("command"), arguments.get("args", ()), limit=2_000)
         cwd = _bounded_text(arguments.get("cwd"), limit=500)
         summary = f"Create interactive terminal:\n{command}\nWorking directory: {cwd}"
     elif tool_name == "search_replace":

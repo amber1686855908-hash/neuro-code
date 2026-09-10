@@ -15,6 +15,10 @@ from neuro_code.application.ports.client_terminal import ClientTerminal
 from neuro_code.application.ports.instructions import InstructionContextTracker
 from neuro_code.application.ports.sandbox import LocalProcessSandbox
 from neuro_code.application.ports.skills import SkillContextTracker
+from neuro_code.application.ports.terminal import (
+    InteractiveTerminalManager,
+    TerminalCreationAuthorization,
+)
 from neuro_code.application.ports.user_interaction import (
     InteractionEventSink,
     UserInteractionPort,
@@ -170,6 +174,15 @@ class ToolContext:
     user_interaction: UserInteractionPort | None = None
     interaction_event_sink: InteractionEventSink | None = field(default=None, repr=False)
     web_search_event_sink: HostedWebSearchEventSink | None = field(default=None, repr=False)
+    terminal_creation_authorization: TerminalCreationAuthorization | None = field(
+        default=None,
+        repr=False,
+        kw_only=True,
+    )
+    interactive_terminals: InteractiveTerminalManager | None = field(
+        default=None,
+        kw_only=True,
+    )
 
 
 class Tool(Protocol):

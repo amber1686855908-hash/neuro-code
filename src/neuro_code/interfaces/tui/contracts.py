@@ -10,6 +10,7 @@ from typing import Protocol
 
 from neuro_code.application.memory.compaction_runtime import ContextCompactionCommandResult
 from neuro_code.application.permissions.broker import ApprovalHandler
+from neuro_code.application.ports.terminal import InteractiveTerminalManager
 from neuro_code.application.providers.contracts import ProviderOption, ProviderSelectionResult
 from neuro_code.application.providers.service import ChangeProviderRequest
 from neuro_code.application.runtime.agent import AgentRunResult, EventSink
@@ -32,6 +33,9 @@ from neuro_code.domain.session_tasks import SessionTask
 
 
 class ConversationRunner(Protocol):
+    @property
+    def interactive_terminals(self) -> InteractiveTerminalManager | None: ...
+
     @property
     def session_id(self) -> str | None: ...
 

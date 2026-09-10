@@ -14,6 +14,7 @@ from dataclasses import replace
 from typing import Any
 
 from neuro_code.application.memory.compaction_runtime import ContextCompactionCommandResult
+from neuro_code.application.ports.terminal import InteractiveTerminalManager
 from neuro_code.application.ports.tools import Tool
 from neuro_code.application.providers.contracts import (
     ProviderOption,
@@ -136,6 +137,12 @@ class ProfileConversationController:
     @property
     def model_name(self) -> str:
         return self._binding.provider.model_name
+
+    @property
+    def interactive_terminals(self) -> InteractiveTerminalManager | None:
+        """Expose the current binding's optional attached-terminal manager."""
+
+        return self._binding.interactive_terminals
 
     @property
     def capabilities(self) -> SubagentCapabilitySet:
@@ -591,11 +598,11 @@ class ProfileConversationController:
     @staticmethod
     async def _shutdown_binding_tasks(binding: ConversationBinding) -> int:
         manager = binding.background_tasks
-        if manager is None:
-            return 0
-        snapshots = await manager.list()
-        running = sum(snapshot.status is BackgroundTaskStatus.RUNNING for snapshot in snapshots)
-        await manager.shutdown()
+        running = 0
+        if manager is not None:
+            snapshots = await manager.list()
+            running = sum(snapshot.status is BackgroundTaskStatus.RUNNING for snapshot in snapshots)
+        await binding.close()
         return running
 
     def _resume_profile(self, summary: SessionSummary) -> tuple[str, bool, bool]:

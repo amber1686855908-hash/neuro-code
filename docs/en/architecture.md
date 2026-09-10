@@ -1001,6 +1001,17 @@ registered sessions. The substrate is intentionally not exposed through ACP
 until protocol framing, authorization and backpressure are defined. See
 [ADR 0034](adr/0034-bounded-owned-interactive-terminal-sessions.md).
 
+Normal local CLI/TUI bindings may additionally expose the bounded attached
+terminal tools `create_terminal`, `terminal_output`, `terminal_write`,
+`terminal_resize`, `terminal_wait`, and `terminal_kill`. They address the same
+binding-owned manager; terminal IDs and cursor output are opaque, bounded,
+memory-only, and same-process. Binding replacement or shutdown closes every
+owned session, while a process crash does not restore one. The TUI presents
+one selected session rather than a terminal emulator, and attached terminals
+are not verification evidence. ACP, subagents, planners, and UltraCode
+workers do not receive this local tool family; ACP's existing client-terminal
+contract is unchanged.
+
 Runtime timing uses monotonic clocks. `MODEL_THINKING_COMPLETED` measures each
 model step from dispatch to the first visible/actionable result; it does not
 claim access to private provider reasoning telemetry. Tool terminal events carry

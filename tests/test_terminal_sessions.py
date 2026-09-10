@@ -20,10 +20,12 @@ from neuro_code.application.ports.sandbox import (
     SandboxedProcessRequest,
 )
 from neuro_code.application.ports.terminal import (
+    TerminalCreationAuthorization,
     TerminalEofHandler,
     TerminalErrorHandler,
     TerminalOutputHandler,
     TerminalPlatformSession,
+    _issue_terminal_creation_authorization,
 )
 from neuro_code.application.ports.workspace import WorkspacePathResolver
 from neuro_code.application.sessions.terminal_sessions import LocalInteractiveTerminalManager
@@ -442,6 +444,172 @@ class LocalInteractiveTerminalManagerTests(unittest.IsolatedAsyncioTestCase):
                 )
             self.assertEqual(rejected_platform.spawn_calls, [])
             await rejected.shutdown()
+
+    async def test_pipeline_authorization_skips_duplicate_manager_approval(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            platform = _FakeTerminalPlatform()
+            manager = self._manager(
+                root,
+                platform,
+                permissions=PermissionManager(),
+            )
+            authorization = _issue_terminal_creation_authorization(
+                "create-terminal-call",
+                {
+                    "command": "python",
+                    "args": ["-V"],
+                    "cwd": ".",
+                    "env": {},
+                    "columns": 80,
+                    "rows": 24,
+                    "output_capacity": 100,
+                },
+            )
+            session = await manager.create_exec(
+                "create-terminal-call",
+                "python",
+                ("-V",),
+                cwd=".",
+                env={},
+                size=TerminalSize(80, 24),
+                output_capacity=100,
+                authorization=authorization,
+            )
+            self.assertEqual(1, len(platform.spawn_calls))
+            self.assertIs(await manager.get_session(session.session_id), session)
+            self.assertEqual((session,), await manager.list_sessions())
+            self.assertIsNone(await manager.get_session("terminal-missing"))
+            await session.close()
+            self.assertIsNone(await manager.get_session(session.session_id))
+            self.assertEqual((), await manager.list_sessions())
+            await manager.shutdown()
+
+    async def test_terminal_authorization_is_opaque_exact_and_one_use(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            child = root / "child"
+            child.mkdir()
+            platform = _FakeTerminalPlatform()
+            manager = self._manager(root, platform, permissions=PermissionManager())
+            authorization = _issue_terminal_creation_authorization(
+                "call-1",
+                {
+                    "command": "python",
+                    "args": ["-c", "print('ok')"],
+                    "cwd": ".",
+                    "env": {"TOKEN": "approved"},
+                    "columns": 80,
+                    "rows": 24,
+                    "output_capacity": 100,
+                },
+            )
+
+            with self.assertRaisesRegex(PermissionDenied, "invalid or mismatched"):
+                await manager.create_exec(
+                    "wrong-call",
+                    "python",
+                    ("-c", "print('ok')"),
+                    cwd=".",
+                    env={"TOKEN": "approved"},
+                    size=TerminalSize(80, 24),
+                    output_capacity=100,
+                    authorization=authorization,
+                )
+            with self.assertRaisesRegex(PermissionDenied, "invalid or mismatched"):
+                await manager.create_exec(
+                    "call-1",
+                    "pypy",
+                    ("-c", "print('ok')"),
+                    cwd=".",
+                    env={"TOKEN": "approved"},
+                    size=TerminalSize(80, 24),
+                    output_capacity=100,
+                    authorization=authorization,
+                )
+            with self.assertRaisesRegex(PermissionDenied, "invalid or mismatched"):
+                await manager.create_exec(
+                    "call-1",
+                    "python",
+                    ("-c", "print('different')"),
+                    cwd=".",
+                    env={"TOKEN": "approved"},
+                    size=TerminalSize(80, 24),
+                    output_capacity=100,
+                    authorization=authorization,
+                )
+            with self.assertRaisesRegex(PermissionDenied, "invalid or mismatched"):
+                await manager.create_exec(
+                    "call-1",
+                    "python",
+                    ("-c", "print('ok')"),
+                    cwd="child",
+                    env={"TOKEN": "approved"},
+                    size=TerminalSize(80, 24),
+                    output_capacity=100,
+                    authorization=authorization,
+                )
+            with self.assertRaisesRegex(PermissionDenied, "invalid or mismatched"):
+                await manager.create_exec(
+                    "call-1",
+                    "python",
+                    ("-c", "print('ok')"),
+                    cwd=".",
+                    env={"TOKEN": "changed"},
+                    size=TerminalSize(80, 24),
+                    output_capacity=100,
+                    authorization=authorization,
+                )
+            with self.assertRaisesRegex(PermissionDenied, "invalid or mismatched"):
+                await manager.create_exec(
+                    "call-1",
+                    "python",
+                    ("-c", "print('ok')"),
+                    cwd=".",
+                    env={"TOKEN": "approved"},
+                    size=TerminalSize(81, 24),
+                    output_capacity=100,
+                    authorization=authorization,
+                )
+            with self.assertRaisesRegex(PermissionDenied, "invalid or mismatched"):
+                await manager.create_exec(
+                    "call-1",
+                    "python",
+                    ("-c", "print('ok')"),
+                    cwd=".",
+                    env={"TOKEN": "approved"},
+                    size=TerminalSize(80, 24),
+                    output_capacity=101,
+                    authorization=authorization,
+                )
+
+            with self.assertRaises(TypeError):
+                TerminalCreationAuthorization("call-1")  # type: ignore[call-arg]
+
+            session = await manager.create_exec(
+                "call-1",
+                "python",
+                ("-c", "print('ok')"),
+                cwd=".",
+                env={"TOKEN": "approved"},
+                size=TerminalSize(80, 24),
+                output_capacity=100,
+                authorization=authorization,
+            )
+            self.assertEqual(1, len(platform.spawn_calls))
+            with self.assertRaisesRegex(PermissionDenied, "invalid or mismatched"):
+                await manager.create_exec(
+                    "call-1",
+                    "python",
+                    ("-c", "print('ok')"),
+                    cwd=".",
+                    env={"TOKEN": "approved"},
+                    size=TerminalSize(80, 24),
+                    output_capacity=100,
+                    authorization=authorization,
+                )
+            await session.close()
+            await manager.shutdown()
 
     async def test_workspace_and_sandbox_boundaries_precede_spawn(self) -> None:
         with TemporaryDirectory() as directory:

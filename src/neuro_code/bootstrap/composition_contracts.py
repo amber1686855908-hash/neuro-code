@@ -26,7 +26,10 @@ if TYPE_CHECKING:
     from neuro_code.application.ports.tools import Tool
     from neuro_code.application.ports.user_interaction import UserInteractionPort
     from neuro_code.application.sessions import SessionApplicationService
-    from neuro_code.application.sessions.binding import ConversationBinding
+    from neuro_code.application.sessions.binding import (
+        ConversationBinding,
+        ConversationBindingResourceScope,
+    )
     from neuro_code.application.sessions.summary import SessionSummaryQueryService
     from neuro_code.application.settings import ApplicationSettings
     from neuro_code.application.workflows.agent_swarm import AgentSwarmApplicationService
@@ -70,6 +73,7 @@ class CompositionRootMixin:
         _session_service: SessionApplicationService
         _session_summary_queries: SessionSummaryQueryService
         _lsp_services: set[LanguageServerManager]
+        _binding_scopes: set[ConversationBindingResourceScope]
         _closed: bool
 
         @property
@@ -98,6 +102,7 @@ class CompositionRootMixin:
             dag_result_relay: TaskDagDependencyResultRelay | None = None,
             final_output_gate_enabled: bool = True,
             normal_requirements_enabled: bool = True,
+            enable_local_attached_terminals: bool = False,
         ) -> ConversationBinding: ...
 
         def create_worktree_service(self) -> WorktreeApplicationService: ...

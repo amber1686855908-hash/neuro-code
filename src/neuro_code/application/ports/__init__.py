@@ -133,6 +133,7 @@ from neuro_code.application.ports.task_dag_result_relay import (
 from neuro_code.application.ports.terminal import (
     InteractiveTerminalManager,
     InteractiveTerminalSession,
+    TerminalCreationAuthorization,
 )
 from neuro_code.application.ports.tool_pipeline import ToolPipelineHook
 from neuro_code.application.ports.tools import (
@@ -401,6 +402,7 @@ __all__ = [
     "TaskDagReplanStore",
     "TaskDagReplanStoreError",
     "TaskDagStore",
+    "TerminalCreationAuthorization",
     "Tool",
     "ToolCollection",
     "ToolContext",
