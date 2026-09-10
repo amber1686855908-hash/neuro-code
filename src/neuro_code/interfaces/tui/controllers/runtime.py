@@ -270,7 +270,9 @@ class RuntimeControllerMixin(TuiAppControllerMixin):
             else ui_text(
                 self._language,
                 (
-                    "runtime.context_help_estimated"
+                    "runtime.context_help_preflight"
+                    if self._context_preflight_total_tokens
+                    else "runtime.context_help_estimated"
                     if self._context_usage_estimated
                     else "runtime.context_help_reported"
                 ),

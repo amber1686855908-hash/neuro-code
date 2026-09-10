@@ -1009,6 +1009,13 @@ class AgentLoopRunner:
             step: int,
             deterministic_fallback_only: bool = False,
         ) -> AgentRunResult:
+            # A repeated context-budget decision means that the durable
+            # compaction projection already covers this source range but the
+            # request still cannot fit.  Do not issue an oversized finalizer
+            # request; the deterministic fallback is the only bounded path.
+            deterministic_fallback_only = deterministic_fallback_only or (
+                decision.reason_code is SupervisorReasonCode.CONTEXT_WINDOW_BUDGET
+            )
             await maybe_acquire_explicit_verification()
             if (
                 decision.reason_code is SupervisorReasonCode.MODEL_CALL_BUDGET
@@ -1315,6 +1322,40 @@ class AgentLoopRunner:
                         )
                 append_budget_pressure_notice(include_model_reserve=True)
                 context = await build_request_context(completion_reminders)
+                tool_definitions = tuple(self._tools.definitions())
+                if self._execution_control_mode is ExecutionControlMode.FINALIZE_TERMINAL:
+                    # Reject requests whose immutable request cost alone
+                    # cannot fit before consulting the automatic compaction
+                    # boundary.  Conversation history is the only reducible
+                    # component and is handled by the bounded path below.
+                    initial_preflight = assess_context_preflight(
+                        context=context,
+                        tools=tool_definitions,
+                        provider=self._provider.provider_name,
+                        model=self._provider.model_name,
+                        context_affinity=getattr(self._provider, "context_affinity", None),
+                        reasoning_effort=context.reasoning_effort,
+                        provider_window=active_provider_window,
+                        max_output_tokens=self._provider_max_output_tokens,
+                        compaction_attempted=False,
+                    )
+                    if initial_preflight.status is ContextPreflightStatus.BLOCKED:
+                        await emit(
+                            AgentEventKind.CONTEXT_PREFLIGHT,
+                            initial_preflight.to_event_data(),
+                        )
+                        preflight_decision = SupervisorDecision(
+                            SupervisorDecisionKind.MARK_BUDGET_LIMITED,
+                            "context request has an irreducible cost above its configured budget",
+                            AgentExecutionStatus.BUDGET_LIMITED,
+                            False,
+                            SupervisorReasonCode.CONTEXT_WINDOW_BUDGET,
+                        )
+                        return await complete_finalized_turn(
+                            preflight_decision,
+                            step=step - 1,
+                            deterministic_fallback_only=True,
+                        )
                 prior_compaction_item = active_compaction_item
                 compaction_decision = await maybe_compact_context(
                     ContextCompactionSafePoint.BEFORE_MODEL_REQUEST,
@@ -1326,7 +1367,6 @@ class AgentLoopRunner:
                 preflight_compaction_attempted = active_compaction_item is not prior_compaction_item
                 if active_compaction_item is not prior_compaction_item:
                     context = await build_request_context(completion_reminders)
-                tool_definitions = tuple(self._tools.definitions())
                 if self._execution_control_mode is ExecutionControlMode.FINALIZE_TERMINAL:
                     preflight = assess_context_preflight(
                         context=context,

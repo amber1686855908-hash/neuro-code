@@ -110,6 +110,9 @@ class ContextPreflightAssessment:
     capacity_tokens: int | None
     estimated_remaining_tokens: int | None
     compaction_attempted: bool = False
+    context_tokens: int | None = None
+    request_shape_tokens: int | None = None
+    irreducible_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, ContextPreflightStatus):
@@ -124,6 +127,9 @@ class ContextPreflightAssessment:
             "estimated_remaining_tokens",
             self.estimated_remaining_tokens,
         )
+        _optional_non_negative_int("context_tokens", self.context_tokens)
+        _optional_non_negative_int("request_shape_tokens", self.request_shape_tokens)
+        _optional_non_negative_int("irreducible_tokens", self.irreducible_tokens)
         if self.capacity_tokens is not None and self.capacity_tokens < 1:
             raise ValueError("capacity_tokens must be positive when provided")
         if not isinstance(self.compaction_attempted, bool):
@@ -148,11 +154,27 @@ class ContextPreflightAssessment:
         assert self.estimated_total_tokens is not None
         assert self.capacity_tokens is not None
         assert self.estimated_remaining_tokens is not None
+        if (self.context_tokens is None) != (self.request_shape_tokens is None):
+            raise ValueError("context and request-shape accounting must be provided together")
+        if (
+            self.context_tokens is not None
+            and self.request_shape_tokens is not None
+            and self.estimated_input_tokens
+            != self.context_tokens + self.tool_tokens + self.request_shape_tokens
+        ):
+            raise ValueError("estimated_input_tokens does not match component accounting")
+        if self.irreducible_tokens is not None and (
+            self.context_tokens is None or self.request_shape_tokens is None
+        ):
+            raise ValueError("irreducible accounting requires component accounting")
         expected_remaining = max(0, self.capacity_tokens - self.estimated_total_tokens)
         if self.estimated_remaining_tokens != expected_remaining:
             raise ValueError("estimated_remaining_tokens does not match accounting")
         expected_status = (
-            ContextPreflightStatus.SAFE
+            ContextPreflightStatus.BLOCKED
+            if self.irreducible_tokens is not None
+            and self.irreducible_tokens >= self.capacity_tokens
+            else ContextPreflightStatus.SAFE
             if self.estimated_total_tokens <= self.capacity_tokens
             else ContextPreflightStatus.BLOCKED
             if self.compaction_attempted
@@ -174,6 +196,9 @@ class ContextPreflightAssessment:
             "capacity_tokens": self.capacity_tokens,
             "estimated_remaining_tokens": self.estimated_remaining_tokens,
             "compaction_attempted": self.compaction_attempted,
+            "context_tokens": self.context_tokens,
+            "request_shape_tokens": self.request_shape_tokens,
+            "irreducible_tokens": self.irreducible_tokens,
         }
 
 
@@ -238,37 +263,47 @@ def assess_context_preflight(
     estimate = estimate_model_request_tokens(payload)
     if provider_window is None or max_output_tokens is None:
         return ContextPreflightAssessment(
-            ContextPreflightStatus.UNKNOWN,
-            estimate.estimated_input_tokens,
-            estimate.tool_tokens,
-            max_output_tokens,
-            None,
-            None,
-            None,
-            None,
-            compaction_attempted,
+            status=ContextPreflightStatus.UNKNOWN,
+            estimated_input_tokens=estimate.estimated_input_tokens,
+            tool_tokens=estimate.tool_tokens,
+            reserved_output_tokens=max_output_tokens,
+            safety_margin_tokens=None,
+            estimated_total_tokens=None,
+            capacity_tokens=None,
+            estimated_remaining_tokens=None,
+            compaction_attempted=compaction_attempted,
+            context_tokens=estimate.context_tokens,
+            request_shape_tokens=estimate.request_shape_tokens,
         )
 
     safety_margin = _context_preflight_margin(provider_window.capacity_tokens)
     estimated_total = estimate.estimated_input_tokens + max_output_tokens + safety_margin
+    irreducible_tokens = (
+        estimate.tool_tokens + estimate.request_shape_tokens + max_output_tokens + safety_margin
+    )
     remaining = max(0, provider_window.capacity_tokens - estimated_total)
     status = (
-        ContextPreflightStatus.SAFE
+        ContextPreflightStatus.BLOCKED
+        if irreducible_tokens >= provider_window.capacity_tokens
+        else ContextPreflightStatus.SAFE
         if estimated_total <= provider_window.capacity_tokens
         else ContextPreflightStatus.BLOCKED
         if compaction_attempted
         else ContextPreflightStatus.COMPACTION_REQUIRED
     )
     return ContextPreflightAssessment(
-        status,
-        estimate.estimated_input_tokens,
-        estimate.tool_tokens,
-        max_output_tokens,
-        safety_margin,
-        estimated_total,
-        provider_window.capacity_tokens,
-        remaining,
-        compaction_attempted,
+        status=status,
+        estimated_input_tokens=estimate.estimated_input_tokens,
+        tool_tokens=estimate.tool_tokens,
+        reserved_output_tokens=max_output_tokens,
+        safety_margin_tokens=safety_margin,
+        estimated_total_tokens=estimated_total,
+        capacity_tokens=provider_window.capacity_tokens,
+        estimated_remaining_tokens=remaining,
+        compaction_attempted=compaction_attempted,
+        context_tokens=estimate.context_tokens,
+        request_shape_tokens=estimate.request_shape_tokens,
+        irreducible_tokens=irreducible_tokens,
     )
 
 
@@ -451,6 +486,15 @@ def build_automatic_context_compaction_runtime_request(
     if usage_override is not None:
         if not isinstance(usage_override, CompactionContextUsage):
             raise TypeError("usage_override must be a CompactionContextUsage or None")
+        if provider_window is None:
+            raise ValueError("usage_override requires a provider_window")
+        if usage_override.capacity_tokens != provider_window.capacity_tokens:
+            raise ValueError("usage_override capacity must match provider_window")
+        if (
+            usage_override.provider_window is not None
+            and usage_override.provider_window != provider_window
+        ):
+            raise ValueError("usage_override provider_window must match provider_window")
         usage = usage_override
     else:
         usage = build_context_usage_snapshot(

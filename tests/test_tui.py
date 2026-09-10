@@ -3293,6 +3293,108 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
                 ).lower(),
             )
 
+    async def test_context_preflight_unknown_is_visible_without_fake_percentage(self) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(90, 24)) as pilot:
+            await app._handle_event(
+                AgentEvent.create(
+                    1,
+                    AgentEventKind.CONTEXT_PREFLIGHT,
+                    {
+                        "status": "unknown",
+                        "estimated_input_tokens": 1_536,
+                        "estimated_total_tokens": None,
+                        "capacity_tokens": None,
+                    },
+                )
+            )
+            await pilot.pause()
+
+            context = app.query_one("#runtime-secondary", Static)
+            self.assertIn("1.5k tok", rendered_text(app, context.renderable))
+            self.assertNotIn("%", rendered_text(app, context.renderable))
+            self.assertIn("Provider context capacity is unknown", app.entries[-1].text)
+            self.assertNotIn("estimated_input_tokens", app.entries[-1].text)
+
+    async def test_context_preflight_block_and_compaction_are_visible_but_safe_is_quiet(
+        self,
+    ) -> None:
+        app = NeuroCodeApp(
+            TuiConversation(),
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+            context_window_tokens=1_000,
+        )
+
+        async with app.run_test(size=(100, 24)) as pilot:
+            await app._handle_event(
+                AgentEvent.create(
+                    1,
+                    AgentEventKind.CONTEXT_PREFLIGHT,
+                    {
+                        "status": "compaction_required",
+                        "estimated_input_tokens": 800,
+                        "estimated_total_tokens": 1_100,
+                        "capacity_tokens": 1_000,
+                    },
+                )
+            )
+            await pilot.pause()
+            self.assertIn("Context pressure detected", app.entries[-1].text)
+
+            await app._handle_event(
+                AgentEvent.create(
+                    1,
+                    AgentEventKind.CONTEXT_COMPACTION_COMPLETED,
+                    {"summary_tokens": 32},
+                )
+            )
+            await pilot.pause()
+            self.assertIn("Context compaction: completed", app.entries[-1].text)
+            entry_count = len(app.entries)
+
+            await app._handle_event(
+                AgentEvent.create(
+                    1,
+                    AgentEventKind.CONTEXT_PREFLIGHT,
+                    {
+                        "status": "safe",
+                        "estimated_input_tokens": 600,
+                        "estimated_total_tokens": 900,
+                        "capacity_tokens": 1_000,
+                    },
+                )
+            )
+            await pilot.pause()
+
+            self.assertEqual(len(app.entries), entry_count)
+            context = app.query_one("#runtime-secondary", Static)
+            self.assertIn("90.0%", rendered_text(app, context.renderable))
+            self.assertIn("including output reserve and safety margin", str(context.tooltip))
+            self.assertNotIn("estimated_total_tokens", str(context.tooltip))
+
+            await app._handle_event(
+                AgentEvent.create(
+                    1,
+                    AgentEventKind.CONTEXT_PREFLIGHT,
+                    {
+                        "status": "blocked",
+                        "estimated_input_tokens": 900,
+                        "estimated_total_tokens": 1_200,
+                        "capacity_tokens": 1_000,
+                    },
+                )
+            )
+            await pilot.pause()
+            self.assertIn("exceeds the available budget", app.entries[-1].text)
+
     async def test_runtime_budget_telemetry_is_not_rendered_in_the_tui(self) -> None:
         app = NeuroCodeApp(
             TuiConversation(),

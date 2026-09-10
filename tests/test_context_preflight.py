@@ -6,14 +6,18 @@ from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 
 from neuro_code.application.memory.compaction import (
+    CompactionContextUsage,
     ContextCompactionPlanner,
     ContextCompactionPolicy,
     ProviderContextWindow,
 )
 from neuro_code.application.memory.compaction_runtime import (
+    ContextCompactionRuntimeBoundary,
     ContextCompactionRuntimeGate,
+    ContextCompactionSafePoint,
     ContextPreflightStatus,
     assess_context_preflight,
+    build_automatic_context_compaction_runtime_request,
 )
 from neuro_code.application.memory.compaction_service import ContextCompactionApplicationService
 from neuro_code.application.memory.compaction_trigger import ContextCompactionTriggerService
@@ -167,7 +171,8 @@ class ContextPreflightTests(unittest.TestCase):
             max_output_tokens=512,
         )
 
-        self.assertIs(result.status, ContextPreflightStatus.COMPACTION_REQUIRED)
+        self.assertIs(result.status, ContextPreflightStatus.BLOCKED)
+        self.assertGreaterEqual(result.irreducible_tokens or 0, 512)
         blocked = assess_context_preflight(
             context=self.context,
             tools=(),
@@ -180,6 +185,43 @@ class ContextPreflightTests(unittest.TestCase):
             compaction_attempted=True,
         )
         self.assertIs(blocked.status, ContextPreflightStatus.BLOCKED)
+
+    def test_large_tool_schema_is_blocked_before_compaction(self) -> None:
+        result = assess_context_preflight(
+            context=self.context,
+            tools=(
+                ToolDefinition(
+                    "inspect",
+                    "x" * 40_000,
+                    {"type": "object", "description": "y" * 40_000},
+                ),
+            ),
+            provider="fixture",
+            model="fixture-model",
+            context_affinity=None,
+            reasoning_effort=ReasoningEffort.HIGH,
+            provider_window=ProviderContextWindow("fixture", "fixture-model", 2_000),
+            max_output_tokens=128,
+        )
+
+        self.assertIs(result.status, ContextPreflightStatus.BLOCKED)
+        self.assertGreaterEqual(result.irreducible_tokens or 0, 2_000)
+
+    def test_large_history_keeps_compaction_actionable_when_immutable_cost_fits(self) -> None:
+        result = assess_context_preflight(
+            context=ModelContext((Message(Role.USER, "history " + "x" * 20_000),)),
+            tools=(),
+            provider="fixture",
+            model="fixture-model",
+            context_affinity=None,
+            reasoning_effort=ReasoningEffort.HIGH,
+            provider_window=ProviderContextWindow("fixture", "fixture-model", 2_000),
+            max_output_tokens=128,
+        )
+
+        self.assertIs(result.status, ContextPreflightStatus.COMPACTION_REQUIRED)
+        self.assertLess(result.irreducible_tokens or 0, result.capacity_tokens or 0)
+        self.assertGreater(result.context_tokens or 0, result.irreducible_tokens or 0)
 
     def test_unknown_capacity_does_not_invent_numeric_limit(self) -> None:
         result = assess_context_preflight(
@@ -216,6 +258,52 @@ class ContextPreflightTests(unittest.TestCase):
 
 
 class ContextPreflightRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_usage_override_must_match_active_provider_window(self) -> None:
+        provider = _ScriptedProvider(())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            service = ContextCompactionTriggerService(
+                ContextCompactionApplicationService(store, provider),
+            )
+            active_window = ProviderContextWindow("fixture", "fixture-model", 1_000)
+            stale_window = ProviderContextWindow("other", "other-model", 2_000)
+            same_capacity_other_window = ProviderContextWindow("other", "other-model", 1_000)
+
+            with self.assertRaisesRegex(ValueError, "usage_override capacity"):
+                build_automatic_context_compaction_runtime_request(
+                    service,
+                    source_context=ModelContext((Message(Role.USER, "source"),)),
+                    usage_context=ModelContext((Message(Role.USER, "usage"),)),
+                    boundary=ContextCompactionRuntimeBoundary(
+                        ContextCompactionSafePoint.BEFORE_MODEL_REQUEST,
+                        0,
+                    ),
+                    provider_window=active_window,
+                    usage_override=CompactionContextUsage.from_provider_window(
+                        10,
+                        stale_window,
+                        estimated=True,
+                    ),
+                )
+            with self.assertRaisesRegex(ValueError, "usage_override provider_window"):
+                build_automatic_context_compaction_runtime_request(
+                    service,
+                    source_context=ModelContext((Message(Role.USER, "source"),)),
+                    usage_context=ModelContext((Message(Role.USER, "usage"),)),
+                    boundary=ContextCompactionRuntimeBoundary(
+                        ContextCompactionSafePoint.BEFORE_MODEL_REQUEST,
+                        0,
+                    ),
+                    provider_window=active_window,
+                    usage_override=CompactionContextUsage.from_provider_window(
+                        10,
+                        same_capacity_other_window,
+                        estimated=True,
+                    ),
+                )
+
     async def test_known_safe_request_calls_provider_once(self) -> None:
         provider = _ScriptedProvider((ModelCompleted("stop", response_text="answer"),))
         with tempfile.TemporaryDirectory() as directory:
@@ -279,6 +367,50 @@ class ContextPreflightRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(
             AgentEventKind.MODEL_OUTPUT_STARTED, [event.kind for event in result.events]
         )
+
+    async def test_irreducible_block_stops_before_real_compaction(self) -> None:
+        provider = _ScriptedProvider(())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(str(root), "fixture", "fixture-model")
+            gate = ContextCompactionRuntimeGate(
+                ContextCompactionTriggerService(
+                    ContextCompactionApplicationService(store, provider),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=_EmptyToolCollection(),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+                compaction_runtime_gate=gate,
+                provider_context_window=ProviderContextWindow(
+                    "fixture",
+                    "fixture-model",
+                    512,
+                ),
+                provider_max_output_tokens=512,
+            )
+
+            result = await runtime.run("hello", session_id=session_id)
+            compaction_items = await store.load_compaction_items(session_id)
+
+        self.assertEqual(len(provider.calls), 0)
+        self.assertEqual(len(compaction_items), 0)
+        self.assertEqual(
+            result.response.splitlines()[0],
+            "I could not produce a reliable final summary from the available evidence.",
+        )
+        preflights = [
+            event for event in result.events if event.kind is AgentEventKind.CONTEXT_PREFLIGHT
+        ]
+        self.assertEqual(len(preflights), 1)
+        self.assertEqual(preflights[0].data["status"], ContextPreflightStatus.BLOCKED.value)
 
     async def test_unknown_capacity_keeps_existing_provider_path(self) -> None:
         provider = _ScriptedProvider((ModelCompleted("stop", response_text="answer"),))

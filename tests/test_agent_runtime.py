@@ -1383,11 +1383,15 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 result.outcome.reason_code,
                 SupervisorReasonCode.CONTEXT_WINDOW_BUDGET,
             )
-            self.assertEqual(result.response, "safe context-limit finalization")
+            self.assertTrue(
+                result.response.startswith(
+                    "I could not produce a reliable final summary from the available evidence."
+                )
+            )
             self.assertEqual(result.steps, 1)
             self.assertEqual(
                 provider.tool_policies,
-                [ModelToolPolicy.ALLOWED, ModelToolPolicy.DISABLED, ModelToolPolicy.DISABLED],
+                [ModelToolPolicy.ALLOWED, ModelToolPolicy.DISABLED],
             )
             self.assertEqual(
                 sum(

@@ -2995,6 +2995,17 @@ the assembled `ModelContext`, tool definitions, request metadata, configured
 128-token floor and 2,048-token cap. It is not provider-wire serialization or
 exact tokenizer accounting.
 
+The accounting separates reducible conversation context from immutable request
+cost: tool definitions, request-shape metadata, the configured output reserve,
+and the safety margin. If that immutable cost alone reaches the provider
+capacity, preflight stops immediately without compaction or a normal/finalizer
+Provider request. A history-only overflow may use the existing bounded
+compaction path; a repeated durable compaction range stops through the
+deterministic context-budget fallback. TUI and plain CLI projections expose
+only bounded status notices. When capacity is known, displayed numeric
+pressure represents the request total rather than input tokens alone; unknown
+capacity remains visibly unknown and does not produce a percentage.
+
 When configured provider capacity and output reserve are known, one preflight
 cycle may use the existing safe-point compaction boundary before the first
 model request, rebuild the durable context, and assess the rebuilt request

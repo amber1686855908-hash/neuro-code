@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 from typing import cast
 
 from neuro_code.application.runtime.agent import AgentRunResult, EventSink
@@ -42,12 +43,33 @@ async def run_agent(args: argparse.Namespace, services: CliServices) -> int:
             user_interaction=CliUserInteraction(interactive=args.output_format == "plain"),
             enable_local_attached_terminals=True,
         )
+        last_context_notice: str | None = None
+        context_notice_text = {
+            "compaction_required": "Context pressure detected; compacting before continuing.",
+            "blocked": "The context request exceeds the available budget; the turn stopped safely.",
+            "unknown": "Provider context capacity is unknown; continuing without a numeric safety check.",
+        }
 
         async def stream_event(event: AgentEvent) -> None:
+            nonlocal last_context_notice
             if args.output_format == "plain" and event.kind is AgentEventKind.TEXT_DELTA:
                 text = event.data.get("text")
                 if isinstance(text, str):
                     print(text, end="", flush=True)
+            elif args.output_format == "plain" and event.kind is AgentEventKind.CONTEXT_PREFLIGHT:
+                status = event.data.get("status")
+                notice = context_notice_text.get(status) if isinstance(status, str) else None
+                if notice != last_context_notice:
+                    if notice is not None:
+                        print(notice, file=sys.stderr, flush=True)
+                    last_context_notice = notice
+            elif (
+                args.output_format == "plain"
+                and event.kind is AgentEventKind.CONTEXT_COMPACTION_COMPLETED
+                and last_context_notice != "compacted"
+            ):
+                print("Context compacted before continuing.", file=sys.stderr, flush=True)
+                last_context_notice = "compacted"
             elif args.output_format == "jsonl":
                 if event.kind is not AgentEventKind.MODEL_REQUEST_SNAPSHOT:
                     print(json.dumps(event.to_dict(), ensure_ascii=False), flush=True)

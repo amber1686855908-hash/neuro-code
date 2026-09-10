@@ -217,7 +217,11 @@ def _route_profile(config: AppConfig, profile_name: str, model: str) -> Provider
         ) from error
     if profile.model == model:
         return profile
-    return replace(profile, model=model)
+    # The configured capacity belongs to the profile's original model.  A
+    # route-level model override is a distinct model until it supplies its own
+    # trusted capacity metadata; retaining the old value would let a later
+    # ProviderSelected event resurrect stale context accounting.
+    return replace(profile, model=model, context_window_tokens=None)
 
 
 def _runtime_capabilities(config: ProviderProfile) -> ModelCapabilitySet:

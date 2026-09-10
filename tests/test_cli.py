@@ -1194,7 +1194,13 @@ api_key_env = "FIXTURE_KEY"
                 )
 
             self.assertEqual(exit_code, 0)
-            self.assertEqual(errors, "")
+            if output_format == "plain":
+                self.assertEqual(
+                    errors,
+                    "Provider context capacity is unknown; continuing without a numeric safety check.\n",
+                )
+            else:
+                self.assertEqual(errors, "")
             self.assertNotIn("PROVISIONAL_FALSE_SUCCESS_SENTINEL", output)
             self.assertIn("safe committed response", output)
             if output_format == "plain":

@@ -1607,6 +1607,10 @@ Runtime 门控现在会在允许的显式压缩操作外层真正执行有限的
 `ModelContext`、工具定义、请求 metadata、配置的 `max_output_tokens` 保留值，以及确定性的 5% 不确定性余量；余量下限为
 128 token，上限为 2,048 token。这不是 Provider wire 序列化或精确 tokenizer 计量。
 
+这项计量区分可压缩的对话上下文与不可约的请求成本：工具定义、请求形状 metadata、配置的输出保留值和安全余量。
+如果仅不可约成本就达到 Provider 容量，预检会立即停止，不调用压缩，也不调用普通/finalizer Provider。仅历史过大时才可以使用既有有界压缩路径；
+重复的 durable 压缩区间则通过确定性的上下文预算 fallback 停止。TUI 和纯 CLI 只显示有界状态提示。只有在容量已知时，显示的数值压力才代表请求总量而不是只有输入 token；容量未知时会明确保持未知，不显示百分比。
+
 当配置的 Provider 容量和输出保留值均已知时，一次预检周期可以在首次模型请求前复用既有安全点压缩边界，重建持久上下文，
 再对重建后的请求评估一次。若请求仍超出容量，会在普通 Provider 调用前以既有有界的
 `BUDGET_LIMITED/CONTEXT_WINDOW_BUDGET` 结果停止。缺少容量或输出 metadata 时返回 `UNKNOWN`，不伪造限制，并保持既有 Provider

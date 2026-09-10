@@ -75,6 +75,9 @@ class TurnControllerMixin(TuiAppControllerMixin):
         self._terminal_execution_recoverable = False
         self._finalizing = False
         self._turn_usage_reported = False
+        self._context_preflight_status = None
+        self._context_preflight_total_tokens = False
+        self._context_preflight_notice = None
         self._begin_pending_assistant()
         self._turn_worker = self.run_worker(
             self._run_prompt(prompt),
@@ -346,18 +349,47 @@ class TurnControllerMixin(TuiAppControllerMixin):
             if isinstance(used_tokens, int) and not isinstance(used_tokens, bool):
                 self._context_used_tokens = max(0, used_tokens)
                 self._context_usage_estimated = data.get("estimated") is not False
+                self._context_preflight_total_tokens = False
                 self._turn_usage_reported = not self._context_usage_estimated
                 self._refresh_runtime_bar()
         elif event.kind is AgentEventKind.CONTEXT_PREFLIGHT:
+            status = data.get("status")
             estimated_input_tokens = data.get("estimated_input_tokens")
             if isinstance(estimated_input_tokens, int) and not isinstance(
                 estimated_input_tokens,
                 bool,
             ):
-                self._context_used_tokens = max(0, estimated_input_tokens)
+                estimated_total_tokens = data.get("estimated_total_tokens")
+                if (
+                    isinstance(estimated_total_tokens, int)
+                    and not isinstance(
+                        estimated_total_tokens,
+                        bool,
+                    )
+                    and estimated_total_tokens >= 0
+                ):
+                    self._context_used_tokens = max(0, estimated_total_tokens)
+                    has_request_total = True
+                else:
+                    self._context_used_tokens = max(0, estimated_input_tokens)
+                    has_request_total = False
                 self._context_usage_estimated = True
+                self._context_preflight_total_tokens = has_request_total
                 self._turn_usage_reported = False
                 self._refresh_runtime_bar()
+            if isinstance(status, str):
+                self._context_preflight_status = status
+                notice_key = {
+                    "compaction_required": "context.preflight.compaction_required",
+                    "blocked": "context.preflight.blocked",
+                    "unknown": "context.preflight.unknown",
+                }.get(status)
+                if notice_key != self._context_preflight_notice:
+                    if notice_key is not None:
+                        self._write_ui_entry("status", notice_key)
+                    self._context_preflight_notice = notice_key
+        elif event.kind is AgentEventKind.CONTEXT_COMPACTION_COMPLETED:
+            self._write_ui_entry("status", "context.compaction_result", status="completed")
         elif event.kind is AgentEventKind.BACKGROUND_TASK_COMPLETION_REMINDER:
             raw_task_ids = data.get("task_ids")
             if (

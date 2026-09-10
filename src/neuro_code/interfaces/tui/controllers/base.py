@@ -148,6 +148,9 @@ class TuiAppControllerMixin:
         _context_window_tokens: int | None
         _context_used_tokens: int
         _context_usage_estimated: bool
+        _context_preflight_status: str | None
+        _context_preflight_total_tokens: bool
+        _context_preflight_notice: str | None
         _plan: SessionPlan | None
         _plan_comments: tuple[PlanComment, ...]
         _plan_entry_index: int | None
