@@ -19,6 +19,7 @@ class AgentEventKind(StrEnum):
     MODEL_OUTPUT_STARTED = "model_output_started"
     MODEL_THINKING_COMPLETED = "model_thinking_completed"
     CONTEXT_USAGE_UPDATED = "context_usage_updated"
+    CONTEXT_PREFLIGHT = "context_preflight"
     EXECUTION_BUDGET_UPDATED = "execution_budget_updated"
     CONTEXT_COMPACTION_STARTED = "context_compaction_started"
     CONTEXT_COMPACTION_COMPLETED = "context_compaction_completed"

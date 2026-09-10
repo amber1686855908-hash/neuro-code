@@ -25,6 +25,7 @@ from time import monotonic
 
 from neuro_code.application.execution_policy import ExecutionSegmentPolicy
 from neuro_code.application.memory.compaction import (
+    CompactionContextUsage,
     CompactionResumeRebuilder,
     ContextCompactionDecision,
     ProviderContextWindow,
@@ -35,6 +36,8 @@ from neuro_code.application.memory.compaction_runtime import (
     ContextCompactionRuntimeGate,
     ContextCompactionSafePoint,
     ContextCompactionTimeoutError,
+    ContextPreflightStatus,
+    assess_context_preflight,
 )
 from neuro_code.application.ports.model import ModelProvider
 from neuro_code.application.ports.storage import SessionStore
@@ -214,6 +217,7 @@ class AgentLoopRunner:
         "_max_steps",
         "_provider",
         "_provider_context_window",
+        "_provider_max_output_tokens",
         "_segment_policy",
         "_session_store",
         "_supervision_observer",
@@ -243,6 +247,7 @@ class AgentLoopRunner:
         tool_executor: ToolExecutor,
         compaction_runtime_gate: ContextCompactionRuntimeGate | None,
         provider_context_window: ProviderContextWindow | None,
+        provider_max_output_tokens: int | None = None,
         final_output_gate_enabled: bool = True,
     ) -> None:
         self._provider = provider
@@ -264,6 +269,12 @@ class AgentLoopRunner:
             ProviderContextWindow,
         ):
             raise TypeError("provider_context_window must be a ProviderContextWindow or None")
+        if provider_max_output_tokens is not None and (
+            isinstance(provider_max_output_tokens, bool)
+            or not isinstance(provider_max_output_tokens, int)
+            or provider_max_output_tokens <= 0
+        ):
+            raise ValueError("provider_max_output_tokens must be a positive integer or None")
         if not isinstance(final_output_gate_enabled, bool):
             raise TypeError("final_output_gate_enabled must be a bool")
         self._execution_budget = execution_budget
@@ -280,10 +291,15 @@ class AgentLoopRunner:
         self._tool_scheduler: ToolScheduler[_ScheduledToolOutcome] = ToolScheduler(tools)
         self._compaction_runtime_gate = compaction_runtime_gate
         self._provider_context_window = provider_context_window
+        self._provider_max_output_tokens = provider_max_output_tokens
 
     @property
     def provider_context_window(self) -> ProviderContextWindow | None:
         return self._provider_context_window
+
+    @property
+    def provider_max_output_tokens(self) -> int | None:
+        return self._provider_max_output_tokens
 
     async def run(
         self,
@@ -760,12 +776,13 @@ class AgentLoopRunner:
             *,
             step: int,
             usage_context: ModelContext,
+            usage_override: CompactionContextUsage | None = None,
         ) -> SupervisorDecision | None:
             nonlocal active_compaction_item
             gate = self._compaction_runtime_gate
             if (
                 self._execution_control_mode is not ExecutionControlMode.FINALIZE_TERMINAL
-                or not has_completed_model_step
+                or (not has_completed_model_step and usage_override is None)
                 or gate is None
                 or active_provider_window is None
                 or self._session_store is None
@@ -794,6 +811,7 @@ class AgentLoopRunner:
                 session_id=session_id,
                 compaction_id=f"compact-{uuid.uuid4().hex}",
                 created_at=datetime.now(UTC),
+                usage_override=usage_override,
             )
             assessment = gate.assess(request)
             if not assessment.will_trigger:
@@ -989,6 +1007,7 @@ class AgentLoopRunner:
             decision: SupervisorDecision,
             *,
             step: int,
+            deterministic_fallback_only: bool = False,
         ) -> AgentRunResult:
             await maybe_acquire_explicit_verification()
             if (
@@ -1013,15 +1032,19 @@ class AgentLoopRunner:
                     "recoverable": outcome.recoverable,
                 },
             )
-            finalizer = self._finalizer_factory(
-                self._provider,
-                self._finalizer_max_attempts,
-                self._tool_context.redaction_values,
-            )
-            finalization = await finalizer.finalize(
-                projected_model_context(),
-                finalization_evidence(decision),
-            )
+            evidence = finalization_evidence(decision)
+            if deterministic_fallback_only:
+                finalization = deterministic_fallback_result(evidence)
+            else:
+                finalizer = self._finalizer_factory(
+                    self._provider,
+                    self._finalizer_max_attempts,
+                    self._tool_context.redaction_values,
+                )
+                finalization = await finalizer.finalize(
+                    projected_model_context(),
+                    evidence,
+                )
             return await complete_finalization_result(finalization, decision, step=step)
 
         async def complete_gated_terminal_turn(
@@ -1300,8 +1323,79 @@ class AgentLoopRunner:
                 )
                 if compaction_decision is not None:
                     return await complete_finalized_turn(compaction_decision, step=step - 1)
+                preflight_compaction_attempted = active_compaction_item is not prior_compaction_item
                 if active_compaction_item is not prior_compaction_item:
                     context = await build_request_context(completion_reminders)
+                tool_definitions = tuple(self._tools.definitions())
+                if self._execution_control_mode is ExecutionControlMode.FINALIZE_TERMINAL:
+                    preflight = assess_context_preflight(
+                        context=context,
+                        tools=tool_definitions,
+                        provider=self._provider.provider_name,
+                        model=self._provider.model_name,
+                        context_affinity=getattr(self._provider, "context_affinity", None),
+                        reasoning_effort=context.reasoning_effort,
+                        provider_window=active_provider_window,
+                        max_output_tokens=self._provider_max_output_tokens,
+                        compaction_attempted=preflight_compaction_attempted,
+                    )
+                    await emit(
+                        AgentEventKind.CONTEXT_PREFLIGHT,
+                        preflight.to_event_data(),
+                    )
+                    if preflight.status is ContextPreflightStatus.COMPACTION_REQUIRED:
+                        capacity = preflight.capacity_tokens
+                        if capacity is None or active_provider_window is None:
+                            raise ConfigurationError(
+                                "actionable context preflight must have a provider capacity"
+                            )
+                        compaction_decision = await maybe_compact_context(
+                            ContextCompactionSafePoint.BEFORE_MODEL_REQUEST,
+                            step=step,
+                            usage_context=context,
+                            usage_override=CompactionContextUsage.from_provider_window(
+                                max(preflight.estimated_input_tokens, capacity),
+                                active_provider_window,
+                                estimated=True,
+                            ),
+                        )
+                        preflight_compaction_attempted = True
+                        if compaction_decision is not None:
+                            return await complete_finalized_turn(
+                                compaction_decision,
+                                step=step - 1,
+                                deterministic_fallback_only=True,
+                            )
+                        if active_compaction_item is not prior_compaction_item:
+                            context = await build_request_context(completion_reminders)
+                        preflight = assess_context_preflight(
+                            context=context,
+                            tools=tool_definitions,
+                            provider=self._provider.provider_name,
+                            model=self._provider.model_name,
+                            context_affinity=getattr(self._provider, "context_affinity", None),
+                            reasoning_effort=context.reasoning_effort,
+                            provider_window=active_provider_window,
+                            max_output_tokens=self._provider_max_output_tokens,
+                            compaction_attempted=preflight_compaction_attempted,
+                        )
+                        await emit(
+                            AgentEventKind.CONTEXT_PREFLIGHT,
+                            preflight.to_event_data(),
+                        )
+                    if preflight.status is ContextPreflightStatus.BLOCKED:
+                        preflight_decision = SupervisorDecision(
+                            SupervisorDecisionKind.MARK_BUDGET_LIMITED,
+                            "context remains above its configured request budget after bounded compaction",
+                            AgentExecutionStatus.BUDGET_LIMITED,
+                            False,
+                            SupervisorReasonCode.CONTEXT_WINDOW_BUDGET,
+                        )
+                        return await complete_finalized_turn(
+                            preflight_decision,
+                            step=step - 1,
+                            deterministic_fallback_only=True,
+                        )
                 before_model_decision = record_supervision(
                     SupervisionCheckpoint.BEFORE_MODEL,
                     step,
@@ -1311,7 +1405,6 @@ class AgentLoopRunner:
                 if terminal_before_model is not None:
                     return await complete_finalized_turn(terminal_before_model, step=step - 1)
                 await emit_budget_usage()
-                tool_definitions = self._tools.definitions()
                 request_snapshot = ModelRequestSnapshot.build(
                     context=context,
                     tools=tool_definitions,

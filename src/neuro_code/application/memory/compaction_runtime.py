@@ -1,14 +1,15 @@
-"""Guard explicit context compaction at a safe Runtime boundary.
+"""Guard context compaction at safe Runtime boundaries.
 
-This module does not integrate compaction into ``AgentRuntime``.  It defines
-the boundary a future caller must prove before it may invoke the existing
-default-disabled trigger: no model request or tool batch may be active, the
-operation must not run after cancellation, and compaction must use its own
-bounded one-request/no-tool budget.
+This module owns the explicit and automatic compaction boundary.  It defines
+the conditions a caller must prove before invoking the existing trigger: no
+model request or tool batch may be active, the operation must not run after
+cancellation, and compaction must use its own bounded one-request/no-tool
+budget.  It also exposes the conservative, provider-neutral request preflight
+used by the normal finalizing Agent loop.
 
-在安全的 Runtime 边界保护显式上下文压缩。
+在安全的 Runtime 边界保护上下文压缩。
 
-本模块不会把压缩接入 ``AgentRuntime``, 而是定义未来调用方在调用现有默认关闭触发器前必须证明的边界: 不能有正在进行的模型请求或工具批次, 取消后不得运行, 且压缩必须使用独立的单次请求/无工具有界预算.
+本模块拥有显式和自动压缩边界, 并定义调用方在调用现有触发器前必须证明的条件: 不能有正在进行的模型请求或工具批次, 取消后不得运行, 且压缩必须使用独立的单次请求/无工具有界预算。本模块还提供普通终态 Agent loop 使用的保守、供应商中立请求预检。
 """
 
 from __future__ import annotations
@@ -38,15 +39,237 @@ from neuro_code.domain.conversation.compaction import (
 )
 from neuro_code.domain.conversation.context import ModelContext, estimate_context_tokens
 from neuro_code.domain.conversation.messages import SessionItem
+from neuro_code.domain.conversation.reasoning import ReasoningEffort
+from neuro_code.domain.conversation.request import (
+    build_model_request_payload,
+    estimate_model_request_tokens,
+)
 from neuro_code.domain.execution import (
     AgentExecutionOutcome,
     AgentExecutionStatus,
     SupervisorReasonCode,
 )
+from neuro_code.domain.tools import ToolDefinition
 from neuro_code.shared.errors import ConfigurationError, NeuroCodeError, ProviderError, SessionError
 
 DEFAULT_CONTEXT_COMPACTION_TIMEOUT_SECONDS = 30.0
 MAX_CONTEXT_COMPACTION_TIMEOUT_SECONDS = 300.0
+DEFAULT_CONTEXT_PREFLIGHT_MARGIN_RATIO = 0.05
+MIN_CONTEXT_PREFLIGHT_MARGIN_TOKENS = 128
+MAX_CONTEXT_PREFLIGHT_MARGIN_TOKENS = 2_048
+
+
+class ContextPreflightStatus(StrEnum):
+    """Classify whether one estimated model request may proceed.
+
+    The estimate is conservative metadata, not an exact provider tokenizer
+    result.  ``UNKNOWN`` intentionally does not imply that the request is safe.
+
+    分类一次模型请求的估算是否可以继续。
+
+    估算是保守元数据, 不是精确的 Provider tokenizer 结果。
+    ``UNKNOWN`` 明确不表示请求安全。
+    """
+
+    SAFE = "safe"
+    COMPACTION_REQUIRED = "compaction_required"
+    BLOCKED = "blocked"
+    UNKNOWN = "unknown"
+
+
+def _optional_non_negative_int(name: str, value: int | None) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer or None")
+
+
+@dataclass(frozen=True, slots=True)
+class ContextPreflightAssessment:
+    """Bounded, approximate accounting for one logical model request.
+
+    The fields describe the request payload assembled by
+    ``ModelRequestSnapshot``.  They deliberately avoid raw prompt/tool data and
+    never claim an exact wire size.  ``compaction_attempted`` records only the
+    caller's bounded cycle state; it does not represent a second compaction
+    owner.
+
+    一个逻辑模型请求的有界近似计量。
+
+    字段描述 ``ModelRequestSnapshot`` 组装的请求 payload, 刻意不包含原始提示词/工具数据,
+    也不声称是精确 wire 大小。``compaction_attempted`` 只记录调用方的有界循环状态,
+    不代表第二个压缩所有者。
+    """
+
+    status: ContextPreflightStatus
+    estimated_input_tokens: int
+    tool_tokens: int
+    reserved_output_tokens: int | None
+    safety_margin_tokens: int | None
+    estimated_total_tokens: int | None
+    capacity_tokens: int | None
+    estimated_remaining_tokens: int | None
+    compaction_attempted: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, ContextPreflightStatus):
+            raise TypeError("status must be a ContextPreflightStatus")
+        _optional_non_negative_int("estimated_input_tokens", self.estimated_input_tokens)
+        _optional_non_negative_int("tool_tokens", self.tool_tokens)
+        _optional_non_negative_int("reserved_output_tokens", self.reserved_output_tokens)
+        _optional_non_negative_int("safety_margin_tokens", self.safety_margin_tokens)
+        _optional_non_negative_int("estimated_total_tokens", self.estimated_total_tokens)
+        _optional_non_negative_int("capacity_tokens", self.capacity_tokens)
+        _optional_non_negative_int(
+            "estimated_remaining_tokens",
+            self.estimated_remaining_tokens,
+        )
+        if self.capacity_tokens is not None and self.capacity_tokens < 1:
+            raise ValueError("capacity_tokens must be positive when provided")
+        if not isinstance(self.compaction_attempted, bool):
+            raise TypeError("compaction_attempted must be a bool")
+        if self.status is ContextPreflightStatus.UNKNOWN:
+            if self.capacity_tokens is not None or self.estimated_remaining_tokens is not None:
+                raise ValueError("unknown preflight cannot expose capacity or remaining tokens")
+            return
+        if any(
+            value is None
+            for value in (
+                self.reserved_output_tokens,
+                self.safety_margin_tokens,
+                self.estimated_total_tokens,
+                self.capacity_tokens,
+                self.estimated_remaining_tokens,
+            )
+        ):
+            raise ValueError("known preflight statuses require complete accounting")
+        assert self.reserved_output_tokens is not None
+        assert self.safety_margin_tokens is not None
+        assert self.estimated_total_tokens is not None
+        assert self.capacity_tokens is not None
+        assert self.estimated_remaining_tokens is not None
+        expected_remaining = max(0, self.capacity_tokens - self.estimated_total_tokens)
+        if self.estimated_remaining_tokens != expected_remaining:
+            raise ValueError("estimated_remaining_tokens does not match accounting")
+        expected_status = (
+            ContextPreflightStatus.SAFE
+            if self.estimated_total_tokens <= self.capacity_tokens
+            else ContextPreflightStatus.BLOCKED
+            if self.compaction_attempted
+            else ContextPreflightStatus.COMPACTION_REQUIRED
+        )
+        if self.status is not expected_status:
+            raise ValueError("preflight status does not match accounting")
+
+    def to_event_data(self) -> dict[str, object]:
+        """Return the bounded projection safe for CLI/TUI/event sinks."""
+
+        return {
+            "status": self.status.value,
+            "estimated_input_tokens": self.estimated_input_tokens,
+            "tool_tokens": self.tool_tokens,
+            "reserved_output_tokens": self.reserved_output_tokens,
+            "safety_margin_tokens": self.safety_margin_tokens,
+            "estimated_total_tokens": self.estimated_total_tokens,
+            "capacity_tokens": self.capacity_tokens,
+            "estimated_remaining_tokens": self.estimated_remaining_tokens,
+            "compaction_attempted": self.compaction_attempted,
+        }
+
+
+def _context_preflight_margin(capacity_tokens: int) -> int:
+    return min(
+        capacity_tokens,
+        max(
+            MIN_CONTEXT_PREFLIGHT_MARGIN_TOKENS,
+            min(
+                MAX_CONTEXT_PREFLIGHT_MARGIN_TOKENS,
+                math.ceil(capacity_tokens * DEFAULT_CONTEXT_PREFLIGHT_MARGIN_RATIO),
+            ),
+        ),
+    )
+
+
+def assess_context_preflight(
+    *,
+    context: ModelContext,
+    tools: Sequence[ToolDefinition],
+    provider: str,
+    model: str,
+    context_affinity: str | None,
+    reasoning_effort: ReasoningEffort,
+    provider_window: ProviderContextWindow | None,
+    max_output_tokens: int | None,
+    tool_policy: str = "allowed",
+    compaction_attempted: bool = False,
+) -> ContextPreflightAssessment:
+    """Assess the exact logical request shape before a normal Provider call.
+
+    The function is pure: it builds the same payload used by
+    ``ModelRequestSnapshot`` and performs only bounded local estimation.  A
+    missing provider capacity or output reservation returns ``UNKNOWN`` and
+    never invents a limit.
+
+    在普通 Provider 调用前评估同一逻辑请求形状。
+
+    本函数是纯函数: 使用 ``ModelRequestSnapshot`` 的同一 payload, 只做有界本地估算。
+    缺少 Provider 容量或输出保留值时返回 ``UNKNOWN``, 绝不伪造限制。
+    """
+
+    if provider_window is not None and not isinstance(provider_window, ProviderContextWindow):
+        raise TypeError("provider_window must be a ProviderContextWindow or None")
+    if max_output_tokens is not None and (
+        isinstance(max_output_tokens, bool)
+        or not isinstance(max_output_tokens, int)
+        or max_output_tokens <= 0
+    ):
+        raise ValueError("max_output_tokens must be a positive integer when provided")
+    if not isinstance(compaction_attempted, bool):
+        raise TypeError("compaction_attempted must be a bool")
+    payload = build_model_request_payload(
+        context=context,
+        tools=tools,
+        provider=provider,
+        model=model,
+        context_affinity=context_affinity,
+        reasoning_effort=reasoning_effort,
+        tool_policy=tool_policy,
+    )
+    estimate = estimate_model_request_tokens(payload)
+    if provider_window is None or max_output_tokens is None:
+        return ContextPreflightAssessment(
+            ContextPreflightStatus.UNKNOWN,
+            estimate.estimated_input_tokens,
+            estimate.tool_tokens,
+            max_output_tokens,
+            None,
+            None,
+            None,
+            None,
+            compaction_attempted,
+        )
+
+    safety_margin = _context_preflight_margin(provider_window.capacity_tokens)
+    estimated_total = estimate.estimated_input_tokens + max_output_tokens + safety_margin
+    remaining = max(0, provider_window.capacity_tokens - estimated_total)
+    status = (
+        ContextPreflightStatus.SAFE
+        if estimated_total <= provider_window.capacity_tokens
+        else ContextPreflightStatus.BLOCKED
+        if compaction_attempted
+        else ContextPreflightStatus.COMPACTION_REQUIRED
+    )
+    return ContextPreflightAssessment(
+        status,
+        estimate.estimated_input_tokens,
+        estimate.tool_tokens,
+        max_output_tokens,
+        safety_margin,
+        estimated_total,
+        provider_window.capacity_tokens,
+        remaining,
+        compaction_attempted,
+    )
 
 
 def _validate_reported_tokens(name: str, value: int | None) -> None:
@@ -204,6 +427,7 @@ def build_automatic_context_compaction_runtime_request(
     session_id: str | None = None,
     compaction_id: str | None = None,
     created_at: datetime | None = None,
+    usage_override: CompactionContextUsage | None = None,
     token_estimator: Callable[[Sequence[SessionItem]], int] = estimate_context_tokens,
 ) -> ContextCompactionRuntimeRequest:
     """Build an automatic request from canonical source and request projection.
@@ -224,11 +448,16 @@ def build_automatic_context_compaction_runtime_request(
         raise TypeError("usage_context must be a ModelContext")
     if not isinstance(boundary, ContextCompactionRuntimeBoundary):
         raise TypeError("boundary must be a ContextCompactionRuntimeBoundary")
-    usage = build_context_usage_snapshot(
-        usage_context,
-        provider_window,
-        token_estimator=token_estimator,
-    )
+    if usage_override is not None:
+        if not isinstance(usage_override, CompactionContextUsage):
+            raise TypeError("usage_override must be a CompactionContextUsage or None")
+        usage = usage_override
+    else:
+        usage = build_context_usage_snapshot(
+            usage_context,
+            provider_window,
+            token_estimator=token_estimator,
+        )
     base = ContextCompactionTriggerRequest(
         context=source_context,
         usage=usage,
@@ -956,6 +1185,7 @@ class ContextCompactionRuntimeGate:
         session_id: str | None = None,
         compaction_id: str | None = None,
         created_at: datetime | None = None,
+        usage_override: CompactionContextUsage | None = None,
         token_estimator: Callable[[Sequence[SessionItem]], int] = estimate_context_tokens,
     ) -> ContextCompactionRuntimeRequest:
         """Build a side-effect-free automatic request owned by this gate.
@@ -973,6 +1203,7 @@ class ContextCompactionRuntimeGate:
             session_id=session_id,
             compaction_id=compaction_id,
             created_at=created_at,
+            usage_override=usage_override,
             token_estimator=token_estimator,
         )
 
@@ -1003,7 +1234,10 @@ class ContextCompactionRuntimeGate:
 
 __all__ = [
     "DEFAULT_CONTEXT_COMPACTION_TIMEOUT_SECONDS",
+    "DEFAULT_CONTEXT_PREFLIGHT_MARGIN_RATIO",
     "MAX_CONTEXT_COMPACTION_TIMEOUT_SECONDS",
+    "MAX_CONTEXT_PREFLIGHT_MARGIN_TOKENS",
+    "MIN_CONTEXT_PREFLIGHT_MARGIN_TOKENS",
     "ContextCompactionBoundaryDecision",
     "ContextCompactionCommandResult",
     "ContextCompactionCommandStatus",
@@ -1020,6 +1254,9 @@ __all__ = [
     "ContextCompactionSafePoint",
     "ContextCompactionTimeoutError",
     "ContextCompactionTurnProjection",
+    "ContextPreflightAssessment",
+    "ContextPreflightStatus",
+    "assess_context_preflight",
     "build_automatic_context_compaction_runtime_request",
     "build_context_usage_snapshot",
     "build_explicit_context_compaction_runtime_request",

@@ -348,6 +348,16 @@ class TurnControllerMixin(TuiAppControllerMixin):
                 self._context_usage_estimated = data.get("estimated") is not False
                 self._turn_usage_reported = not self._context_usage_estimated
                 self._refresh_runtime_bar()
+        elif event.kind is AgentEventKind.CONTEXT_PREFLIGHT:
+            estimated_input_tokens = data.get("estimated_input_tokens")
+            if isinstance(estimated_input_tokens, int) and not isinstance(
+                estimated_input_tokens,
+                bool,
+            ):
+                self._context_used_tokens = max(0, estimated_input_tokens)
+                self._context_usage_estimated = True
+                self._turn_usage_reported = False
+                self._refresh_runtime_bar()
         elif event.kind is AgentEventKind.BACKGROUND_TASK_COMPLETION_REMINDER:
             raw_task_ids = data.get("task_ids")
             if (

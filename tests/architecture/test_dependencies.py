@@ -336,6 +336,7 @@ _BOOTSTRAP_COMPOSITION_MIXIN_OWNERS = {
 }
 
 _BOOTSTRAP_COMPOSITION_PRIVATE_HELPER_OWNERS = {
+    "_main_request_budget_metadata": "neuro_code.bootstrap.composition_bindings",
     "_without_main_inline_web_search": "neuro_code.bootstrap.composition_bindings",
     "_without_main_inline_web_fetch": "neuro_code.bootstrap.composition_bindings",
 }
@@ -1893,6 +1894,8 @@ def test_canonical_memory_modules_are_the_only_memory_implementations() -> None:
             "ContextCompactionSafePoint",
             "ContextCompactionTimeoutError",
             "ContextCompactionTurnProjection",
+            "ContextPreflightAssessment",
+            "ContextPreflightStatus",
         },
         "neuro_code.application.memory.compaction_trigger": {
             "ContextCompactionTriggerAssessment",
