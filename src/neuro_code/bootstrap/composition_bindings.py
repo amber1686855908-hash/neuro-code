@@ -154,6 +154,56 @@ def _without_main_inline_web_fetch(config: AppConfig) -> AppConfig:
     return replace(config, providers=profiles)
 
 
+def _main_request_budget_metadata(
+    config: AppConfig,
+    *,
+    failover: bool,
+) -> tuple[ProviderContextWindow | None, int | None]:
+    """Resolve conservative request-budget metadata for the MAIN route.
+
+    A failover chain is represented as known only when every eligible candidate
+    has a configured context window.  Its capacity is the minimum candidate
+    capacity, while the output reserve is the maximum configured reserve.  A
+    route-level model override invalidates the primary profile's context
+    metadata because that value belongs to the profile's original model.
+
+    为 MAIN 路由解析保守的请求预算元数据。
+
+    只有所有可用故障转移候选都配置了上下文窗口时, 故障转移链才会被视为已知; 容量取候选中的最小值, 输出保留取配置中的最大值。
+    路由级模型覆盖会使主 Profile 原有的上下文元数据失效, 因为该元数据属于 Profile 的原模型。
+    """
+
+    route = config.main_route
+    profile_names = tuple(dict.fromkeys((route.provider_profile, *route.fallback_profiles)))
+    profiles = tuple(config.providers[name] for name in profile_names)
+    if not profiles:
+        raise ConfigurationError("MAIN route must contain at least one provider profile")
+
+    context_capacities: list[int | None] = []
+    for index, profile in enumerate(profiles):
+        context_capacities.append(
+            profile.context_window_tokens if index != 0 or profile.model == route.model else None
+        )
+    active_profiles = profiles if failover and len(profiles) > 1 else profiles[:1]
+    active_capacities = context_capacities[: len(active_profiles)]
+    request_max_output_tokens = max(profile.max_output_tokens for profile in active_profiles)
+    if any(capacity is None for capacity in active_capacities):
+        return None, request_max_output_tokens
+
+    capacity = min(capacity for capacity in active_capacities if capacity is not None)
+    primary = active_profiles[0]
+    context_affinity = primary.context_affinity if primary.model == route.model else None
+    return (
+        ProviderContextWindow(
+            route.provider_profile,
+            route.model,
+            capacity,
+            context_affinity,
+        ),
+        request_max_output_tokens,
+    )
+
+
 class CompositionBindingMixin(CompositionRootMixin):
     """Assemble a conversation binding and its per-binding resources."""
 
@@ -613,6 +663,10 @@ class CompositionBindingMixin(CompositionRootMixin):
             workspace_change_journal = (
                 WorkspaceMutationJournal() if client_file_system is None else None
             )
+            provider_context_window, provider_max_output_tokens = _main_request_budget_metadata(
+                selected_config,
+                failover=self.settings.failover,
+            )
             runtime = AgentRuntime(
                 provider=provider,
                 tools=tools,
@@ -652,16 +706,8 @@ class CompositionBindingMixin(CompositionRootMixin):
                     self.settings.verification_command if normal_requirements_enabled else None
                 ),
                 compaction_runtime_gate=compaction_gate,
-                provider_context_window=(
-                    ProviderContextWindow(
-                        selected_config.provider.name,
-                        selected_config.provider.model,
-                        selected_config.provider.context_window_tokens,
-                        selected_config.provider.context_affinity,
-                    )
-                    if selected_config.provider.context_window_tokens is not None
-                    else None
-                ),
+                provider_context_window=provider_context_window,
+                provider_max_output_tokens=provider_max_output_tokens,
                 instruction_provider=instruction_provider,
                 skill_provider=skill_provider,
                 parent_relay_message=(

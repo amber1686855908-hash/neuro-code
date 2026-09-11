@@ -53,8 +53,11 @@ from neuro_code.domain.conversation.request import (
     MAX_REQUEST_SNAPSHOT_ID_BYTES,
     REQUEST_SNAPSHOT_SCHEMA_VERSION,
     ModelRequestSnapshot,
+    ModelRequestTokenEstimate,
     RequestContextFingerprints,
+    build_model_request_payload,
     context_fingerprints,
+    estimate_model_request_tokens,
 )
 
 __all__ = [
@@ -85,6 +88,7 @@ __all__ = [
     "ModelProviderSelected",
     "ModelReasoningDelta",
     "ModelRequestSnapshot",
+    "ModelRequestTokenEstimate",
     "ModelTextDelta",
     "ModelToolCall",
     "ModelUsage",
@@ -95,9 +99,11 @@ __all__ = [
     "SessionItem",
     "SyntheticReason",
     "ToolCall",
+    "build_model_request_payload",
     "compute_compaction_source_fingerprint",
     "context_fingerprints",
     "estimate_context_tokens",
+    "estimate_model_request_tokens",
     "estimate_text_tokens",
     "interaction_mode_guidance",
     "reasoning_guidance",

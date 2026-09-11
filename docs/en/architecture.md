@@ -2985,6 +2985,38 @@ semantics. Repeating the same range is suppressed; a projection that remains
 above the hard context threshold finalizes as recoverable
 `BUDGET_LIMITED/CONTEXT_WINDOW_BUDGET`.
 
+## C1 conservative context preflight guard
+
+Before a normal `FINALIZE_TERMINAL` model request, `AgentLoopRunner` freezes
+the exact `ToolDefinition` tuple and reuses the logical request payload owned
+by `ModelRequestSnapshot` for bounded local accounting. The estimate includes
+the assembled `ModelContext`, tool definitions, request metadata, configured
+`max_output_tokens` reserve, and a deterministic 5% uncertainty margin with a
+128-token floor and 2,048-token cap. It is not provider-wire serialization or
+exact tokenizer accounting.
+
+The accounting separates reducible conversation context from immutable request
+cost: tool definitions, request-shape metadata, the configured output reserve,
+and the safety margin. If that immutable cost alone reaches the provider
+capacity, preflight stops immediately without compaction or a normal/finalizer
+Provider request. A history-only overflow may use the existing bounded
+compaction path; a repeated durable compaction range stops through the
+deterministic context-budget fallback. TUI and plain CLI projections expose
+only bounded status notices. When capacity is known, displayed numeric
+pressure represents the request total rather than input tokens alone; unknown
+capacity remains visibly unknown and does not produce a percentage.
+
+When configured provider capacity and output reserve are known, one preflight
+cycle may use the existing safe-point compaction boundary before the first
+model request, rebuild the durable context, and assess the rebuilt request
+once more. A request that remains above capacity stops before normal Provider
+invocation with the existing bounded `BUDGET_LIMITED/CONTEXT_WINDOW_BUDGET`
+outcome. Missing capacity or output metadata produces `UNKNOWN`, does not
+invent a limit, and keeps the existing Provider path. The bounded
+`CONTEXT_PREFLIGHT` event exposes status and numeric metadata only; there is no
+provider-overflow retry loop, workspace mutation, or Verification Foundation
+integration.
+
 Progressing long turns may also emit a durable, bounded
 `EXECUTION_SEGMENT_CHECKPOINTED` event and receive one transient checkpoint
 guidance message. Segment thresholds do not reset or replace the global turn

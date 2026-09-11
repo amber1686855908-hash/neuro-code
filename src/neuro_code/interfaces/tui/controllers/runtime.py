@@ -159,8 +159,15 @@ class RuntimeControllerMixin(TuiAppControllerMixin):
         widget.update(hints)
         widget.display = True
 
+    def _context_display_window_tokens(self) -> int | None:
+        if self._context_preflight_status is not None:
+            if not self._context_preflight_total_tokens:
+                return None
+            return self._context_preflight_capacity_tokens
+        return self._context_window_tokens
+
     def _context_percentage(self) -> str:
-        window = self._context_window_tokens
+        window = self._context_display_window_tokens()
         if window is None:
             return self._context_token_usage()
         percentage = self._context_used_tokens / window * 100
@@ -168,7 +175,7 @@ class RuntimeControllerMixin(TuiAppControllerMixin):
         return f"~{rendered}" if self._context_usage_estimated else rendered
 
     def _context_color(self) -> str:
-        window = self._context_window_tokens
+        window = self._context_display_window_tokens()
         if window is None:
             return TEXT_SECONDARY
         ratio = self._context_used_tokens / window
@@ -188,7 +195,7 @@ class RuntimeControllerMixin(TuiAppControllerMixin):
         return f"{approximation}{rendered} tok"
 
     def _context_usage_summary(self) -> str:
-        window = self._context_window_tokens
+        window = self._context_display_window_tokens()
         if window is None:
             return self._context_token_usage()
         approximation = "≈" if self._context_usage_estimated else ""
@@ -264,18 +271,21 @@ class RuntimeControllerMixin(TuiAppControllerMixin):
         secondary.add_row(context, workspace)
         secondary_widget = self._main_screen_query_one("#runtime-secondary", Static)
         secondary_widget.update(secondary)
+        window = self._context_display_window_tokens()
         context_help = (
             self._context_token_usage()
-            if self._context_window_tokens is None
+            if window is None
             else ui_text(
                 self._language,
                 (
-                    "runtime.context_help_estimated"
+                    "runtime.context_help_preflight"
+                    if self._context_preflight_total_tokens
+                    else "runtime.context_help_estimated"
                     if self._context_usage_estimated
                     else "runtime.context_help_reported"
                 ),
                 used=f"{self._context_used_tokens:,}",
-                window=f"{self._context_window_tokens:,}",
+                window=f"{window:,}",
             )
         )
         secondary_widget.tooltip = f"{context_help}\n{self._cwd}"

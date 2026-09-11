@@ -118,6 +118,7 @@ class AgentRuntime:
         verification_command: str | None = None,
         compaction_runtime_gate: ContextCompactionRuntimeGate | None = None,
         provider_context_window: ProviderContextWindow | None = None,
+        provider_max_output_tokens: int | None = None,
         tool_hooks: Sequence[ToolPipelineHook] = (),
         workspace_mutation_tool: Tool | None = None,
         parent_relay_message: Message | None = None,
@@ -159,6 +160,12 @@ class AgentRuntime:
             ProviderContextWindow,
         ):
             raise TypeError("provider_context_window must be a ProviderContextWindow or None")
+        if provider_max_output_tokens is not None and (
+            isinstance(provider_max_output_tokens, bool)
+            or not isinstance(provider_max_output_tokens, int)
+            or provider_max_output_tokens <= 0
+        ):
+            raise ValueError("provider_max_output_tokens must be a positive integer or None")
         self._provider = provider
         self._tools = tools
         self._workspace_change_observer = workspace_change_observer
@@ -231,6 +238,7 @@ class AgentRuntime:
             final_output_gate_enabled=final_output_gate_enabled,
             compaction_runtime_gate=self._compaction_runtime_gate,
             provider_context_window=provider_context_window,
+            provider_max_output_tokens=provider_max_output_tokens,
         )
         self._apply_interaction_mode_permissions()
 
@@ -271,6 +279,10 @@ class AgentRuntime:
     @property
     def provider_context_window(self) -> ProviderContextWindow | None:
         return self._loop_runner.provider_context_window
+
+    @property
+    def provider_max_output_tokens(self) -> int | None:
+        return self._loop_runner.provider_max_output_tokens
 
     def set_reasoning_effort(self, effort: ReasoningEffort) -> None:
         self._context_builder.set_reasoning_effort(effort)

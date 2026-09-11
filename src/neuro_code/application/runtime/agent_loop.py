@@ -25,6 +25,7 @@ from time import monotonic
 
 from neuro_code.application.execution_policy import ExecutionSegmentPolicy
 from neuro_code.application.memory.compaction import (
+    CompactionContextUsage,
     CompactionResumeRebuilder,
     ContextCompactionDecision,
     ProviderContextWindow,
@@ -35,6 +36,8 @@ from neuro_code.application.memory.compaction_runtime import (
     ContextCompactionRuntimeGate,
     ContextCompactionSafePoint,
     ContextCompactionTimeoutError,
+    ContextPreflightStatus,
+    assess_context_preflight,
 )
 from neuro_code.application.ports.model import ModelProvider
 from neuro_code.application.ports.storage import SessionStore
@@ -204,6 +207,7 @@ class AgentLoopRunner:
     管理一个 Agent 回合的步骤循环和最终化编排."""
 
     __slots__ = (
+        "_active_provider_window",
         "_compaction_runtime_gate",
         "_context_builder",
         "_execution_budget",
@@ -214,6 +218,7 @@ class AgentLoopRunner:
         "_max_steps",
         "_provider",
         "_provider_context_window",
+        "_provider_max_output_tokens",
         "_segment_policy",
         "_session_store",
         "_supervision_observer",
@@ -243,6 +248,7 @@ class AgentLoopRunner:
         tool_executor: ToolExecutor,
         compaction_runtime_gate: ContextCompactionRuntimeGate | None,
         provider_context_window: ProviderContextWindow | None,
+        provider_max_output_tokens: int | None = None,
         final_output_gate_enabled: bool = True,
     ) -> None:
         self._provider = provider
@@ -264,6 +270,12 @@ class AgentLoopRunner:
             ProviderContextWindow,
         ):
             raise TypeError("provider_context_window must be a ProviderContextWindow or None")
+        if provider_max_output_tokens is not None and (
+            isinstance(provider_max_output_tokens, bool)
+            or not isinstance(provider_max_output_tokens, int)
+            or provider_max_output_tokens <= 0
+        ):
+            raise ValueError("provider_max_output_tokens must be a positive integer or None")
         if not isinstance(final_output_gate_enabled, bool):
             raise TypeError("final_output_gate_enabled must be a bool")
         self._execution_budget = execution_budget
@@ -280,10 +292,16 @@ class AgentLoopRunner:
         self._tool_scheduler: ToolScheduler[_ScheduledToolOutcome] = ToolScheduler(tools)
         self._compaction_runtime_gate = compaction_runtime_gate
         self._provider_context_window = provider_context_window
+        self._active_provider_window = provider_context_window
+        self._provider_max_output_tokens = provider_max_output_tokens
 
     @property
     def provider_context_window(self) -> ProviderContextWindow | None:
         return self._provider_context_window
+
+    @property
+    def provider_max_output_tokens(self) -> int | None:
+        return self._provider_max_output_tokens
 
     async def run(
         self,
@@ -518,7 +536,12 @@ class AgentLoopRunner:
         finalize_turn_completion = recorder.finalize_turn_completion
 
         supervisor: AgentExecutionSupervisor | None = None
-        active_provider_window = self._provider_context_window
+        # Keep the binding-lifetime request budget separate from the currently
+        # selected provider identity.  A failover selection may expose a larger
+        # capacity, but a later request can still fall back to a smaller or
+        # unknown candidate.
+        request_budget_window = self._provider_context_window
+        active_provider_window = self._active_provider_window
         active_compaction_item: DurableCompactionItem | None = None
         has_completed_model_step = False
         segment_number = 1
@@ -760,14 +783,17 @@ class AgentLoopRunner:
             *,
             step: int,
             usage_context: ModelContext,
+            usage_override: CompactionContextUsage | None = None,
+            provider_window_override: ProviderContextWindow | None = None,
         ) -> SupervisorDecision | None:
             nonlocal active_compaction_item
             gate = self._compaction_runtime_gate
+            compaction_window = provider_window_override or active_provider_window
             if (
                 self._execution_control_mode is not ExecutionControlMode.FINALIZE_TERMINAL
-                or not has_completed_model_step
+                or (not has_completed_model_step and usage_override is None)
                 or gate is None
-                or active_provider_window is None
+                or compaction_window is None
                 or self._session_store is None
                 or session_id is None
             ):
@@ -783,7 +809,7 @@ class AgentLoopRunner:
                 source_context=source_context,
                 usage_context=usage_context,
                 boundary=ContextCompactionRuntimeBoundary(safe_point, step),
-                provider_window=active_provider_window,
+                provider_window=compaction_window,
                 protected_item_count=(
                     1
                     if source_context.items
@@ -794,6 +820,7 @@ class AgentLoopRunner:
                 session_id=session_id,
                 compaction_id=f"compact-{uuid.uuid4().hex}",
                 created_at=datetime.now(UTC),
+                usage_override=usage_override,
             )
             assessment = gate.assess(request)
             if not assessment.will_trigger:
@@ -989,7 +1016,15 @@ class AgentLoopRunner:
             decision: SupervisorDecision,
             *,
             step: int,
+            deterministic_fallback_only: bool = False,
         ) -> AgentRunResult:
+            # A repeated context-budget decision means that the durable
+            # compaction projection already covers this source range but the
+            # request still cannot fit.  Do not issue an oversized finalizer
+            # request; the deterministic fallback is the only bounded path.
+            deterministic_fallback_only = deterministic_fallback_only or (
+                decision.reason_code is SupervisorReasonCode.CONTEXT_WINDOW_BUDGET
+            )
             await maybe_acquire_explicit_verification()
             if (
                 decision.reason_code is SupervisorReasonCode.MODEL_CALL_BUDGET
@@ -1013,15 +1048,19 @@ class AgentLoopRunner:
                     "recoverable": outcome.recoverable,
                 },
             )
-            finalizer = self._finalizer_factory(
-                self._provider,
-                self._finalizer_max_attempts,
-                self._tool_context.redaction_values,
-            )
-            finalization = await finalizer.finalize(
-                projected_model_context(),
-                finalization_evidence(decision),
-            )
+            evidence = finalization_evidence(decision)
+            if deterministic_fallback_only:
+                finalization = deterministic_fallback_result(evidence)
+            else:
+                finalizer = self._finalizer_factory(
+                    self._provider,
+                    self._finalizer_max_attempts,
+                    self._tool_context.redaction_values,
+                )
+                finalization = await finalizer.finalize(
+                    projected_model_context(),
+                    evidence,
+                )
             return await complete_finalization_result(finalization, decision, step=step)
 
         async def complete_gated_terminal_turn(
@@ -1292,6 +1331,40 @@ class AgentLoopRunner:
                         )
                 append_budget_pressure_notice(include_model_reserve=True)
                 context = await build_request_context(completion_reminders)
+                tool_definitions = tuple(self._tools.definitions())
+                if self._execution_control_mode is ExecutionControlMode.FINALIZE_TERMINAL:
+                    # Reject requests whose immutable request cost alone
+                    # cannot fit before consulting the automatic compaction
+                    # boundary.  Conversation history is the only reducible
+                    # component and is handled by the bounded path below.
+                    initial_preflight = assess_context_preflight(
+                        context=context,
+                        tools=tool_definitions,
+                        provider=self._provider.provider_name,
+                        model=self._provider.model_name,
+                        context_affinity=getattr(self._provider, "context_affinity", None),
+                        reasoning_effort=context.reasoning_effort,
+                        provider_window=request_budget_window,
+                        max_output_tokens=self._provider_max_output_tokens,
+                        compaction_attempted=False,
+                    )
+                    if initial_preflight.status is ContextPreflightStatus.BLOCKED:
+                        await emit(
+                            AgentEventKind.CONTEXT_PREFLIGHT,
+                            initial_preflight.to_event_data(),
+                        )
+                        preflight_decision = SupervisorDecision(
+                            SupervisorDecisionKind.MARK_BUDGET_LIMITED,
+                            "context request has an irreducible cost above its configured budget",
+                            AgentExecutionStatus.BUDGET_LIMITED,
+                            False,
+                            SupervisorReasonCode.CONTEXT_WINDOW_BUDGET,
+                        )
+                        return await complete_finalized_turn(
+                            preflight_decision,
+                            step=step - 1,
+                            deterministic_fallback_only=True,
+                        )
                 prior_compaction_item = active_compaction_item
                 compaction_decision = await maybe_compact_context(
                     ContextCompactionSafePoint.BEFORE_MODEL_REQUEST,
@@ -1300,8 +1373,89 @@ class AgentLoopRunner:
                 )
                 if compaction_decision is not None:
                     return await complete_finalized_turn(compaction_decision, step=step - 1)
+                preflight_compaction_attempted = active_compaction_item is not prior_compaction_item
                 if active_compaction_item is not prior_compaction_item:
                     context = await build_request_context(completion_reminders)
+                if self._execution_control_mode is ExecutionControlMode.FINALIZE_TERMINAL:
+                    preflight = assess_context_preflight(
+                        context=context,
+                        tools=tool_definitions,
+                        provider=self._provider.provider_name,
+                        model=self._provider.model_name,
+                        context_affinity=getattr(self._provider, "context_affinity", None),
+                        reasoning_effort=context.reasoning_effort,
+                        provider_window=request_budget_window,
+                        max_output_tokens=self._provider_max_output_tokens,
+                        compaction_attempted=preflight_compaction_attempted,
+                    )
+                    await emit(
+                        AgentEventKind.CONTEXT_PREFLIGHT,
+                        preflight.to_event_data(),
+                    )
+                    if preflight.status is ContextPreflightStatus.COMPACTION_REQUIRED:
+                        capacity = preflight.capacity_tokens
+                        if (
+                            capacity is None
+                            or request_budget_window is None
+                            or active_provider_window is None
+                        ):
+                            raise ConfigurationError(
+                                "actionable context preflight must have a provider capacity"
+                            )
+                        compaction_window = ProviderContextWindow(
+                            active_provider_window.provider_name,
+                            active_provider_window.model_name,
+                            request_budget_window.capacity_tokens,
+                            active_provider_window.context_affinity,
+                        )
+                        compaction_decision = await maybe_compact_context(
+                            ContextCompactionSafePoint.BEFORE_MODEL_REQUEST,
+                            step=step,
+                            usage_context=context,
+                            usage_override=CompactionContextUsage.from_provider_window(
+                                max(preflight.estimated_input_tokens, capacity),
+                                compaction_window,
+                                estimated=True,
+                            ),
+                            provider_window_override=compaction_window,
+                        )
+                        preflight_compaction_attempted = True
+                        if compaction_decision is not None:
+                            return await complete_finalized_turn(
+                                compaction_decision,
+                                step=step - 1,
+                                deterministic_fallback_only=True,
+                            )
+                        if active_compaction_item is not prior_compaction_item:
+                            context = await build_request_context(completion_reminders)
+                        preflight = assess_context_preflight(
+                            context=context,
+                            tools=tool_definitions,
+                            provider=self._provider.provider_name,
+                            model=self._provider.model_name,
+                            context_affinity=getattr(self._provider, "context_affinity", None),
+                            reasoning_effort=context.reasoning_effort,
+                            provider_window=request_budget_window,
+                            max_output_tokens=self._provider_max_output_tokens,
+                            compaction_attempted=preflight_compaction_attempted,
+                        )
+                        await emit(
+                            AgentEventKind.CONTEXT_PREFLIGHT,
+                            preflight.to_event_data(),
+                        )
+                    if preflight.status is ContextPreflightStatus.BLOCKED:
+                        preflight_decision = SupervisorDecision(
+                            SupervisorDecisionKind.MARK_BUDGET_LIMITED,
+                            "context remains above its configured request budget after bounded compaction",
+                            AgentExecutionStatus.BUDGET_LIMITED,
+                            False,
+                            SupervisorReasonCode.CONTEXT_WINDOW_BUDGET,
+                        )
+                        return await complete_finalized_turn(
+                            preflight_decision,
+                            step=step - 1,
+                            deterministic_fallback_only=True,
+                        )
                 before_model_decision = record_supervision(
                     SupervisionCheckpoint.BEFORE_MODEL,
                     step,
@@ -1311,7 +1465,6 @@ class AgentLoopRunner:
                 if terminal_before_model is not None:
                     return await complete_finalized_turn(terminal_before_model, step=step - 1)
                 await emit_budget_usage()
-                tool_definitions = self._tools.definitions()
                 request_snapshot = ModelRequestSnapshot.build(
                     context=context,
                     tools=tool_definitions,
@@ -1383,9 +1536,10 @@ class AgentLoopRunner:
                     )
                     # A failover provider can keep its selected candidate across
                     # turns without announcing it again. Retain the last explicit
-                    # selection so the next turn never falls back to stale primary
-                    # context-window metadata.
-                    self._provider_context_window = active_provider_window
+                    # selection for compaction identity, while the separate
+                    # request budget remains the binding-lifetime failover-safe
+                    # capacity supplied at composition time.
+                    self._active_provider_window = active_provider_window
                     if active_compaction_item is not None and (
                         active_compaction_item.provider_name != selected.provider
                         or active_compaction_item.model_name != selected.model

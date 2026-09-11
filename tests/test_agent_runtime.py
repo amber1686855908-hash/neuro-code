@@ -25,6 +25,7 @@ from neuro_code.application.memory.compaction_runtime import (
     ContextCompactionRuntimeRequest,
     ContextCompactionRuntimeResult,
     ContextCompactionSafePoint,
+    ContextPreflightStatus,
 )
 from neuro_code.application.memory.compaction_service import ContextCompactionApplicationService
 from neuro_code.application.memory.compaction_trigger import (
@@ -222,6 +223,21 @@ class RecordingCompactionRuntimeGate(ContextCompactionRuntimeGate):
     ) -> ContextCompactionRuntimeResult:
         self.requests.append(request)
         raise ProviderError("compaction gate fixture failure")
+
+
+class RaisingAutomaticCompactionRuntimeGate(ContextCompactionRuntimeGate):
+    __slots__ = ("requests",)
+
+    def __init__(self, trigger_service: ContextCompactionTriggerService) -> None:
+        super().__init__(trigger_service)
+        self.requests: list[ContextCompactionRuntimeRequest] = []
+
+    async def trigger(
+        self,
+        request: ContextCompactionRuntimeRequest,
+    ) -> ContextCompactionRuntimeResult:
+        self.requests.append(request)
+        raise ProviderError("automatic compaction fixture failure")
 
 
 class BlockingProvider:
@@ -1325,6 +1341,266 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(stored[0].provider_name, "fallback")
             self.assertEqual(stored[0].model_name, "fallback-model")
 
+    async def test_failover_selection_does_not_widen_request_budget(self) -> None:
+        primary = ScriptedProvider(
+            (
+                (ModelTextDelta("primary answer"), ModelCompleted("stop")),
+                (ModelTextDelta("next answer"), ModelCompleted("stop")),
+            )
+        )
+        primary.provider_name = "primary"
+        primary.model_name = "primary-model"
+        primary.context_affinity = "profile-v1:primary"
+        fallback = ScriptedProvider(())
+        fallback.provider_name = "fallback"
+        fallback.model_name = "fallback-model"
+        fallback.context_affinity = "profile-v1:fallback"
+        provider = FailoverModelProvider(
+            (
+                ProviderCandidate(
+                    "primary",
+                    "primary-model",
+                    "profile-v1:primary",
+                    lambda: primary,
+                    context_window_tokens=100_000,
+                ),
+                ProviderCandidate(
+                    "fallback",
+                    "fallback-model",
+                    "profile-v1:fallback",
+                    lambda: fallback,
+                    context_window_tokens=50_000,
+                ),
+            )
+        )
+        safe_window = ProviderContextWindow(
+            "primary",
+            "primary-model",
+            50_000,
+            "profile-v1:primary",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection(()),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+                provider_context_window=safe_window,
+                provider_max_output_tokens=256,
+            )
+
+            first = await runtime.run("first request")
+            second = await runtime.run("second request", initial_items=first.items)
+
+        self.assertEqual(first.response, "primary answer")
+        self.assertEqual(second.response, "next answer")
+        self.assertEqual(runtime.provider_context_window, safe_window)
+        active_window = runtime._loop_runner._active_provider_window
+        self.assertIsNotNone(active_window)
+        assert active_window is not None
+        self.assertEqual(active_window.capacity_tokens, 100_000)
+        preflights = [
+            event for event in second.events if event.kind is AgentEventKind.CONTEXT_PREFLIGHT
+        ]
+        self.assertEqual(len(preflights), 1)
+        self.assertEqual(
+            preflights[0].data["status"],
+            ContextPreflightStatus.SAFE.value,
+        )
+        self.assertEqual(preflights[0].data["capacity_tokens"], 50_000)
+
+    async def test_failover_safe_budget_blocks_oversized_request_before_fallback(self) -> None:
+        primary = ScriptedProvider(((ModelTextDelta("warm"), ModelCompleted("stop")),))
+        primary.provider_name = "primary"
+        primary.model_name = "primary-model"
+        primary.context_affinity = "profile-v1:primary"
+        fallback = ScriptedProvider(((ModelTextDelta("fallback"), ModelCompleted("stop")),))
+        fallback.provider_name = "fallback"
+        fallback.model_name = "fallback-model"
+        fallback.context_affinity = "profile-v1:fallback"
+        provider = FailoverModelProvider(
+            (
+                ProviderCandidate(
+                    "primary",
+                    "primary-model",
+                    "profile-v1:primary",
+                    lambda: primary,
+                    context_window_tokens=100_000,
+                ),
+                ProviderCandidate(
+                    "fallback",
+                    "fallback-model",
+                    "profile-v1:fallback",
+                    lambda: fallback,
+                    context_window_tokens=50_000,
+                ),
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = SqliteSessionStore(root / "sessions.db")
+            await store.initialize()
+            session_id = await store.create_session(
+                str(root),
+                "primary",
+                "primary-model",
+                "profile-v1:primary",
+            )
+            gate = RaisingAutomaticCompactionRuntimeGate(
+                ContextCompactionTriggerService(
+                    ContextCompactionApplicationService(store, provider),
+                )
+            )
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection(()),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(root),
+                session_store=store,
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+                compaction_runtime_gate=gate,
+                provider_context_window=ProviderContextWindow(
+                    "primary",
+                    "primary-model",
+                    50_000,
+                    "profile-v1:primary",
+                ),
+                provider_max_output_tokens=256,
+            )
+
+            await runtime.run("warm up", session_id=session_id)
+            persisted_items = await store.load_session_items(session_id)
+            oversized_context = (*persisted_items, Message(Role.USER, "x" * 180_000))
+            result = await runtime.run(
+                "request that must fit the fallback too",
+                initial_items=oversized_context,
+                session_id=session_id,
+            )
+
+            preflights = [
+                event
+                for event in await store.load_events(session_id)
+                if event["kind"] == AgentEventKind.CONTEXT_PREFLIGHT.value
+            ]
+
+        preflight_data = preflights[-1]["data"]
+        self.assertGreater(preflight_data["estimated_total_tokens"], 50_000)
+        self.assertLess(preflight_data["estimated_total_tokens"], 100_000)
+        self.assertEqual(preflight_data["capacity_tokens"], 50_000)
+        assert result.outcome is not None
+        self.assertIs(result.outcome.status, AgentExecutionStatus.BUDGET_LIMITED)
+        self.assertIs(
+            result.outcome.reason_code,
+            SupervisorReasonCode.CONTEXT_WINDOW_BUDGET,
+        )
+        self.assertEqual(len(primary.calls), 1)
+        self.assertEqual(len(fallback.calls), 0)
+        self.assertEqual(len(gate.requests), 0)
+
+    async def test_unknown_failover_budget_stays_unknown_after_primary_selection(self) -> None:
+        primary = ScriptedProvider(((ModelTextDelta("primary"), ModelCompleted("stop")),))
+        primary.provider_name = "primary"
+        primary.model_name = "primary-model"
+        primary.context_affinity = "profile-v1:primary"
+        fallback = ScriptedProvider(())
+        fallback.provider_name = "fallback"
+        fallback.model_name = "fallback-model"
+        fallback.context_affinity = "profile-v1:fallback"
+        provider = FailoverModelProvider(
+            (
+                ProviderCandidate(
+                    "primary",
+                    "primary-model",
+                    "profile-v1:primary",
+                    lambda: primary,
+                    context_window_tokens=100_000,
+                ),
+                ProviderCandidate(
+                    "fallback",
+                    "fallback-model",
+                    "profile-v1:fallback",
+                    lambda: fallback,
+                ),
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection(()),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+                provider_max_output_tokens=256,
+            )
+            result = await runtime.run("unknown capacity")
+
+        self.assertEqual(result.response, "primary")
+        self.assertIsNone(runtime.provider_context_window)
+        active_window = runtime._loop_runner._active_provider_window
+        self.assertIsNotNone(active_window)
+        assert active_window is not None
+        self.assertEqual(active_window.capacity_tokens, 100_000)
+        preflight = next(
+            event for event in result.events if event.kind is AgentEventKind.CONTEXT_PREFLIGHT
+        )
+        self.assertEqual(preflight.data["status"], ContextPreflightStatus.UNKNOWN.value)
+        self.assertIsNone(preflight.data["capacity_tokens"])
+
+    async def test_equal_failover_capacities_keep_normal_fallback_behavior(self) -> None:
+        primary = FailingProvider("primary")
+        fallback = ScriptedProvider(((ModelTextDelta("fallback"), ModelCompleted("stop")),))
+        fallback.provider_name = "fallback"
+        fallback.model_name = "fallback-model"
+        fallback.context_affinity = "profile-v1:fallback"
+        provider = FailoverModelProvider(
+            (
+                ProviderCandidate(
+                    "primary",
+                    "primary-model",
+                    "profile-v1:primary",
+                    lambda: primary,
+                    context_window_tokens=50_000,
+                ),
+                ProviderCandidate(
+                    "fallback",
+                    "fallback-model",
+                    "profile-v1:fallback",
+                    lambda: fallback,
+                    context_window_tokens=50_000,
+                ),
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = AgentRuntime(
+                provider=provider,
+                tools=MinimalToolCollection(()),
+                workspace_change_observer=EmptyWorkspaceChangeObserver(),
+                permissions=PermissionManager(),
+                tool_context=ToolContext(Path(directory)),
+                execution_control_mode=ExecutionControlMode.FINALIZE_TERMINAL,
+                provider_context_window=ProviderContextWindow(
+                    "primary",
+                    "primary-model",
+                    50_000,
+                    "profile-v1:primary",
+                ),
+                provider_max_output_tokens=256,
+            )
+            result = await runtime.run("fallback normally")
+
+        self.assertEqual(result.response, "fallback")
+        preflight = next(
+            event for event in result.events if event.kind is AgentEventKind.CONTEXT_PREFLIGHT
+        )
+        self.assertEqual(preflight.data["capacity_tokens"], 50_000)
+        self.assertEqual(runtime.provider_context_window.capacity_tokens, 50_000)
+        assert runtime._loop_runner._active_provider_window is not None
+        self.assertEqual(runtime._loop_runner._active_provider_window.capacity_tokens, 50_000)
+
     async def test_hard_context_limit_after_compaction_stops_without_repeating_summary(
         self,
     ) -> None:
@@ -1383,11 +1659,15 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 result.outcome.reason_code,
                 SupervisorReasonCode.CONTEXT_WINDOW_BUDGET,
             )
-            self.assertEqual(result.response, "safe context-limit finalization")
+            self.assertTrue(
+                result.response.startswith(
+                    "I could not produce a reliable final summary from the available evidence."
+                )
+            )
             self.assertEqual(result.steps, 1)
             self.assertEqual(
                 provider.tool_policies,
-                [ModelToolPolicy.ALLOWED, ModelToolPolicy.DISABLED, ModelToolPolicy.DISABLED],
+                [ModelToolPolicy.ALLOWED, ModelToolPolicy.DISABLED],
             )
             self.assertEqual(
                 sum(

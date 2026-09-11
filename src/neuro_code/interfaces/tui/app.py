@@ -674,6 +674,10 @@ class NeuroCodeApp(
         self._context_window_tokens = context_window_tokens
         self._context_used_tokens = estimate_context_tokens(self._initial_items)
         self._context_usage_estimated = True
+        self._context_preflight_status: str | None = None
+        self._context_preflight_capacity_tokens: int | None = None
+        self._context_preflight_total_tokens = False
+        self._context_preflight_notice: str | None = None
         self._plan = plan_controller.plan if plan_controller is not None else None
         self._plan_comments: tuple[PlanComment, ...] = ()
         self._plan_entry_index: int | None = None

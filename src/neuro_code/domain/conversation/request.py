@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
-from neuro_code.domain.conversation.context import ModelContext
+from neuro_code.domain.conversation.context import ModelContext, estimate_text_tokens
 from neuro_code.domain.conversation.messages import Message, SessionItem
 from neuro_code.domain.conversation.reasoning import ReasoningEffort
 from neuro_code.domain.tools import ToolDefinition
@@ -113,6 +113,126 @@ def context_fingerprints(items: Sequence[SessionItem]) -> RequestContextFingerpr
     )
 
 
+def build_model_request_payload(
+    *,
+    context: ModelContext,
+    tools: Sequence[ToolDefinition],
+    provider: str,
+    model: str,
+    context_affinity: str | None,
+    reasoning_effort: ReasoningEffort,
+    tool_policy: str = "allowed",
+) -> dict[str, Any]:
+    """Build the one canonical logical request shape used by the runtime.
+
+    The payload is an in-memory accounting/fingerprint shape.  It is not an
+    exact provider wire request and must not be treated as a provider-specific
+    tokenizer result.
+
+    构建 Runtime 唯一使用的规范逻辑请求形状。
+
+    该 payload 只用于内存中的计量和指纹, 不是精确的 Provider wire 请求,
+    也不得被当作 Provider 专属 tokenizer 的结果。
+    """
+
+    if not isinstance(context, ModelContext):
+        raise TypeError("context must be a ModelContext")
+    definitions = tuple(tools)
+    if not all(isinstance(tool, ToolDefinition) for tool in definitions):
+        raise TypeError("tools must contain ToolDefinition values")
+    if not isinstance(reasoning_effort, ReasoningEffort):
+        raise TypeError("reasoning_effort must be a ReasoningEffort")
+    for name, value in (("provider", provider), ("model", model), ("tool_policy", tool_policy)):
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{name} must be non-empty")
+    if context_affinity is not None and not isinstance(context_affinity, str):
+        raise TypeError("context_affinity must be a string or None")
+    return {
+        "context": [_item_shape(item) for item in context.items],
+        "tools": [tool.to_dict() for tool in definitions],
+        "provider": provider,
+        "model": model,
+        "context_affinity": context_affinity,
+        "reasoning_effort": reasoning_effort.value,
+        "tool_policy": tool_policy,
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class ModelRequestTokenEstimate:
+    """Approximate token accounting for one canonical request payload.
+
+    Values are deliberately estimates.  They include the complete logical
+    request shape, including synthetic context and tool definitions, without
+    claiming to match a provider tokenizer.
+
+    一个规范请求 payload 的近似 token 计量。
+
+    这些值明确是估算值, 包含完整逻辑请求形状 (包括合成上下文和工具定义),
+    但不声称等于 Provider tokenizer 的结果。
+    """
+
+    estimated_input_tokens: int
+    context_tokens: int
+    tool_tokens: int
+    request_shape_tokens: int
+
+    def __post_init__(self) -> None:
+        for name in (
+            "estimated_input_tokens",
+            "context_tokens",
+            "tool_tokens",
+            "request_shape_tokens",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.estimated_input_tokens != (
+            self.context_tokens + self.tool_tokens + self.request_shape_tokens
+        ):
+            raise ValueError("estimated_input_tokens must match component totals")
+
+
+def _estimate_payload_tokens(value: Any) -> int:
+    encoded = json.dumps(
+        _canonical(value),
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return estimate_text_tokens(encoded)
+
+
+def estimate_model_request_tokens(payload: Mapping[str, Any]) -> ModelRequestTokenEstimate:
+    """Estimate tokens from the exact payload used by request snapshots.
+
+    The component sum intentionally accounts for context, tool definitions,
+    and request-shape metadata separately so callers can expose a bounded tool
+    contribution without maintaining a second request representation.
+
+    根据请求快照使用的同一 payload 估算 token。组件总和刻意分别计算上下文,
+    工具定义和请求元数据, 以便调用方暴露有界工具贡献, 而无需维护第二种请求表示。
+    """
+
+    if not isinstance(payload, Mapping):
+        raise TypeError("payload must be a mapping")
+    context = payload.get("context")
+    tools = payload.get("tools")
+    if not isinstance(context, list) or not isinstance(tools, list):
+        raise ValueError("request payload must contain context and tools lists")
+    metadata = {key: value for key, value in payload.items() if key not in {"context", "tools"}}
+    context_tokens = _estimate_payload_tokens({"context": context})
+    tool_tokens = _estimate_payload_tokens({"tools": tools})
+    request_shape_tokens = _estimate_payload_tokens(metadata)
+    return ModelRequestTokenEstimate(
+        context_tokens + tool_tokens + request_shape_tokens,
+        context_tokens,
+        tool_tokens,
+        request_shape_tokens,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ModelRequestSnapshot:
     """Auditable identity of one concrete provider request.
@@ -186,20 +306,18 @@ class ModelRequestSnapshot:
     ) -> ModelRequestSnapshot:
         if not isinstance(context, ModelContext):
             raise TypeError("context must be a ModelContext")
-        definitions = tuple(tools)
-        if not all(isinstance(tool, ToolDefinition) for tool in definitions):
-            raise TypeError("tools must contain ToolDefinition values")
         fingerprints = context_fingerprints(context.items)
-        tool_payload = [tool.to_dict() for tool in definitions]
-        payload: dict[str, Any] = {
-            "context": [_item_shape(item) for item in context.items],
-            "tools": tool_payload,
-            "provider": provider,
-            "model": model,
-            "context_affinity": context_affinity,
-            "reasoning_effort": reasoning_effort.value,
-            "tool_policy": tool_policy,
-        }
+        payload = build_model_request_payload(
+            context=context,
+            tools=tools,
+            provider=provider,
+            model=model,
+            context_affinity=context_affinity,
+            reasoning_effort=reasoning_effort,
+            tool_policy=tool_policy,
+        )
+        tool_payload = payload["tools"]
+        definitions = tuple(tools)
         return cls(
             request_id=request_id or f"request-{uuid.uuid4().hex}",
             step=step,
@@ -272,6 +390,9 @@ __all__ = [
     "MAX_REQUEST_SNAPSHOT_ID_BYTES",
     "REQUEST_SNAPSHOT_SCHEMA_VERSION",
     "ModelRequestSnapshot",
+    "ModelRequestTokenEstimate",
     "RequestContextFingerprints",
+    "build_model_request_payload",
     "context_fingerprints",
+    "estimate_model_request_tokens",
 ]

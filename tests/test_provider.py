@@ -13,6 +13,7 @@ from neuro_code.application.ports.model import (
     ModelCapability,
     ModelToolPolicy,
 )
+from neuro_code.application.ports.routing import ModelRoute, RuntimeRole
 from neuro_code.domain.conversation.context import UPSTREAM_IMPORT_PROVIDER, ModelContext
 from neuro_code.domain.conversation.events import (
     ModelCompleted,
@@ -1533,6 +1534,51 @@ class OpenAICompatibleProviderTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsInstance(routed, FailoverModelProvider)
         self.assertIsInstance(direct, ResilientModelProvider)
+
+    def test_route_model_override_does_not_reuse_primary_capacity_metadata(self) -> None:
+        primary = ProviderProfile(
+            name="primary",
+            protocol="openai-chat",
+            model="model-a",
+            base_url="https://primary.invalid/v1",
+            api_key_env="PRIMARY_KEY",
+            context_window_tokens=100_000,
+        )
+        fallback = ProviderProfile(
+            name="fallback",
+            protocol="openai-chat",
+            model="fallback-model",
+            base_url="https://fallback.invalid/v1",
+            api_key_env="FALLBACK_KEY",
+            context_window_tokens=50_000,
+        )
+        config = AppConfig(
+            cwd=Path("/workspace"),
+            state_dir=Path("/state"),
+            providers={"primary": primary, "fallback": fallback},
+            default_provider="primary",
+            selected_provider="primary",
+            routes={
+                RuntimeRole.MAIN: ModelRoute(
+                    RuntimeRole.MAIN,
+                    "primary",
+                    "model-b",
+                    ("fallback",),
+                )
+            },
+        )
+
+        with mock.patch.dict(
+            "os.environ",
+            {"PRIMARY_KEY": "primary-key", "FALLBACK_KEY": "fallback-key"},
+            clear=True,
+        ):
+            routed = create_routed_provider(config)
+
+        self.assertIsInstance(routed, FailoverModelProvider)
+        assert isinstance(routed, FailoverModelProvider)
+        self.assertIsNone(routed._candidates[0].context_window_tokens)
+        self.assertEqual(routed._candidates[1].context_window_tokens, 50_000)
 
 
 if __name__ == "__main__":
