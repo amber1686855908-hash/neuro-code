@@ -14,6 +14,7 @@ from unittest.mock import Mock, patch
 
 from neuro_code.application.sessions import ExportSessionRequest, SessionApplicationService
 from neuro_code.domain.background_tasks import BackgroundWakeState
+from neuro_code.domain.checkpoints import CheckpointFingerprint, CheckpointId, RollbackAttemptId
 from neuro_code.domain.conversation.compaction import DurableCompactionItem
 from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
 from neuro_code.domain.conversation.messages import (
@@ -29,6 +30,8 @@ from neuro_code.domain.execution import (
     AgentExecutionStatus,
     SessionExecutionRecord,
     SupervisorReasonCode,
+    TurnInput,
+    TurnRecoveryAttempt,
 )
 from neuro_code.domain.plans import (
     MAX_PLAN_COMMENTS,
@@ -46,6 +49,7 @@ from neuro_code.domain.session_tasks import (
     SubagentLink,
 )
 from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
+from neuro_code.domain.workspace_undo import WorkspaceUndoAssociation, WorkspaceUndoState
 from neuro_code.infrastructure.persistence.sqlite_session import SCHEMA_VERSION, SqliteSessionStore
 from neuro_code.interfaces.cli.serialization import render_session_markdown
 from neuro_code.shared.errors import SessionError
@@ -2439,6 +2443,95 @@ class SessionStoreTests(unittest.IsolatedAsyncioTestCase):
             ):
                 with self.assertRaises(SessionError):
                     await operation
+
+
+class WorkspaceUndoStorageTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory(prefix="neuro-workspace-undo-store-")
+        self.store = SqliteSessionStore(Path(self.directory.name) / "sessions.db")
+        await self.store.initialize()
+        self.session_id = await self.store.create_session("/workspace", "provider", "model")
+
+    async def asyncTearDown(self) -> None:
+        self.directory.cleanup()
+
+    async def _persist_available_workspace_undo(self) -> WorkspaceUndoAssociation:
+        association = WorkspaceUndoAssociation(
+            session_id=self.session_id,
+            turn_id="turn-undo",
+            state=WorkspaceUndoState.AVAILABLE,
+            updated_at=datetime.now(UTC),
+            checkpoint_id=CheckpointId("cp-undo"),
+            expected_current_fingerprint=CheckpointFingerprint("a" * 64),
+        )
+        await self.store.append_event(
+            self.session_id,
+            AgentEvent.create(
+                1,
+                AgentEventKind.WORKSPACE_UNDO_STATE,
+                association.to_event_data(),
+            ),
+        )
+        return association
+
+    def _workspace_undo_attempt(self, turn_id: str = "turn-active") -> TurnRecoveryAttempt:
+        return TurnRecoveryAttempt.create(
+            turn_id=turn_id,
+            session_id=self.session_id,
+            input=TurnInput(
+                "workspace undo race",
+                (ContentPart.from_text("workspace undo race"),),
+            ),
+            accepted_at=datetime.now(UTC),
+        )
+
+    def _rolling_workspace_undo(
+        self,
+        association: WorkspaceUndoAssociation,
+    ) -> WorkspaceUndoAssociation:
+        return replace(
+            association,
+            state=WorkspaceUndoState.ROLLING_BACK,
+            rollback_attempt_id=RollbackAttemptId("rb-undo"),
+        )
+
+    async def test_workspace_undo_claim_rejects_open_turn_atomically(self) -> None:
+        association = await self._persist_available_workspace_undo()
+        rolling_back = self._rolling_workspace_undo(association)
+        await self.store.start_turn_attempt(self._workspace_undo_attempt())
+
+        self.assertFalse(await self.store.claim_workspace_undo(association, rolling_back))
+        self.assertEqual(
+            (await self.store.load_open_turn_attempts(self.session_id))[0].turn_id,
+            "turn-active",
+        )
+        self.assertEqual(
+            (await self.store.load_events(self.session_id))[-1]["data"],
+            association.to_event_data(),
+        )
+
+    async def test_workspace_undo_claim_blocks_new_turn_after_undo_wins(self) -> None:
+        association = await self._persist_available_workspace_undo()
+        rolling_back = self._rolling_workspace_undo(association)
+
+        self.assertTrue(await self.store.claim_workspace_undo(association, rolling_back))
+        with self.assertRaisesRegex(SessionError, "workspace rollback in progress"):
+            await self.store.start_turn_attempt(self._workspace_undo_attempt())
+
+    async def test_completed_turn_does_not_block_workspace_undo_claim(self) -> None:
+        association = await self._persist_available_workspace_undo()
+        rolling_back = self._rolling_workspace_undo(association)
+        attempt = self._workspace_undo_attempt()
+        await self.store.start_turn_attempt(attempt)
+        await self.store.finalize_turn(
+            self.session_id,
+            AgentEvent.create(2, AgentEventKind.TURN_COMPLETED, {"turn_id": attempt.turn_id}),
+            (),
+            None,
+            turn_id=attempt.turn_id,
+        )
+
+        self.assertTrue(await self.store.claim_workspace_undo(association, rolling_back))
 
 
 if __name__ == "__main__":

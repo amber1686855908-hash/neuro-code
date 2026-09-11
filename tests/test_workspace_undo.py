@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,10 +24,18 @@ from neuro_code.application.ports.workspace import (
 )
 from neuro_code.domain.background_tasks import BackgroundTaskStatus
 from neuro_code.domain.checkpoints import (
+    CheckpointFingerprint,
     CheckpointId,
+    RollbackAttemptId,
+    RollbackState,
     SourceWorkspaceCheckpointGrant,
+    WorkspaceFileEntry,
+    WorkspaceFileKind,
+    WorkspaceFileScope,
+    WorkspaceProjection,
+    workspace_projection_fingerprint,
 )
-from neuro_code.domain.conversation.events import AgentEventKind
+from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
 from neuro_code.domain.workspace_undo import (
     WorkspaceUndoAssociation,
     WorkspaceUndoReason,
@@ -44,6 +53,7 @@ class _MemorySessionStore:
         self.events: list[dict[str, object]] = []
         self.append_count = 0
         self.fail_on_append: int | None = None
+        self.open_turns: list[object] = []
 
     async def load_events(self, session_id: str) -> list[dict[str, object]]:
         del session_id
@@ -55,10 +65,68 @@ class _MemorySessionStore:
 
     async def append_event(self, session_id: str, event: object) -> None:
         del session_id
+        self._append_event(event)
+
+    def _append_event(self, event: object) -> None:
         self.append_count += 1
         if self.fail_on_append == self.append_count:
             raise OSError("fixture append failure")
         self.events.append(event.to_dict())  # type: ignore[union-attr]
+
+    async def load_open_turn_attempts(self, session_id: str) -> list[object]:
+        del session_id
+        return list(self.open_turns)
+
+    def _latest_undo_data(self, session_id: str) -> dict[str, object] | None:
+        del session_id
+        undo_events = [
+            event
+            for event in self.events
+            if event.get("kind") == AgentEventKind.WORKSPACE_UNDO_STATE.value
+        ]
+        if not undo_events:
+            return None
+        return max(undo_events, key=lambda event: event["sequence"])["data"]  # type: ignore[return-value]
+
+    async def claim_workspace_undo(
+        self,
+        expected: WorkspaceUndoAssociation,
+        rolling_back: WorkspaceUndoAssociation,
+    ) -> bool:
+        if (
+            self.open_turns
+            or self._latest_undo_data(expected.session_id) != expected.to_event_data()
+        ):
+            return False
+        sequence = await self.next_event_sequence(expected.session_id)
+        self._append_event(
+            AgentEvent.create(
+                sequence,
+                AgentEventKind.WORKSPACE_UNDO_STATE,
+                rolling_back.to_event_data(),
+            )
+        )
+        return True
+
+    async def seal_workspace_undo(
+        self,
+        expected: WorkspaceUndoAssociation,
+        sealed: WorkspaceUndoAssociation,
+    ) -> bool:
+        if (
+            self.open_turns
+            or self._latest_undo_data(expected.session_id) != expected.to_event_data()
+        ):
+            return False
+        sequence = await self.next_event_sequence(expected.session_id)
+        self._append_event(
+            AgentEvent.create(
+                sequence,
+                AgentEventKind.WORKSPACE_UNDO_STATE,
+                sealed.to_event_data(),
+            )
+        )
+        return True
 
 
 class _FakeCheckpointService:
@@ -77,6 +145,13 @@ class _FakeCheckpointService:
             branch="main",
             detached=False,
         )
+        self.projection = WorkspaceProjection(
+            head_sha="a" * 40,
+            branch="main",
+            detached=False,
+            index_bytes=b"index",
+            entries=(),
+        )
         self.checkpoint = SimpleNamespace(
             checkpoint_id=CheckpointId("cp-fixture"),
             repository=repository,
@@ -84,9 +159,12 @@ class _FakeCheckpointService:
             head_sha="a" * 40,
             branch="main",
             detached=False,
+            source_fingerprint=workspace_projection_fingerprint(self.grant, self.projection),
         )
         self.create_calls = 0
         self.rollback_calls = 0
+        self.restore_calls = 0
+        self.completed_attempts: set[str] = set()
         self.fail_rollback = False
 
     async def initialize(self) -> None:
@@ -113,21 +191,35 @@ class _FakeCheckpointService:
     async def get(self, checkpoint_id: CheckpointId) -> SimpleNamespace | None:
         return self.checkpoint if checkpoint_id == self.checkpoint.checkpoint_id else None
 
+    async def inspect(self, grant: SourceWorkspaceCheckpointGrant) -> WorkspaceProjection:
+        assert grant == self.grant
+        return self.projection
+
     async def rollback(
         self,
         checkpoint_id: CheckpointId,
         *,
         target: SourceWorkspaceCheckpointGrant,
+        attempt_id: object,
+        expected_current_fingerprint: CheckpointFingerprint | None = None,
     ) -> SimpleNamespace:
         assert checkpoint_id == self.checkpoint.checkpoint_id
         assert target == self.grant
+        del expected_current_fingerprint
         self.rollback_calls += 1
         if self.fail_rollback:
             raise WorkspaceCheckpointError(
                 "fixture rollback failed",
                 kind=CheckpointFailureKind.COMMAND_FAILED,
             )
-        return SimpleNamespace(attempt_id=SimpleNamespace(value="rb-fixture"))
+        attempt_value = attempt_id.value  # type: ignore[attr-defined]
+        if attempt_value not in self.completed_attempts:
+            self.completed_attempts.add(attempt_value)
+            self.restore_calls += 1
+        return SimpleNamespace(
+            attempt_id=attempt_id,
+            state=RollbackState.COMPLETED,
+        )
 
 
 def _plan(root: Path) -> FilesystemAccessPlan:
@@ -173,6 +265,7 @@ class WorkspaceUndoCoordinatorTests(unittest.TestCase):
                 client_terminal=None,
             )
         )
+        _run(self.coordinator.seal_turn("session-1", turn_id))
 
     def test_checkpoint_barrier_is_single_and_undo_is_one_shot(self) -> None:
         async def prepare_concurrently() -> None:
@@ -180,6 +273,7 @@ class WorkspaceUndoCoordinatorTests(unittest.TestCase):
 
         async def run() -> None:
             await prepare_concurrently()
+            await self.coordinator.seal_turn("session-1", "turn-1")
             result = await self.coordinator.undo("session-1")
             self.assertIs(result.state, WorkspaceUndoState.ROLLED_BACK)
             self.assertTrue(result.restored)
@@ -195,7 +289,7 @@ class WorkspaceUndoCoordinatorTests(unittest.TestCase):
 
         _run(run())
         self.assertEqual(self.service.create_calls, 1)
-        self.assertEqual(len(self.store.events), 4)
+        self.assertEqual(len(self.store.events), 5)
         self.assertEqual(
             self.store.events[0]["kind"],
             AgentEventKind.WORKSPACE_UNDO_STATE.value,
@@ -227,6 +321,165 @@ class WorkspaceUndoCoordinatorTests(unittest.TestCase):
         self.assertIs(result.reason, WorkspaceUndoReason.UNBOUNDED_MUTATION)
         self.assertEqual(self.service.rollback_calls, 0)
 
+    def test_unsealed_checkpoint_fails_closed_without_guessing_workspace_state(self) -> None:
+        _run(
+            self.coordinator.prepare(
+                session_id="session-1",
+                turn_id="turn-1",
+                plan=_plan(self.root),
+                client_file_system=None,
+                client_terminal=None,
+            )
+        )
+
+        result = _run(self.coordinator.undo("session-1"))
+
+        self.assertIs(result.reason, WorkspaceUndoReason.ROLLBACK_INDETERMINATE)
+        self.assertEqual(self.service.rollback_calls, 0)
+        self.assertEqual(len(self.store.events), 1)
+
+    def test_post_turn_workspace_change_refuses_restore_without_overwrite(self) -> None:
+        self._prepare()
+        self.service.projection = replace(self.service.projection, index_bytes=b"manual-index")
+
+        result = _run(self.coordinator.undo("session-1"))
+
+        self.assertIs(result.reason, WorkspaceUndoReason.WORKSPACE_CHANGED)
+        self.assertEqual(self.service.rollback_calls, 0)
+        self.assertEqual(self.service.restore_calls, 0)
+        self.assertEqual(self.service.projection.index_bytes, b"manual-index")
+        latest = _run(self.coordinator._ledger.latest("session-1"))
+        self.assertIsNotNone(latest)
+        assert latest is not None
+        self.assertIs(latest.state, WorkspaceUndoState.UNAVAILABLE)
+        self.assertIs(latest.reason, WorkspaceUndoReason.WORKSPACE_CHANGED)
+
+    def test_post_turn_tracked_file_change_refuses_restore_without_overwrite(self) -> None:
+        self._prepare()
+        self.service.projection = replace(
+            self.service.projection,
+            entries=(
+                WorkspaceFileEntry(
+                    path="tracked.py",
+                    scope=WorkspaceFileScope.TRACKED,
+                    present=True,
+                    kind=WorkspaceFileKind.REGULAR,
+                    mode=0o100644,
+                    content=b"manual tracked change",
+                ),
+            ),
+        )
+
+        result = _run(self.coordinator.undo("session-1"))
+
+        self.assertIs(result.reason, WorkspaceUndoReason.WORKSPACE_CHANGED)
+        self.assertEqual(self.service.rollback_calls, 0)
+        self.assertEqual(self.service.restore_calls, 0)
+        self.assertEqual(self.service.projection.entries[0].content, b"manual tracked change")
+
+    def test_post_turn_untracked_file_change_refuses_restore_without_overwrite(self) -> None:
+        self._prepare()
+        self.service.projection = replace(
+            self.service.projection,
+            entries=(
+                WorkspaceFileEntry(
+                    path="manual.txt",
+                    scope=WorkspaceFileScope.UNTRACKED,
+                    present=True,
+                    kind=WorkspaceFileKind.REGULAR,
+                    mode=0o100644,
+                    content=b"manual untracked change",
+                ),
+            ),
+        )
+
+        result = _run(self.coordinator.undo("session-1"))
+
+        self.assertIs(result.reason, WorkspaceUndoReason.WORKSPACE_CHANGED)
+        self.assertEqual(self.service.rollback_calls, 0)
+        self.assertEqual(self.service.restore_calls, 0)
+        self.assertEqual(self.service.projection.entries[0].content, b"manual untracked change")
+
+    def test_ignored_only_change_does_not_invalidate_undo_projection(self) -> None:
+        self._prepare()
+        ignored = self.root / "ignored.tmp"
+        ignored.write_bytes(b"manual ignored change")
+
+        result = _run(self.coordinator.undo("session-1"))
+
+        self.assertIs(result.state, WorkspaceUndoState.ROLLED_BACK)
+        self.assertEqual(ignored.read_bytes(), b"manual ignored change")
+        self.assertEqual(self.service.restore_calls, 1)
+
+    def test_open_turn_wins_before_undo_claim(self) -> None:
+        self._prepare()
+        self.store.open_turns.append(object())
+
+        result = _run(self.coordinator.undo("session-1"))
+
+        self.assertIs(result.reason, WorkspaceUndoReason.ACTIVE_TURN)
+        self.assertEqual(self.service.rollback_calls, 0)
+        latest = _run(self.coordinator._ledger.latest("session-1"))
+        self.assertIsNotNone(latest)
+        assert latest is not None
+        self.assertIs(latest.state, WorkspaceUndoState.AVAILABLE)
+        self.assertIsNotNone(latest.expected_current_fingerprint)
+
+    def test_interrupted_rollback_resumes_same_durable_attempt(self) -> None:
+        self._prepare()
+        available = _run(self.coordinator._ledger.latest("session-1"))
+        assert available is not None
+        attempt_id = RollbackAttemptId("rb-interrupted")
+        rolling_back = replace(
+            available,
+            state=WorkspaceUndoState.ROLLING_BACK,
+            expected_current_fingerprint=available.expected_current_fingerprint,
+            rollback_attempt_id=attempt_id,
+        )
+        self.assertTrue(_run(self.store.claim_workspace_undo(available, rolling_back)))
+
+        restarted = TurnWorkspaceCheckpointCoordinator(
+            checkpoint_service=self.service,  # type: ignore[arg-type]
+            store=self.store,  # type: ignore[arg-type]
+            source_workspace=self.root,
+        )
+        _run(restarted.initialize())
+        result = _run(restarted.undo("session-1"))
+
+        self.assertIs(result.state, WorkspaceUndoState.ROLLED_BACK)
+        self.assertEqual(self.service.rollback_calls, 1)
+        self.assertEqual(self.service.restore_calls, 1)
+        latest = _run(restarted._ledger.latest("session-1"))
+        self.assertIsNotNone(latest)
+        assert latest is not None
+        self.assertIs(latest.state, WorkspaceUndoState.ROLLED_BACK)
+        self.assertEqual(latest.rollback_attempt_id, attempt_id)
+
+    def test_interrupted_rollback_refuses_unexpected_workspace_without_restore(self) -> None:
+        self._prepare()
+        available = _run(self.coordinator._ledger.latest("session-1"))
+        assert available is not None
+        rolling_back = replace(
+            available,
+            state=WorkspaceUndoState.ROLLING_BACK,
+            rollback_attempt_id=RollbackAttemptId("rb-indeterminate"),
+        )
+        self.assertTrue(_run(self.store.claim_workspace_undo(available, rolling_back)))
+        self.service.projection = replace(self.service.projection, index_bytes=b"unexpected")
+
+        restarted = TurnWorkspaceCheckpointCoordinator(
+            checkpoint_service=self.service,  # type: ignore[arg-type]
+            store=self.store,  # type: ignore[arg-type]
+            source_workspace=self.root,
+        )
+        _run(restarted.initialize())
+        result = _run(restarted.undo("session-1"))
+
+        self.assertIs(result.reason, WorkspaceUndoReason.ROLLBACK_INDETERMINATE)
+        self.assertEqual(self.service.rollback_calls, 0)
+        self.assertEqual(self.service.restore_calls, 0)
+        self.assertEqual(self.service.projection.index_bytes, b"unexpected")
+
     def test_undo_refuses_live_terminal_without_rollback(self) -> None:
         self._prepare()
 
@@ -234,7 +487,7 @@ class WorkspaceUndoCoordinatorTests(unittest.TestCase):
 
         self.assertIs(result.reason, WorkspaceUndoReason.LIVE_MUTATOR)
         self.assertEqual(self.service.rollback_calls, 0)
-        self.assertEqual(len(self.store.events), 1)
+        self.assertEqual(len(self.store.events), 2)
 
     def test_undo_refuses_live_background_without_rollback(self) -> None:
         self._prepare()
@@ -243,7 +496,7 @@ class WorkspaceUndoCoordinatorTests(unittest.TestCase):
 
         self.assertIs(result.reason, WorkspaceUndoReason.LIVE_MUTATOR)
         self.assertEqual(self.service.rollback_calls, 0)
-        self.assertEqual(len(self.store.events), 1)
+        self.assertEqual(len(self.store.events), 2)
 
     def test_checkpoint_or_invalidation_persistence_failure_fails_closed(self) -> None:
         self.store.fail_on_append = 1
@@ -273,7 +526,7 @@ class WorkspaceUndoCoordinatorTests(unittest.TestCase):
 
     def test_rollback_guard_prevents_duplicate_after_final_association_failure(self) -> None:
         self._prepare()
-        self.store.fail_on_append = 3
+        self.store.fail_on_append = 4
         result = _run(self.coordinator.undo("session-1"))
         self.assertIs(result.reason, WorkspaceUndoReason.PERSISTENCE_FAILED)
         self.assertEqual(self.service.rollback_calls, 1)
@@ -285,8 +538,22 @@ class WorkspaceUndoCoordinatorTests(unittest.TestCase):
         )
         _run(restarted.initialize())
         repeated = _run(restarted.undo("session-1"))
-        self.assertIs(repeated.reason, WorkspaceUndoReason.ROLLBACK_INDETERMINATE)
-        self.assertEqual(self.service.rollback_calls, 1)
+        self.assertIs(repeated.state, WorkspaceUndoState.ROLLED_BACK)
+        self.assertEqual(self.service.rollback_calls, 2)
+        self.assertEqual(self.service.restore_calls, 1)
+
+    def test_next_checkpoint_is_usable_after_completed_rollback(self) -> None:
+        self._prepare(turn_id="turn-1")
+        first = _run(self.coordinator.undo("session-1"))
+        self.assertIs(first.state, WorkspaceUndoState.ROLLED_BACK)
+
+        self._prepare(turn_id="turn-2")
+        second = _run(self.coordinator.undo("session-1"))
+
+        self.assertIs(second.state, WorkspaceUndoState.ROLLED_BACK)
+        self.assertEqual(self.service.create_calls, 2)
+        self.assertEqual(self.service.rollback_calls, 2)
+        self.assertEqual(self.service.restore_calls, 2)
 
     def test_rollback_failure_is_durable_and_not_retried(self) -> None:
         self._prepare()

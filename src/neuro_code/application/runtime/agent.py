@@ -243,6 +243,9 @@ class AgentRuntime:
             compaction_runtime_gate=self._compaction_runtime_gate,
             provider_context_window=provider_context_window,
             provider_max_output_tokens=provider_max_output_tokens,
+            workspace_undo_sealer=(
+                workspace_undo.seal_turn if workspace_undo is not None else None
+            ),
         )
         self._apply_interaction_mode_permissions()
 

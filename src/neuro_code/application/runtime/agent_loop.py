@@ -134,6 +134,7 @@ from neuro_code.shared.redaction import redact_sensitive_arguments, redact_sensi
 LOGGER = logging.getLogger(__name__)
 
 EventSink = Callable[[AgentEvent], Awaitable[None] | None]
+WorkspaceUndoSealer = Callable[[str | None, str | None], Awaitable[None]]
 
 
 def _redacted_persisted_tool_calls(
@@ -228,6 +229,7 @@ class AgentLoopRunner:
         "_tool_executor",
         "_tool_scheduler",
         "_tools",
+        "_workspace_undo_sealer",
     )
 
     def __init__(
@@ -250,6 +252,7 @@ class AgentLoopRunner:
         provider_context_window: ProviderContextWindow | None,
         provider_max_output_tokens: int | None = None,
         final_output_gate_enabled: bool = True,
+        workspace_undo_sealer: WorkspaceUndoSealer | None = None,
     ) -> None:
         self._provider = provider
         self._tools = tools
@@ -294,6 +297,7 @@ class AgentLoopRunner:
         self._provider_context_window = provider_context_window
         self._active_provider_window = provider_context_window
         self._provider_max_output_tokens = provider_max_output_tokens
+        self._workspace_undo_sealer = workspace_undo_sealer
 
     @property
     def provider_context_window(self) -> ProviderContextWindow | None:
@@ -530,6 +534,7 @@ class AgentLoopRunner:
             session_task=session_task,
             pristine_cancel_eligible=pristine_cancel_eligible,
             turn_id=turn_id,
+            workspace_undo_sealer=self._workspace_undo_sealer,
         )
         emit = recorder.emit
         record_turn_failure = recorder.record_turn_failure

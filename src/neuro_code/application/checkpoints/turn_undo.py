@@ -29,7 +29,11 @@ from neuro_code.application.ports.workspace import (
 from neuro_code.domain.background_tasks.models import BackgroundTaskStatus
 from neuro_code.domain.checkpoints import (
     CheckpointCreateRequest,
+    CheckpointFingerprint,
+    RollbackAttemptId,
+    RollbackState,
     SourceWorkspaceCheckpointGrant,
+    workspace_projection_fingerprint,
 )
 from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
 from neuro_code.domain.workspace_undo import (
@@ -138,6 +142,33 @@ class _WorkspaceUndoLedger:
             ),
         )
 
+    async def claim(
+        self,
+        expected: WorkspaceUndoAssociation,
+        rolling_back: WorkspaceUndoAssociation,
+    ) -> bool:
+        try:
+            return await self._store.claim_workspace_undo(expected, rolling_back)
+        except AttributeError as error:
+            raise WorkspaceUndoPreparationError(
+                "session store does not support atomic workspace undo claims"
+            ) from error
+
+    async def seal(
+        self,
+        expected: WorkspaceUndoAssociation,
+        sealed: WorkspaceUndoAssociation,
+    ) -> bool:
+        try:
+            return await self._store.seal_workspace_undo(expected, sealed)
+        except AttributeError as error:
+            raise WorkspaceUndoPreparationError(
+                "session store does not support atomic workspace undo sealing"
+            ) from error
+
+    async def has_open_turn(self, session_id: str) -> bool:
+        return bool(await self._store.load_open_turn_attempts(session_id))
+
 
 class TurnWorkspaceCheckpointCoordinator:
     """Coordinate one latest-only user undo target per durable session."""
@@ -149,6 +180,7 @@ class TurnWorkspaceCheckpointCoordinator:
         "_enabled",
         "_ledger",
         "_lock",
+        "_rollback_attempt_id_factory",
         "_source_grant",
         "_source_workspace",
         "_terminals",
@@ -165,6 +197,7 @@ class TurnWorkspaceCheckpointCoordinator:
         enabled: bool = True,
         background_tasks: BackgroundTaskManager | None = None,
         interactive_terminals: InteractiveTerminalManager | None = None,
+        rollback_attempt_id_factory: Callable[[], RollbackAttemptId] = RollbackAttemptId.new,
     ) -> None:
         self._checkpoint_service = checkpoint_service
         self._ledger = _WorkspaceUndoLedger(store)
@@ -172,6 +205,7 @@ class TurnWorkspaceCheckpointCoordinator:
         self._enabled = enabled
         self._background_tasks = background_tasks
         self._terminals = interactive_terminals
+        self._rollback_attempt_id_factory = rollback_attempt_id_factory
         self._source_grant: SourceWorkspaceCheckpointGrant | None = None
         self._capability_reason: WorkspaceUndoReason | None = None
         self._lock = asyncio.Lock()
@@ -221,6 +255,13 @@ class TurnWorkspaceCheckpointCoordinator:
                 and self._turn_association.state is WorkspaceUndoState.UNAVAILABLE
             ):
                 return
+            if (
+                self._turn_association is not None
+                and self._turn_association.state is WorkspaceUndoState.ROLLING_BACK
+            ):
+                raise WorkspaceUndoPreparationError(
+                    "workspace undo rollback is already in progress"
+                )
 
             eligible, reason, paths = await self._classify_target(
                 plan,
@@ -353,19 +394,36 @@ class TurnWorkspaceCheckpointCoordinator:
                     WorkspaceUndoState.UNAVAILABLE,
                     WorkspaceUndoReason.LIVE_MUTATOR,
                 )
-            rollback_guard = WorkspaceUndoAssociation(
-                session_id=session_id,
-                turn_id=association.turn_id,
-                state=WorkspaceUndoState.UNAVAILABLE,
-                updated_at=datetime.now(UTC),
-                reason=WorkspaceUndoReason.ROLLBACK_INDETERMINATE,
-            )
+            if association.state is WorkspaceUndoState.ROLLING_BACK:
+                return await self._resume_rolling_back(session_id, association)
+            if association.expected_current_fingerprint is None:
+                # A process may have died before the terminal workspace
+                # fingerprint was durably sealed.  Never infer a protected
+                # post-turn state from the checkpoint source projection.
+                return WorkspaceUndoResult(
+                    WorkspaceUndoState.UNAVAILABLE,
+                    WorkspaceUndoReason.ROLLBACK_INDETERMINATE,
+                )
+            checkpoint_id = association.checkpoint_id
+            if checkpoint_id is None:
+                return WorkspaceUndoResult(
+                    WorkspaceUndoState.UNAVAILABLE,
+                    WorkspaceUndoReason.CHECKPOINT_FAILED,
+                )
             try:
-                # Consume the AVAILABLE claim before entering the existing
-                # rollback state machine.  If the process dies or the final
-                # association write fails, a restart must not retry a
-                # potentially destructive restore.
-                await self._ledger.append(rollback_guard)
+                attempt_id = self._rollback_attempt_id_factory()
+                if not isinstance(attempt_id, RollbackAttemptId):
+                    raise TypeError("rollback attempt factory must return RollbackAttemptId")
+                rolling_back = WorkspaceUndoAssociation(
+                    session_id=session_id,
+                    turn_id=association.turn_id,
+                    state=WorkspaceUndoState.ROLLING_BACK,
+                    updated_at=datetime.now(UTC),
+                    checkpoint_id=checkpoint_id,
+                    expected_current_fingerprint=association.expected_current_fingerprint,
+                    rollback_attempt_id=attempt_id,
+                )
+                claimed = await self._ledger.claim(association, rolling_back)
             except Exception:
                 self._capability_reason = WorkspaceUndoReason.PERSISTENCE_FAILED
                 self._turn_association = association
@@ -373,59 +431,225 @@ class TurnWorkspaceCheckpointCoordinator:
                     WorkspaceUndoState.UNAVAILABLE,
                     WorkspaceUndoReason.PERSISTENCE_FAILED,
                 )
-            self._turn_association = rollback_guard
-            checkpoint_id = association.checkpoint_id
-            if checkpoint_id is None:
-                return WorkspaceUndoResult(
-                    WorkspaceUndoState.UNAVAILABLE,
-                    WorkspaceUndoReason.CHECKPOINT_FAILED,
+            if not claimed:
+                open_turns = await self._ledger.has_open_turn(session_id)
+                current = await self._ledger.latest(session_id)
+                reason = (
+                    WorkspaceUndoReason.ACTIVE_TURN
+                    if open_turns
+                    else WorkspaceUndoReason.ROLLBACK_INDETERMINATE
+                    if current is not None and current.state is WorkspaceUndoState.ROLLING_BACK
+                    else WorkspaceUndoReason.CONCURRENT_MODIFICATION
                 )
-            checkpoint = await self._checkpoint_service.get(checkpoint_id)
-            if checkpoint is None:
-                await self._prepare_unavailable(
-                    session_id,
-                    association.turn_id,
-                    WorkspaceUndoReason.CHECKPOINT_FAILED,
-                    strict=False,
-                )
-                return WorkspaceUndoResult(
-                    WorkspaceUndoState.UNAVAILABLE,
-                    WorkspaceUndoReason.CHECKPOINT_FAILED,
-                )
-            try:
-                grant = SourceWorkspaceCheckpointGrant.from_checkpoint(checkpoint)
-                attempt = await self._checkpoint_service.rollback(
-                    checkpoint_id,
-                    target=grant,
-                )
-            except WorkspaceCheckpointError as error:
-                reason = self._rollback_reason(error)
-                await self._prepare_unavailable(
-                    session_id,
-                    association.turn_id,
-                    reason,
-                    strict=False,
-                )
+                self._turn_association = current
                 return WorkspaceUndoResult(WorkspaceUndoState.UNAVAILABLE, reason)
-            mutation_id = f"undo-{attempt.attempt_id.value}"
-            rolled_back = WorkspaceUndoAssociation(
-                session_id=session_id,
-                turn_id=association.turn_id,
-                state=WorkspaceUndoState.ROLLED_BACK,
-                updated_at=datetime.now(UTC),
-                checkpoint_id=checkpoint_id,
-                verification_mutation_id=mutation_id,
+            self._turn_association = rolling_back
+            return await self._perform_rollback(
+                session_id,
+                rolling_back,
+                mismatch_reason=WorkspaceUndoReason.WORKSPACE_CHANGED,
             )
+
+    async def seal_turn(self, session_id: str | None, turn_id: str | None = None) -> None:
+        """Durably seal the protected post-turn workspace projection.
+
+        The seal is deliberately best effort.  If the terminal boundary is
+        interrupted before inspection succeeds, the association remains
+        unsealed and a later explicit undo fails closed instead of guessing
+        that the checkpoint source is still the current workspace.
+        """
+
+        if not self._enabled or session_id is None or turn_id is None:
+            return
+        if not isinstance(session_id, str) or not session_id:
+            return
+        if not isinstance(turn_id, str) or not turn_id:
+            return
+        async with self._lock:
+            association = await self._ledger.latest(session_id)
+            self._turn_key = (session_id, turn_id)
+            self._turn_association = association
+            if (
+                association is None
+                or association.turn_id != turn_id
+                or association.state is not WorkspaceUndoState.AVAILABLE
+                or association.expected_current_fingerprint is not None
+            ):
+                return
             try:
-                await self._ledger.append(rolled_back)
-            except Exception:
-                self._capability_reason = WorkspaceUndoReason.PERSISTENCE_FAILED
-                return WorkspaceUndoResult(
-                    WorkspaceUndoState.UNAVAILABLE,
-                    WorkspaceUndoReason.PERSISTENCE_FAILED,
+                if await self._ledger.has_open_turn(session_id):
+                    return
+                if self._source_grant is None or self._capability_reason is not None:
+                    return
+                checkpoint_id = association.checkpoint_id
+                if checkpoint_id is None:
+                    return
+                checkpoint = await self._checkpoint_service.get(checkpoint_id)
+                if checkpoint is None:
+                    return
+                grant = SourceWorkspaceCheckpointGrant.from_checkpoint(checkpoint)
+                projection = await self._checkpoint_service.inspect(grant)
+                expected = workspace_projection_fingerprint(grant, projection)
+                sealed = replace(
+                    association,
+                    updated_at=datetime.now(UTC),
+                    expected_current_fingerprint=expected,
                 )
-            self._turn_association = rolled_back
-            return WorkspaceUndoResult(WorkspaceUndoState.ROLLED_BACK, restored=True)
+                if await self._ledger.seal(association, sealed):
+                    self._turn_association = sealed
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # No fingerprint means no safe later rollback.  Keeping the
+                # durable AVAILABLE association is safe because undo rejects
+                # it until a later terminal boundary can prove the state.
+                return
+
+    async def _resume_rolling_back(
+        self,
+        session_id: str,
+        association: WorkspaceUndoAssociation,
+    ) -> WorkspaceUndoResult:
+        """Resume only the exact durable rollback attempt after interruption."""
+
+        if (
+            association.rollback_attempt_id is None
+            or association.expected_current_fingerprint is None
+        ):
+            await self._prepare_unavailable(
+                session_id,
+                association.turn_id,
+                WorkspaceUndoReason.ROLLBACK_INDETERMINATE,
+                strict=False,
+            )
+            return WorkspaceUndoResult(
+                WorkspaceUndoState.UNAVAILABLE,
+                WorkspaceUndoReason.ROLLBACK_INDETERMINATE,
+            )
+        return await self._perform_rollback(
+            session_id,
+            association,
+            mismatch_reason=WorkspaceUndoReason.ROLLBACK_INDETERMINATE,
+        )
+
+    async def _perform_rollback(
+        self,
+        session_id: str,
+        association: WorkspaceUndoAssociation,
+        *,
+        mismatch_reason: WorkspaceUndoReason,
+    ) -> WorkspaceUndoResult:
+        checkpoint_id = association.checkpoint_id
+        attempt_id = association.rollback_attempt_id
+        expected = association.expected_current_fingerprint
+        if checkpoint_id is None or attempt_id is None or expected is None:
+            await self._prepare_unavailable(
+                session_id,
+                association.turn_id,
+                WorkspaceUndoReason.ROLLBACK_INDETERMINATE,
+                strict=False,
+            )
+            return WorkspaceUndoResult(
+                WorkspaceUndoState.UNAVAILABLE,
+                WorkspaceUndoReason.ROLLBACK_INDETERMINATE,
+            )
+        checkpoint = await self._checkpoint_service.get(checkpoint_id)
+        if checkpoint is None:
+            await self._prepare_unavailable(
+                session_id,
+                association.turn_id,
+                WorkspaceUndoReason.CHECKPOINT_FAILED,
+                strict=False,
+            )
+            return WorkspaceUndoResult(
+                WorkspaceUndoState.UNAVAILABLE,
+                WorkspaceUndoReason.CHECKPOINT_FAILED,
+            )
+        try:
+            grant = SourceWorkspaceCheckpointGrant.from_checkpoint(checkpoint)
+            current = await self._checkpoint_service.inspect(grant)
+            current_fingerprint = workspace_projection_fingerprint(grant, current)
+            if current_fingerprint == checkpoint.source_fingerprint:
+                service_expected: CheckpointFingerprint | None = None
+            elif current_fingerprint == expected:
+                service_expected = expected
+            else:
+                await self._prepare_unavailable(
+                    session_id,
+                    association.turn_id,
+                    mismatch_reason,
+                    strict=False,
+                )
+                return WorkspaceUndoResult(WorkspaceUndoState.UNAVAILABLE, mismatch_reason)
+            attempt = await self._checkpoint_service.rollback(
+                checkpoint_id,
+                target=grant,
+                attempt_id=attempt_id,
+                expected_current_fingerprint=service_expected,
+            )
+            if attempt.state is not RollbackState.COMPLETED:
+                raise WorkspaceCheckpointError(
+                    "rollback did not reach a completed state",
+                    kind=CheckpointFailureKind.ROLLBACK_VERIFICATION_FAILED,
+                )
+            final_projection = await self._checkpoint_service.inspect(grant)
+            final_fingerprint = workspace_projection_fingerprint(grant, final_projection)
+            if final_fingerprint != checkpoint.source_fingerprint:
+                raise WorkspaceCheckpointError(
+                    "rollback completion did not prove the source projection",
+                    kind=CheckpointFailureKind.ROLLBACK_VERIFICATION_FAILED,
+                )
+        except WorkspaceCheckpointError as error:
+            reason = self._rollback_reason(error)
+            await self._prepare_unavailable(
+                session_id,
+                association.turn_id,
+                reason,
+                strict=False,
+            )
+            return WorkspaceUndoResult(WorkspaceUndoState.UNAVAILABLE, reason)
+        except (TypeError, ValueError):
+            await self._prepare_unavailable(
+                session_id,
+                association.turn_id,
+                WorkspaceUndoReason.ROLLBACK_INDETERMINATE,
+                strict=False,
+            )
+            return WorkspaceUndoResult(
+                WorkspaceUndoState.UNAVAILABLE,
+                WorkspaceUndoReason.ROLLBACK_INDETERMINATE,
+            )
+        except Exception:
+            await self._prepare_unavailable(
+                session_id,
+                association.turn_id,
+                WorkspaceUndoReason.ROLLBACK_INDETERMINATE,
+                strict=False,
+            )
+            return WorkspaceUndoResult(
+                WorkspaceUndoState.UNAVAILABLE,
+                WorkspaceUndoReason.ROLLBACK_INDETERMINATE,
+            )
+        rolled_back = WorkspaceUndoAssociation(
+            session_id=session_id,
+            turn_id=association.turn_id,
+            state=WorkspaceUndoState.ROLLED_BACK,
+            updated_at=datetime.now(UTC),
+            checkpoint_id=checkpoint_id,
+            verification_mutation_id=f"undo-{attempt_id.value}",
+            expected_current_fingerprint=expected,
+            rollback_attempt_id=attempt_id,
+        )
+        try:
+            await self._ledger.append(rolled_back)
+        except Exception:
+            self._capability_reason = WorkspaceUndoReason.PERSISTENCE_FAILED
+            return WorkspaceUndoResult(
+                WorkspaceUndoState.UNAVAILABLE,
+                WorkspaceUndoReason.PERSISTENCE_FAILED,
+            )
+        self._turn_association = rolled_back
+        return WorkspaceUndoResult(WorkspaceUndoState.ROLLED_BACK, restored=True)
 
     async def prepare_verification_handoff(
         self,
@@ -512,6 +736,7 @@ class TurnWorkspaceCheckpointCoordinator:
                     "workspace undo safety state could not be persisted"
                 ) from error
             self._capability_reason = WorkspaceUndoReason.PERSISTENCE_FAILED
+            return
         self._turn_association = association
 
     @staticmethod
@@ -526,6 +751,10 @@ class TurnWorkspaceCheckpointCoordinator:
     def _rollback_reason(error: WorkspaceCheckpointError) -> WorkspaceUndoReason:
         if str(error.kind) == str(CheckpointFailureKind.HEAD_MISMATCH):
             return WorkspaceUndoReason.HEAD_CHANGED
+        if str(error.kind) == str(CheckpointFailureKind.CONCURRENT_MODIFICATION):
+            return WorkspaceUndoReason.WORKSPACE_CHANGED
+        if str(error.kind) == str(CheckpointFailureKind.ALREADY_ROLLING_BACK):
+            return WorkspaceUndoReason.ROLLBACK_INDETERMINATE
         if str(error.kind) in {
             str(CheckpointFailureKind.ROLLBACK_VERIFICATION_FAILED),
             str(CheckpointFailureKind.COMMAND_FAILED),

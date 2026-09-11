@@ -22,6 +22,7 @@ from neuro_code.domain.sandbox.models import SandboxProfile
 from neuro_code.domain.session_tasks import SessionTask, SubagentLink
 from neuro_code.domain.sessions import SessionSnapshot, SessionSummary
 from neuro_code.domain.sessions.search import SessionSearchPage
+from neuro_code.domain.workspace_undo import WorkspaceUndoAssociation
 
 
 class SessionStore(Protocol):
@@ -48,6 +49,18 @@ class SessionStore(Protocol):
     async def fork_session(self, session_id: str) -> str: ...
 
     async def append_event(self, session_id: str, event: AgentEvent) -> None: ...
+
+    async def claim_workspace_undo(
+        self,
+        expected: WorkspaceUndoAssociation,
+        rolling_back: WorkspaceUndoAssociation,
+    ) -> bool: ...
+
+    async def seal_workspace_undo(
+        self,
+        expected: WorkspaceUndoAssociation,
+        sealed: WorkspaceUndoAssociation,
+    ) -> bool: ...
 
     async def update_session_provider(
         self,

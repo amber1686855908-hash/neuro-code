@@ -38,6 +38,7 @@ from neuro_code.domain.session_tasks import SessionTask, SessionTaskStatus
 from neuro_code.shared.errors import ConfigurationError
 
 EventSink = Callable[[AgentEvent], Awaitable[None] | None]
+WorkspaceUndoSealer = Callable[[str | None, str | None], Awaitable[None]]
 
 
 def _durable_session_items(items: Sequence[SessionItem]) -> tuple[SessionItem, ...]:
@@ -81,6 +82,7 @@ class TurnEventRecorder:
         "_turn_id",
         "_turn_source",
         "_turn_started_at",
+        "_workspace_undo_sealer",
         "completion_committed",
         "pristine_cancel_eligible",
         "session_task",
@@ -102,6 +104,7 @@ class TurnEventRecorder:
         session_task: SessionTask | None,
         pristine_cancel_eligible: bool,
         turn_id: str | None = None,
+        workspace_undo_sealer: WorkspaceUndoSealer | None = None,
     ) -> None:
         self._sink = sink
         self._session_store = session_store
@@ -114,6 +117,7 @@ class TurnEventRecorder:
         self._events = events
         self._sequence = sequence
         self._turn_id = turn_id
+        self._workspace_undo_sealer = workspace_undo_sealer
         self.session_task = session_task
         self.pristine_cancel_eligible = pristine_cancel_eligible
         # Once the storage finalizer returns, a subsequent sink failure is a
@@ -342,6 +346,7 @@ class TurnEventRecorder:
                     await self._session_store.append_event(self._session_id, task_event)
                 await self._session_store.append_event(self._session_id, failure_event)
                 await self._session_store.save_session_items(self._session_id, durable_items)
+        await self._seal_workspace_undo()
         if task_event is not None:
             await self._deliver(task_event)
         await self._deliver(failure_event)
@@ -500,6 +505,7 @@ class TurnEventRecorder:
             )
         else:
             self.completion_committed = True
+        await self._seal_workspace_undo()
         if committed_response_event is not None:
             await self._deliver(committed_response_event)
         await self._deliver(completed_event)
@@ -562,6 +568,21 @@ class TurnEventRecorder:
             outcome = self._sink(event)
             if inspect.isawaitable(outcome):
                 await outcome
+
+    async def _seal_workspace_undo(self) -> None:
+        """Best-effort seal after a durable terminal resolution."""
+
+        if self._workspace_undo_sealer is None:
+            return
+        try:
+            await asyncio.shield(self._workspace_undo_sealer(self._session_id, self._turn_id))
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            # A seal is safety metadata, not a reason to reclassify an already
+            # durable turn.  If it cannot be written, the coordinator keeps
+            # undo fail-closed until a later explicit recovery proves safety.
+            return
 
     async def _commit_completion(
         self,

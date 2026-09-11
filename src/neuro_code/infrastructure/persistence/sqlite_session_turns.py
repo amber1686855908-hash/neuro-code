@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import closing
 from datetime import UTC, datetime
 
@@ -29,6 +29,7 @@ from neuro_code.domain.execution import (
 )
 from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
 from neuro_code.domain.sessions.search import fallback_session_title, searchable_session_text
+from neuro_code.domain.workspace_undo import WorkspaceUndoAssociation, WorkspaceUndoState
 from neuro_code.infrastructure.persistence.sqlite_session_connection import (
     _SqliteSessionPersistenceContext,
 )
@@ -155,6 +156,58 @@ class TurnsMixin(_SqliteSessionPersistenceContext):
 
         async with self._write_lock:
             return await run_blocking(start)
+
+    async def claim_workspace_undo(
+        self,
+        expected: WorkspaceUndoAssociation,
+        rolling_back: WorkspaceUndoAssociation,
+    ) -> bool:
+        """Atomically reserve undo after proving that the session is idle.
+
+        The event transition and the open-turn check deliberately share one
+        ``BEGIN IMMEDIATE`` transaction.  A second binding therefore cannot
+        observe an idle session and enter rollback while another process is
+        accepting a turn.
+        """
+
+        _validate_workspace_undo_transition(
+            expected,
+            rolling_back,
+            expected_state=WorkspaceUndoState.AVAILABLE,
+            replacement_state=WorkspaceUndoState.ROLLING_BACK,
+        )
+        async with self._write_lock:
+            return await run_blocking(
+                _transition_workspace_undo,
+                self._connect,
+                expected,
+                rolling_back,
+                True,
+            )
+
+    async def seal_workspace_undo(
+        self,
+        expected: WorkspaceUndoAssociation,
+        sealed: WorkspaceUndoAssociation,
+    ) -> bool:
+        """Atomically attach the terminal protected-workspace fingerprint."""
+
+        _validate_workspace_undo_transition(
+            expected,
+            sealed,
+            expected_state=WorkspaceUndoState.AVAILABLE,
+            replacement_state=WorkspaceUndoState.AVAILABLE,
+        )
+        if sealed.expected_current_fingerprint is None:
+            raise ValueError("sealed workspace undo must carry an expected fingerprint")
+        async with self._write_lock:
+            return await run_blocking(
+                _transition_workspace_undo,
+                self._connect,
+                expected,
+                sealed,
+                True,
+            )
 
     async def append_turn_recovery_fact(
         self,
@@ -1054,6 +1107,9 @@ def _persist_turn_attempt_acceptance(
     ).fetchone()
     if existing is not None:
         raise SessionError(f"session {attempt.session_id} already has an open turn attempt")
+    undo_data = _latest_workspace_undo_data(connection, attempt.session_id)
+    if undo_data is not None and undo_data.get("state") == WorkspaceUndoState.ROLLING_BACK.value:
+        raise SessionError(f"session {attempt.session_id} has a workspace rollback in progress")
     connection.execute(
         """
         INSERT INTO session_turn_attempts(
@@ -1081,6 +1137,112 @@ def _persist_turn_attempt_acceptance(
         "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         (attempt.session_id,),
     )
+
+
+def _validate_workspace_undo_transition(
+    expected: WorkspaceUndoAssociation,
+    replacement: WorkspaceUndoAssociation,
+    *,
+    expected_state: WorkspaceUndoState,
+    replacement_state: WorkspaceUndoState,
+) -> None:
+    if not isinstance(expected, WorkspaceUndoAssociation):
+        raise TypeError("expected workspace undo association must be canonical")
+    if not isinstance(replacement, WorkspaceUndoAssociation):
+        raise TypeError("replacement workspace undo association must be canonical")
+    if expected.state is not expected_state:
+        raise ValueError("workspace undo expected state is invalid")
+    if replacement.state is not replacement_state:
+        raise ValueError("workspace undo replacement state is invalid")
+    if expected.session_id != replacement.session_id or expected.turn_id != replacement.turn_id:
+        raise ValueError("workspace undo transition identity does not match")
+
+
+def _latest_workspace_undo_data(
+    connection: sqlite3.Connection,
+    session_id: str,
+) -> dict[str, object] | None:
+    row = connection.execute(
+        """
+        SELECT data_json
+        FROM events
+        WHERE session_id = ? AND kind = ?
+        ORDER BY sequence DESC
+        LIMIT 1
+        """,
+        (session_id, AgentEventKind.WORKSPACE_UNDO_STATE.value),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        data = json.loads(row[0])
+    except (TypeError, ValueError) as error:
+        raise SessionError("workspace undo durable state is malformed") from error
+    if not isinstance(data, dict):
+        raise SessionError("workspace undo durable state is malformed")
+    raw_state = data.get("state")
+    if not isinstance(raw_state, str):
+        raise SessionError("workspace undo durable state is malformed")
+    try:
+        WorkspaceUndoState(raw_state)
+    except (TypeError, ValueError) as error:
+        raise SessionError("workspace undo durable state is malformed") from error
+    return data
+
+
+def _transition_workspace_undo(
+    connect: Callable[[], sqlite3.Connection],
+    expected: WorkspaceUndoAssociation,
+    replacement: WorkspaceUndoAssociation,
+    require_idle: bool,
+) -> bool:
+    connection = connect()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        session = connection.execute(
+            "SELECT 1 FROM sessions WHERE id = ?",
+            (expected.session_id,),
+        ).fetchone()
+        if session is None:
+            raise SessionError(f"unknown session: {expected.session_id}")
+        if require_idle:
+            open_attempt = connection.execute(
+                """
+                SELECT 1
+                FROM session_turn_attempts
+                WHERE session_id = ? AND resolution IS NULL
+                LIMIT 1
+                """,
+                (expected.session_id,),
+            ).fetchone()
+            if open_attempt is not None:
+                connection.rollback()
+                return False
+        current = _latest_workspace_undo_data(connection, expected.session_id)
+        if current != expected.to_event_data():
+            connection.rollback()
+            return False
+        row = connection.execute(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE session_id = ?",
+            (expected.session_id,),
+        ).fetchone()
+        assert row is not None
+        event = AgentEvent.create(
+            int(row[0]),
+            AgentEventKind.WORKSPACE_UNDO_STATE,
+            replacement.to_event_data(),
+        )
+        _insert_event_row(connection, session_id=expected.session_id, event=event)
+        connection.commit()
+        return True
+    except sqlite3.IntegrityError as error:
+        connection.rollback()
+        raise SessionError("cannot transition workspace undo state") from error
+    except BaseException:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def _resolve_abandoned_turn_attempt(

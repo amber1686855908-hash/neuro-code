@@ -30,6 +30,7 @@ from neuro_code.application.ports.worktree import (
 from neuro_code.application.runtime import process_liveness
 from neuro_code.domain.checkpoints import (
     CheckpointCreateRequest,
+    CheckpointFingerprint,
     CheckpointId,
     CheckpointState,
     CheckpointTarget,
@@ -318,12 +319,18 @@ class WorkspaceCheckpointApplicationService:
         *,
         target: CheckpointTarget | None = None,
         attempt_id: RollbackAttemptId | None = None,
+        expected_current_fingerprint: CheckpointFingerprint | None = None,
     ) -> RollbackAttempt:
         self._require_initialized()
         if not isinstance(checkpoint_id, CheckpointId):
             raise TypeError("checkpoint id must be canonical")
         if attempt_id is not None and not isinstance(attempt_id, RollbackAttemptId):
             raise TypeError("rollback attempt id must be canonical")
+        if expected_current_fingerprint is not None and not isinstance(
+            expected_current_fingerprint,
+            CheckpointFingerprint,
+        ):
+            raise TypeError("expected current fingerprint must be canonical")
         if target is not None and not isinstance(
             target, (WorktreeHandle, SourceWorkspaceCheckpointGrant)
         ):
@@ -367,7 +374,23 @@ class WorkspaceCheckpointApplicationService:
                 target.worktree_id,
                 attempt_id,
             )
-            return await self._resume_attempt(checkpoint, projection, target, attempt)
+            if (
+                attempt.state is RollbackState.COMPLETED
+                and attempt.observed_fingerprint != checkpoint.source_fingerprint
+            ):
+                raise WorkspaceCheckpointError(
+                    "completed rollback does not prove the checkpoint projection",
+                    kind=CheckpointFailureKind.ROLLBACK_VERIFICATION_FAILED,
+                )
+            if attempt.state is RollbackState.COMPLETED:
+                return attempt
+            return await self._resume_attempt(
+                checkpoint,
+                projection,
+                target,
+                attempt,
+                expected_current_fingerprint=expected_current_fingerprint,
+            )
 
     async def reconcile(self) -> tuple[RollbackAttempt, ...]:
         self._require_initialized()
@@ -495,6 +518,20 @@ class WorkspaceCheckpointApplicationService:
         identifier = requested_attempt_id or self._attempt_id_factory()
         if not isinstance(identifier, RollbackAttemptId):
             raise TypeError("rollback attempt factory must return RollbackAttemptId")
+        if requested_attempt_id is not None:
+            existing = await self._checkpoints.get_attempt(requested_attempt_id)
+            if existing is not None:
+                if existing.checkpoint_id != checkpoint.checkpoint_id:
+                    raise WorkspaceCheckpointError(
+                        "requested rollback attempt belongs to another checkpoint",
+                        kind=CheckpointFailureKind.CONCURRENT_MODIFICATION,
+                    )
+                if existing.state is RollbackState.COMPLETED:
+                    return existing
+                raise WorkspaceCheckpointError(
+                    "requested rollback attempt is no longer resumable",
+                    kind=CheckpointFailureKind.CONCURRENT_MODIFICATION,
+                )
         return await self._checkpoints.start_attempt(
             RollbackAttempt(
                 attempt_id=identifier,
@@ -527,6 +564,8 @@ class WorkspaceCheckpointApplicationService:
         projection: WorkspaceProjection,
         target: CheckpointTarget,
         attempt: RollbackAttempt,
+        *,
+        expected_current_fingerprint: CheckpointFingerprint | None = None,
     ) -> RollbackAttempt:
         reason = f"neuro-code-checkpoint:{attempt.attempt_id.value}"
         destructive_started = False
@@ -554,6 +593,14 @@ class WorkspaceCheckpointApplicationService:
                 destructive_started = True
             actual = await self._state.inspect(target)
             actual_fingerprint = workspace_projection_fingerprint(target, actual)
+            if (
+                expected_current_fingerprint is not None
+                and actual_fingerprint != expected_current_fingerprint
+            ):
+                raise WorkspaceCheckpointError(
+                    "workspace changed after rollback was claimed",
+                    kind=CheckpointFailureKind.CONCURRENT_MODIFICATION,
+                )
             if actual_fingerprint != checkpoint.source_fingerprint:
                 await self._state.restore(target, projection)
                 actual = await self._state.inspect(target)

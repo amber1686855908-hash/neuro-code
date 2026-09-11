@@ -8,6 +8,7 @@ from typing import Protocol
 
 from neuro_code.domain.checkpoints import (
     CheckpointCreateRequest,
+    CheckpointFingerprint,
     CheckpointId,
     CheckpointState,
     CheckpointTarget,
@@ -194,6 +195,7 @@ class WorkspaceCheckpointApplication(Protocol):
         *,
         target: CheckpointTarget | None = None,
         attempt_id: RollbackAttemptId | None = None,
+        expected_current_fingerprint: CheckpointFingerprint | None = None,
     ) -> RollbackAttempt: ...
 
     async def reconcile(self) -> tuple[RollbackAttempt, ...]: ...

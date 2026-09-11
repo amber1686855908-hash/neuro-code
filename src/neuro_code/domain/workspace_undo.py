@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 
-from neuro_code.domain.checkpoints import CheckpointId
+from neuro_code.domain.checkpoints import CheckpointFingerprint, CheckpointId, RollbackAttemptId
 
 MAX_WORKSPACE_UNDO_SESSION_ID_BYTES = 256
 MAX_WORKSPACE_UNDO_TURN_ID_BYTES = 256
@@ -30,6 +30,7 @@ class WorkspaceUndoState(StrEnum):
     """Durable latest-only availability of the current session undo."""
 
     AVAILABLE = "available"
+    ROLLING_BACK = "rolling_back"
     UNAVAILABLE = "unavailable"
     ROLLED_BACK = "rolled_back"
 
@@ -47,6 +48,9 @@ class WorkspaceUndoReason(StrEnum):
     PERSISTENCE_FAILED = "persistence_failed"
     HEAD_CHANGED = "head_changed"
     LIVE_MUTATOR = "live_mutator"
+    ACTIVE_TURN = "active_turn"
+    WORKSPACE_CHANGED = "workspace_changed"
+    CONCURRENT_MODIFICATION = "concurrent_modification"
     NO_CHECKPOINT = "no_checkpoint"
     ALREADY_ROLLED_BACK = "already_rolled_back"
     ROLLBACK_FAILED = "rollback_failed"
@@ -65,6 +69,8 @@ class WorkspaceUndoAssociation:
     reason: WorkspaceUndoReason | None = None
     verification_mutation_id: str | None = None
     verification_handoff_consumed: bool = False
+    expected_current_fingerprint: CheckpointFingerprint | None = None
+    rollback_attempt_id: RollbackAttemptId | None = None
 
     def __post_init__(self) -> None:
         _bounded(
@@ -86,6 +92,16 @@ class WorkspaceUndoAssociation:
             raise TypeError("workspace undo checkpoint id must be canonical")
         if self.reason is not None and not isinstance(self.reason, WorkspaceUndoReason):
             raise TypeError("workspace undo reason must be canonical")
+        if self.expected_current_fingerprint is not None and not isinstance(
+            self.expected_current_fingerprint,
+            CheckpointFingerprint,
+        ):
+            raise TypeError("workspace undo expected fingerprint must be canonical")
+        if self.rollback_attempt_id is not None and not isinstance(
+            self.rollback_attempt_id,
+            RollbackAttemptId,
+        ):
+            raise TypeError("workspace undo rollback attempt id must be canonical")
         if self.verification_mutation_id is not None:
             _bounded(
                 self.verification_mutation_id,
@@ -101,6 +117,19 @@ class WorkspaceUndoAssociation:
                 raise ValueError("available undo cannot carry a verification mutation")
             if self.verification_handoff_consumed:
                 raise ValueError("available undo cannot consume a verification handoff")
+            if self.rollback_attempt_id is not None:
+                raise ValueError("available undo cannot carry a rollback attempt")
+        elif self.state is WorkspaceUndoState.ROLLING_BACK:
+            if self.checkpoint_id is None or self.reason is not None:
+                raise ValueError("rolling-back undo must carry only a checkpoint")
+            if self.expected_current_fingerprint is None:
+                raise ValueError("rolling-back undo must carry an expected fingerprint")
+            if self.rollback_attempt_id is None:
+                raise ValueError("rolling-back undo must carry a rollback attempt")
+            if self.verification_mutation_id is not None:
+                raise ValueError("rolling-back undo cannot carry a verification mutation")
+            if self.verification_handoff_consumed:
+                raise ValueError("rolling-back undo cannot consume a verification handoff")
         elif self.state is WorkspaceUndoState.UNAVAILABLE:
             if self.reason is None or self.checkpoint_id is not None:
                 raise ValueError("unavailable undo must carry only a reason")
@@ -108,6 +137,11 @@ class WorkspaceUndoAssociation:
                 raise ValueError("unavailable undo cannot carry a verification mutation")
             if self.verification_handoff_consumed:
                 raise ValueError("unavailable undo cannot consume a verification handoff")
+            if (
+                self.expected_current_fingerprint is not None
+                or self.rollback_attempt_id is not None
+            ):
+                raise ValueError("unavailable undo cannot carry rollback metadata")
         else:
             if self.checkpoint_id is None or self.reason is not None:
                 raise ValueError("rolled-back undo must carry only a checkpoint")
@@ -117,7 +151,7 @@ class WorkspaceUndoAssociation:
     def to_event_data(self) -> dict[str, object]:
         """Return the bounded durable session-event projection."""
 
-        return {
+        data: dict[str, object] = {
             "schema": 1,
             "turn_id": self.turn_id,
             "state": self.state.value,
@@ -126,6 +160,11 @@ class WorkspaceUndoAssociation:
             "verification_mutation_id": self.verification_mutation_id,
             "verification_handoff_consumed": self.verification_handoff_consumed,
         }
+        if self.expected_current_fingerprint is not None:
+            data["expected_current_fingerprint"] = self.expected_current_fingerprint.value
+        if self.rollback_attempt_id is not None:
+            data["rollback_attempt_id"] = self.rollback_attempt_id.value
+        return data
 
     @classmethod
     def from_event_data(
@@ -143,6 +182,8 @@ class WorkspaceUndoAssociation:
         raw_reason = data.get("reason")
         raw_mutation = data.get("verification_mutation_id")
         consumed = data.get("verification_handoff_consumed", False)
+        raw_expected = data.get("expected_current_fingerprint")
+        raw_attempt = data.get("rollback_attempt_id")
         if not isinstance(turn_id, str) or not isinstance(raw_state, str):
             raise ValueError("workspace undo event identity is malformed")
         if raw_checkpoint is not None and not isinstance(raw_checkpoint, str):
@@ -151,6 +192,10 @@ class WorkspaceUndoAssociation:
             raise ValueError("workspace undo reason is malformed")
         if raw_mutation is not None and not isinstance(raw_mutation, str):
             raise ValueError("workspace undo mutation identity is malformed")
+        if raw_expected is not None and not isinstance(raw_expected, str):
+            raise ValueError("workspace undo expected fingerprint is malformed")
+        if raw_attempt is not None and not isinstance(raw_attempt, str):
+            raise ValueError("workspace undo rollback attempt identity is malformed")
         if not isinstance(consumed, bool):
             raise ValueError("workspace undo handoff flag is malformed")
         return cls(
@@ -162,6 +207,12 @@ class WorkspaceUndoAssociation:
             reason=(WorkspaceUndoReason(raw_reason) if raw_reason is not None else None),
             verification_mutation_id=raw_mutation,
             verification_handoff_consumed=consumed,
+            expected_current_fingerprint=(
+                CheckpointFingerprint(raw_expected) if raw_expected is not None else None
+            ),
+            rollback_attempt_id=(
+                RollbackAttemptId(raw_attempt) if raw_attempt is not None else None
+            ),
         )
 
 
