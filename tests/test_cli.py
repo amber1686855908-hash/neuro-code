@@ -1170,8 +1170,11 @@ api_key_env = "FIXTURE_KEY"
             )
 
         self.assertEqual(exit_code, 0)
-        self.assertEqual(errors, "")
-        self.assertEqual(output.count("finalized fixture response"), 1)
+        self.assertEqual(
+            errors,
+            "Provider context capacity is unknown; continuing without a numeric safety check.\n",
+        )
+        self.assertEqual(output, "finalized fixture response\n")
 
     def test_gated_response_hides_terminal_candidate_in_plain_json_and_jsonl(self) -> None:
         for output_format in ("plain", "json", "jsonl"):
