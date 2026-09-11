@@ -91,7 +91,8 @@ factory 选择位于 `bootstrap.factories`。公共 `ApplicationComposition` fac
 [ADR 0150](adr/0150-acp-session-runtime-ownership-boundary.md) 和
 [ADR 0151](adr/0151-acp-transport-boundary.md) 以及
 [ADR 0153](adr/0153-architecture-completion.md) 以及
-[ADR 0154](adr/0154-normal-agent-verification-acquisition-boundary.md)。
+[ADR 0154](adr/0154-normal-agent-verification-acquisition-boundary.md) 以及
+[ADR 0158](adr/0158-turn-workspace-checkpoint-undo.md)。
 
 Agent harness 行为现阶段位于 `neuro_code.application.runtime` 的明确 canonical 子模块：
 `background_task_reminders`、`agent`、`conversation` 以及循环、上下文、工具和终结模块。
@@ -179,7 +180,8 @@ CLI、TUI 和 ACP 继续共享同一服务和带类型运行时事件流。
 完整依赖规则、兼容迁移策略和 allowlist 纪律见
 [ADR 0049](adr/0049-progressive-architecture-boundaries.md)、
 [ADR 0153](adr/0153-architecture-completion.md) 以及
-[ADR 0154](adr/0154-normal-agent-verification-acquisition-boundary.md)。
+[ADR 0154](adr/0154-normal-agent-verification-acquisition-boundary.md) 以及
+[ADR 0158](adr/0158-turn-workspace-checkpoint-undo.md)。
 
 ## 运行时事件模型
 
@@ -1859,6 +1861,28 @@ checkpoint-after path，恢复 file 与 index，并验证最终 fingerprint。�
 reset、checkout、branch-ref rewrite、history rewind 或任意 recursive deletion；ignored file 保持不变。
 Partial 或不确定 operation 持久化为 `INDETERMINATE`，可在进程退出后 reconciliation；READY checkpoint
 target 不可变并受 CAS 保护。详见 [ADR 0130](adr/0130-managed-workspace-checkpoint-rollback.md)。
+
+## B1 回合工作区 Checkpoint 与 Undo
+
+B1 为普通 source checkout 增加由用户控制、仅保留最新目标的 undo 投影。它不会把 source checkout
+伪装成 managed worktree：bootstrap 只有在证明 canonical Git repository identity、source path、当前
+HEAD 以及 branch/detached 状态后，才取得类型化的 `SourceWorkspaceCheckpointGrant`。Checkpoint service
+在每次 capture 和 rollback 前重新证明该 grant，既有 managed-worktree proof 保持不变。
+
+受保护的 projection 正好是现有 checkpoint projection：tracked 与 non-ignored untracked 文件字节、Git
+index/staged 状态、binary 数据、平台支持的 symlink 以及平台支持的 mode。Ignored file、工作区外副作用、
+nested repository、submodule、special file、empty directory 和任意外部进程修改仍不在保证范围内。普通
+mutation tool 在权限批准后、第一次 eligible mutation 开始前创建一个 durable checkpoint；同一回合后续
+eligible mutation 复用它。Read-only 与被拒绝 operation 不创建 checkpoint。如果 target 无法界定、属于
+ignored、unsupported 或无法证明，coordinator 会在允许该 mutation 前持久化 `UNAVAILABLE`；无法持久化
+该 invalidation 时 fail closed。
+
+Session event `WORKSPACE_UNDO_STATE` 只保存有界的最新 association 以及 `AVAILABLE`、`UNAVAILABLE` 或
+`ROLLED_BACK` 状态。后续不安全回合会取代旧的 undo 保证；进程重启后只有在相同 proof 成功时才会复用
+`AVAILABLE` checkpoint。`/undo` 与 `sessions undo <SESSION_ID>` 是仅在 idle 时执行的用户操作，不调用模型，
+也不会杀死运行中的 terminal/background mutator。Rollback 消费最新 association，校验 exact projection，并
+通过现有 verification tracker 传递一次外部 workspace mutation fact；它不会改写回合历史、创建第二个
+generation owner，也不承诺整个文件系统 undo。详见 [ADR 0158](adr/0158-turn-workspace-checkpoint-undo.md)。
 
 ## 显式串行 Writable Subagent 工作区
 

@@ -26,6 +26,10 @@ from pathlib import Path
 from time import monotonic
 from typing import Any
 
+from neuro_code.application.checkpoints.turn_undo import (
+    TurnWorkspaceCheckpointCoordinator,
+    WorkspaceUndoEventSink,
+)
 from neuro_code.application.permissions.contracts import (
     PermissionApproval,
     build_permission_request,
@@ -296,6 +300,7 @@ class ToolExecutor:
         "_tools",
         "_workspace_change_observer",
         "_workspace_mutation_tool",
+        "_workspace_undo",
     )
 
     def __init__(
@@ -310,6 +315,7 @@ class ToolExecutor:
         context_builder: ContextBuilder,
         hooks: Sequence[ToolPipelineHook] = (),
         workspace_mutation_tool: Tool | None = None,
+        workspace_undo: TurnWorkspaceCheckpointCoordinator | None = None,
     ) -> None:
         self._tools = tools
         self._permissions = permissions
@@ -320,6 +326,7 @@ class ToolExecutor:
         self._hooks = tuple(hooks)
         self._workspace_change_observer = workspace_change_observer
         self._workspace_mutation_tool = workspace_mutation_tool
+        self._workspace_undo = workspace_undo
         self._context_builder = context_builder
         self._observation_builder = ToolObservationBuilder(tool_context.redaction_values)
 
@@ -416,6 +423,8 @@ class ToolExecutor:
         emit: Callable[[AgentEventKind, dict[str, object]], Awaitable[AgentEvent]],
         session_id: str | None,
         *,
+        turn_id: str | None = None,
+        workspace_undo_event_sink: WorkspaceUndoEventSink | None = None,
         interrupted_observation_sink: Callable[[ToolExecutionObservation], None] | None = None,
         workspace_change_sink: Callable[[WorkspaceChangeReport], None] | None = None,
         recovery_started_sink: Callable[[str, str, bool], Awaitable[None]] | None = None,
@@ -693,6 +702,15 @@ class ToolExecutor:
                     call.name,
                     safe_arguments,
                     side_effecting=tool.side_effecting,
+                )
+            if tool.side_effecting and self._workspace_undo is not None:
+                await self._workspace_undo.prepare(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    plan=filesystem_access_plan,
+                    client_file_system=self._tool_context.client_file_system,
+                    client_terminal=self._tool_context.client_terminal,
+                    event_sink=workspace_undo_event_sink,
                 )
             if recovery_started_sink is None:
                 await emit(AgentEventKind.TOOL_STARTED, {"id": call.id, "name": call.name})

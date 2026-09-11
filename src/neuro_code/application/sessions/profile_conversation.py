@@ -55,6 +55,7 @@ from neuro_code.domain.session_tasks import SessionTask
 from neuro_code.domain.sessions import SessionSummary
 from neuro_code.domain.sessions.search import SessionSearchHit
 from neuro_code.domain.ultracode import UltracodeDelegationDecision
+from neuro_code.domain.workspace_undo import WorkspaceUndoResult
 from neuro_code.shared.errors import ConfigurationError
 
 ConversationRunner = _ConversationRunner
@@ -348,6 +349,14 @@ class ProfileConversationController:
     ) -> AgentRunResult:
         async with self._turn_lock:
             return await self._binding.runner.run_session_task(task_id, sink=sink)
+
+    async def undo_workspace(self) -> WorkspaceUndoResult:
+        """Restore the current binding's latest idle-safe workspace checkpoint."""
+
+        if self._turn_lock.locked():
+            raise ConfigurationError("cannot undo the workspace while a turn is running")
+        async with self._turn_lock:
+            return await self._binding.undo_workspace()
 
     async def add_plan_comment(self, step_index: int, content: str) -> PlanComment:
         if self._turn_lock.locked():

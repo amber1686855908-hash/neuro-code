@@ -74,6 +74,11 @@ from neuro_code.domain.execution import (
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.session_tasks import SessionTaskStatus
 from neuro_code.domain.tools import ToolDefinition
+from neuro_code.domain.workspace_undo import (
+    WorkspaceUndoReason,
+    WorkspaceUndoResult,
+    WorkspaceUndoState,
+)
 from neuro_code.infrastructure.persistence.output_artifacts import FileToolOutputArtifactStore
 from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
 from neuro_code.infrastructure.providers.catalog_cache import PersistentProviderCatalog
@@ -437,6 +442,11 @@ class SessionCommandRunnerFixture:
         )
         self.compact_calls = 0
         self.retry_calls: list[str] = []
+        self.undo_calls = 0
+        self.undo_result = WorkspaceUndoResult(
+            WorkspaceUndoState.UNAVAILABLE,
+            WorkspaceUndoReason.NO_CHECKPOINT,
+        )
 
     async def compact_now(self) -> ContextCompactionCommandResult:
         self.compact_calls += 1
@@ -445,6 +455,10 @@ class SessionCommandRunnerFixture:
     async def retry_recovery(self, turn_id: str) -> AgentRunResult:
         self.retry_calls.append(turn_id)
         return self.retry_result
+
+    async def undo_workspace(self) -> WorkspaceUndoResult:
+        self.undo_calls += 1
+        return self.undo_result
 
 
 class SessionCommandApplicationFixture:
@@ -459,7 +473,7 @@ class SessionCommandApplicationFixture:
 
     async def create_binding(self, *, resume_id: str | None = None) -> SimpleNamespace:
         self.binding_sessions.append(resume_id)
-        return SimpleNamespace(runner=self.runner)
+        return SimpleNamespace(runner=self.runner, undo_workspace=self.runner.undo_workspace)
 
     async def close(self) -> None:
         self.close_calls += 1
@@ -791,6 +805,61 @@ api_key_env = "FIXTURE_KEY"
         self.assertEqual(retry_application.binding_sessions, ["session-1"])
         self.assertEqual(retry_application.runner.retry_calls, ["turn-1"])
         self.assertEqual(retry_application.close_calls, 1)
+
+    def test_sessions_undo_uses_only_session_id_and_has_plain_json_projections(self) -> None:
+        application = SessionCommandApplicationFixture()
+        application.runner.undo_result = WorkspaceUndoResult(
+            WorkspaceUndoState.ROLLED_BACK,
+            restored=True,
+        )
+        plain = io.StringIO()
+        with redirect_stdout(plain):
+            exit_code = asyncio.run(
+                run_sessions_command(
+                    build_parser().parse_args(("sessions", "undo", "session-1")),
+                    SessionCommandServicesFixture(application),
+                )
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            plain.getvalue(), "Workspace restored to the state before the latest turn.\n"
+        )
+        self.assertEqual(application.runner.undo_calls, 1)
+        self.assertEqual(application.binding_sessions, ["session-1"])
+        self.assertEqual(application.close_calls, 1)
+
+        json_application = SessionCommandApplicationFixture()
+        json_application.runner.undo_result = WorkspaceUndoResult(
+            WorkspaceUndoState.UNAVAILABLE,
+            WorkspaceUndoReason.UNBOUNDED_MUTATION,
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            exit_code = asyncio.run(
+                run_sessions_command(
+                    build_parser().parse_args(("sessions", "undo", "session-2", "--json")),
+                    SessionCommandServicesFixture(json_application),
+                )
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {
+                "status": "unavailable",
+                "reason": "unbounded_mutation",
+                "restored": False,
+            },
+        )
+
+        with self.assertRaisesRegex(ConfigurationError, "accepts only a session ID"):
+            asyncio.run(
+                run_sessions_command(
+                    build_parser().parse_args(
+                        ("sessions", "undo", "session-3", "--max-bytes", "1")
+                    ),
+                    SessionCommandServicesFixture(SessionCommandApplicationFixture()),
+                )
+            )
 
     def test_subagents_lifecycle_parser_requires_parent_and_action(self) -> None:
         args = build_parser().parse_args(

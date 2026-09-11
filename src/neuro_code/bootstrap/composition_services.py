@@ -12,11 +12,16 @@ from __future__ import annotations
 import os
 from typing import cast
 
-from neuro_code.application.checkpoints import WorkspaceCheckpointApplicationService
+from neuro_code.application.checkpoints import (
+    TurnWorkspaceCheckpointCoordinator,
+    WorkspaceCheckpointApplicationService,
+)
 from neuro_code.application.ports.agent_swarm import AgentSwarmStore
+from neuro_code.application.ports.background_tasks import BackgroundTaskManager
 from neuro_code.application.ports.configuration import AppConfig
 from neuro_code.application.ports.result_adoption import ResultAdoptionStore
 from neuro_code.application.ports.task_dag import TaskDagStore
+from neuro_code.application.ports.terminal import InteractiveTerminalManager
 from neuro_code.application.ports.writable_subagent import WritableSubagentLeaseStore
 from neuro_code.application.providers.service import (
     ProviderChangeService,
@@ -83,6 +88,8 @@ class CompositionServicesMixin(CompositionRootMixin):
 
     def create_workspace_checkpoint_service(
         self: CompositionRootMixin,
+        *,
+        config: AppConfig | None = None,
     ) -> WorkspaceCheckpointApplicationService:
         """Create the internal managed-workspace checkpoint capability.
 
@@ -90,14 +97,37 @@ class CompositionServicesMixin(CompositionRootMixin):
         model-facing tool.  Callers must await ``initialize`` before use.
         """
 
-        git = LocalGitWorktreeAdapter(hooks_directory=self.config.state_dir / "git-hooks")
+        selected_config = config or self.config
+        git = LocalGitWorktreeAdapter(hooks_directory=selected_config.state_dir / "git-hooks")
         return WorkspaceCheckpointApplicationService(
             git=git,
             workspace_git=git,
-            worktrees=SqliteManagedWorktreeStore(self.config.state_dir / "worktrees.db"),
+            worktrees=SqliteManagedWorktreeStore(selected_config.state_dir / "worktrees.db"),
             state=LocalWorkspaceStateAdapter(git=git, workspace_git=git),
-            checkpoints=SqliteWorkspaceCheckpointStore(self.config.state_dir / "checkpoints.db"),
-            artifacts=LocalCheckpointArtifactStore(self.config.state_dir),
+            checkpoints=SqliteWorkspaceCheckpointStore(
+                selected_config.state_dir / "checkpoints.db"
+            ),
+            artifacts=LocalCheckpointArtifactStore(selected_config.state_dir),
+        )
+
+    def create_workspace_undo_coordinator(
+        self: CompositionRootMixin,
+        *,
+        config: AppConfig | None = None,
+        enabled: bool = True,
+        background_tasks: BackgroundTaskManager | None = None,
+        interactive_terminals: InteractiveTerminalManager | None = None,
+    ) -> TurnWorkspaceCheckpointCoordinator:
+        """Assemble the normal binding's explicit checkpoint/undo coordinator."""
+
+        selected_config = config or self.config
+        return TurnWorkspaceCheckpointCoordinator(
+            checkpoint_service=self.create_workspace_checkpoint_service(config=selected_config),
+            store=self.store,
+            source_workspace=selected_config.cwd,
+            enabled=enabled,
+            background_tasks=background_tasks,
+            interactive_terminals=interactive_terminals,
         )
 
     def create_result_adoption_service(

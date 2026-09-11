@@ -38,6 +38,7 @@ from neuro_code.domain.checkpoints import (
     RollbackAttempt,
     RollbackAttemptId,
     RollbackState,
+    SourceWorkspaceCheckpointGrant,
     WorkspaceCheckpoint,
     WorkspaceFileEntry,
     WorkspaceFileKind,
@@ -559,6 +560,31 @@ class WorkspaceCheckpointIntegrationTests(unittest.TestCase):
         self.assertEqual(_git(fixture.repository, "rev-parse", "HEAD"), source_head)
         self.assertEqual((fixture.repository / "tracked.txt").read_bytes(), source_bytes)
         self.assertEqual(_git(fixture.repository, "status", "--porcelain=v2", "-z"), source_status)
+
+    def test_source_checkout_grant_is_typed_reproved_and_restorable(self) -> None:
+        fixture = _CheckpointFixture()
+        self.addCleanup(fixture.close)
+        grant = _run(fixture.checkpoints.authorize_source_workspace(fixture.repository))
+        self.assertIsInstance(grant, SourceWorkspaceCheckpointGrant)
+        self.assertTrue(grant.worktree_id.value.startswith("src-"))
+        self.assertEqual(grant.path, fixture.repository.resolve())
+        self.assertEqual(
+            _run(fixture.checkpoints.ignored_source_paths(grant, ("ignored.tmp", "tracked.txt"))),
+            ("ignored.tmp",),
+        )
+        checkpoint = _run(fixture.checkpoints.create(CheckpointCreateRequest(grant)))
+        with self.assertRaises(TypeError):
+            _run(
+                fixture.checkpoints.rollback(
+                    checkpoint.checkpoint_id,
+                    target=fixture.repository,  # type: ignore[arg-type]
+                )
+            )
+
+        (fixture.repository / "tracked.txt").write_bytes(b"source-after-checkpoint\n")
+        result = _run(fixture.checkpoints.rollback(checkpoint.checkpoint_id, target=grant))
+        self.assertIs(result.state, RollbackState.COMPLETED)
+        self.assertEqual((fixture.repository / "tracked.txt").read_bytes(), b"base\n")
 
     def test_repeated_rollback_is_a_verified_no_op(self) -> None:
         fixture = _CheckpointFixture()

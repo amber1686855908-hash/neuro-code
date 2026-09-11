@@ -4,6 +4,7 @@ from collections.abc import Callable, Collection, Sequence
 from datetime import datetime
 from pathlib import Path
 
+from neuro_code.application.checkpoints.turn_undo import TurnWorkspaceCheckpointCoordinator
 from neuro_code.application.execution_policy import ExecutionBudgetPolicy
 from neuro_code.application.memory.compaction import ProviderContextWindow
 from neuro_code.application.memory.compaction_runtime import (
@@ -123,6 +124,7 @@ class AgentRuntime:
         workspace_mutation_tool: Tool | None = None,
         parent_relay_message: Message | None = None,
         dag_result_relay_message: Message | None = None,
+        workspace_undo: TurnWorkspaceCheckpointCoordinator | None = None,
     ) -> None:
         if execution_budget is not None and not isinstance(execution_budget, ExecutionBudget):
             raise TypeError("execution_budget must be an ExecutionBudget or None")
@@ -171,6 +173,7 @@ class AgentRuntime:
         self._workspace_change_observer = workspace_change_observer
         self._permissions = permissions
         self._tool_context = tool_context
+        self._workspace_undo = workspace_undo
         self._approver = approver
         self._session_store = session_store
         self._system_prompt = system_prompt
@@ -220,6 +223,7 @@ class AgentRuntime:
             context_builder=self._context_builder,
             hooks=tool_hooks,
             workspace_mutation_tool=workspace_mutation_tool,
+            workspace_undo=workspace_undo,
         )
         self._loop_runner = AgentLoopRunner(
             provider=self._provider,
@@ -267,6 +271,12 @@ class AgentRuntime:
         """Return the internal mutation port bound to this runtime."""
 
         return self._tool_executor
+
+    @property
+    def workspace_undo(self) -> TurnWorkspaceCheckpointCoordinator | None:
+        """Return the normal-turn workspace undo coordinator, if enabled."""
+
+        return self._workspace_undo
 
     @property
     def system_prompt(self) -> str:

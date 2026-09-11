@@ -535,6 +535,12 @@ class AgentLoopRunner:
         record_turn_failure = recorder.record_turn_failure
         finalize_turn_completion = recorder.finalize_turn_completion
 
+        async def persist_workspace_undo_event(
+            kind: AgentEventKind,
+            data: dict[str, object],
+        ) -> None:
+            await recorder.persist_internal_event(kind, data)
+
         supervisor: AgentExecutionSupervisor | None = None
         # Keep the binding-lifetime request budget separate from the currently
         # selected provider identity.  A failover selection may expose a larger
@@ -960,6 +966,8 @@ class AgentLoopRunner:
                 emit,
                 session_id,
                 interrupted_observation_sink=verification_tracker.observe,
+                turn_id=turn_id,
+                workspace_undo_event_sink=persist_workspace_undo_event,
                 workspace_change_sink=(
                     record_workspace_evidence
                     if self._execution_control_mode is ExecutionControlMode.FINALIZE_TERMINAL
@@ -1768,6 +1776,8 @@ class AgentLoopRunner:
                             target_context_items,
                             emit,
                             session_id,
+                            turn_id=turn_id,
+                            workspace_undo_event_sink=persist_workspace_undo_event,
                             interrupted_observation_sink=record_interrupted_tool_outcome,
                             workspace_change_sink=(
                                 record_workspace_evidence

@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Protocol, TypeVar
 
+from neuro_code.application.checkpoints.turn_undo import binding_has_live_mutators
 from neuro_code.application.memory.compaction import ProviderContextWindow
 from neuro_code.application.memory.compaction_runtime import (
     ContextCompactionCommandResult,
@@ -40,6 +41,7 @@ from neuro_code.domain.execution import (
 from neuro_code.domain.plans import PlanComment, SessionPlan
 from neuro_code.domain.session_tasks import SessionTask
 from neuro_code.domain.ultracode import UltracodeDelegationDecision
+from neuro_code.domain.workspace_undo import WorkspaceUndoResult
 
 _T = TypeVar("_T")
 
@@ -232,6 +234,13 @@ class ConversationRunner(Protocol):
         sink: EventSink | None = None,
     ) -> AgentRunResult: ...
 
+    async def undo_workspace(
+        self,
+        *,
+        live_terminal: bool = False,
+        live_background: bool = False,
+    ) -> WorkspaceUndoResult: ...
+
 
 @dataclass(frozen=True, slots=True)
 class ConversationBinding:
@@ -254,6 +263,18 @@ class ConversationBinding:
     )
     workspace_root: Path | None = field(default=None, kw_only=True)
     workspace_mutation: WorkspaceMutationPort | None = field(default=None, kw_only=True)
+
+    async def undo_workspace(self) -> WorkspaceUndoResult:
+        """Restore the latest idle-safe workspace checkpoint for this binding."""
+
+        live_background, live_terminal = await binding_has_live_mutators(
+            self.background_tasks,
+            self.interactive_terminals,
+        )
+        return await self.runner.undo_workspace(
+            live_terminal=live_terminal,
+            live_background=live_background,
+        )
 
     async def close(self) -> None:
         """Close ephemeral resources owned by this binding."""

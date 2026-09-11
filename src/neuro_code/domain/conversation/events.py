@@ -24,6 +24,7 @@ class AgentEventKind(StrEnum):
     CONTEXT_COMPACTION_STARTED = "context_compaction_started"
     CONTEXT_COMPACTION_COMPLETED = "context_compaction_completed"
     EXECUTION_SEGMENT_CHECKPOINTED = "execution_segment_checkpointed"
+    WORKSPACE_UNDO_STATE = "workspace_undo_state"
     FINALIZING_STARTED = "finalizing_started"
     ULTRACODE_DELEGATION_PROGRESS = "ultracode_delegation_progress"
     BACKGROUND_TASK_COMPLETION_REMINDER = "background_task_completion_reminder"

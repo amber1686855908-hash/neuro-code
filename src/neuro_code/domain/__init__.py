@@ -204,6 +204,12 @@ from neuro_code.domain.ultracode import (
     ultracode_result_fingerprint,
     ultracode_swarm_run_id,
 )
+from neuro_code.domain.workspace_undo import (
+    WorkspaceUndoAssociation,
+    WorkspaceUndoReason,
+    WorkspaceUndoResult,
+    WorkspaceUndoState,
+)
 from neuro_code.domain.worktree import (
     WorktreeCreateRequest,
     WorktreeHandle,
@@ -377,6 +383,10 @@ __all__ = [
     "UltracodeDelegationDecision",
     "UltracodeExecution",
     "UltracodeExecutionState",
+    "WorkspaceUndoAssociation",
+    "WorkspaceUndoReason",
+    "WorkspaceUndoResult",
+    "WorkspaceUndoState",
     "WorktreeCreateRequest",
     "WorktreeHandle",
     "WorktreeId",

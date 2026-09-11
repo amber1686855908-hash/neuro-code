@@ -137,6 +137,26 @@ class TurnEventRecorder:
             await self._deliver(event)
         return event
 
+    async def persist_internal_event(
+        self,
+        kind: AgentEventKind,
+        data: dict[str, object],
+    ) -> None:
+        """Persist a bounded internal event without projecting it to the sink.
+
+        Internal coordination facts still share the recorder's monotonically
+        increasing sequence.  They are intentionally omitted from the
+        user-facing event list and sink so adding a durable bookkeeping fact
+        cannot change the public stream or JSON result shape.
+
+        内部协调事实仍共享记录器的单调递增序列,但有意不投影到用户 sink 或事件列表,
+        从而新增持久化记账事实不会改变公共流或 JSON 结果结构.
+        """
+
+        event = self._create_event(kind, data)
+        if self._session_store is not None and self._session_id is not None:
+            await self._session_store.append_event(self._session_id, event)
+
     def _create_event(self, kind: AgentEventKind, data: dict[str, object]) -> AgentEvent:
         self._sequence += 1
         return AgentEvent.create(self._sequence, kind, data)

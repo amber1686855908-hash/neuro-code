@@ -10,6 +10,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime
+from pathlib import Path
 
 from neuro_code.application.ports.checkpoints import (
     MAX_CHECKPOINT_CAPTURE_SECONDS,
@@ -31,15 +32,18 @@ from neuro_code.domain.checkpoints import (
     CheckpointCreateRequest,
     CheckpointId,
     CheckpointState,
+    CheckpointTarget,
     RollbackAttempt,
     RollbackAttemptId,
     RollbackState,
+    SourceWorkspaceCheckpointGrant,
     WorkspaceCheckpoint,
     WorkspaceProjection,
     workspace_projection_fingerprint,
 )
 from neuro_code.domain.worktree import (
     WorktreeHandle,
+    WorktreeId,
     WorktreeOwnership,
     WorktreeRepositoryIdentity,
     WorktreeSnapshot,
@@ -63,6 +67,21 @@ def _same_repository(
         and first.repository.source_worktree == second_repository.source_worktree
         and first.repository.git_dir == second_repository.git_dir
     )
+
+
+def _same_repository_identity(
+    first: WorktreeRepositoryIdentity,
+    second: WorktreeRepositoryIdentity,
+) -> bool:
+    return (
+        first.common_dir == second.common_dir
+        and first.source_worktree == second.source_worktree
+        and first.git_dir == second.git_dir
+    )
+
+
+def _resolve_path(path: Path) -> Path:
+    return path.expanduser().resolve(strict=False)
 
 
 # Keep these module-level names as a compatibility seam for the existing
@@ -122,20 +141,20 @@ class WorkspaceCheckpointApplicationService:
         self._require_initialized()
         if not isinstance(request, CheckpointCreateRequest):
             raise TypeError("workspace checkpoint create accepts a canonical request")
-        handle = request.worktree
-        lock = await self._worktree_lock(handle.worktree_id.value)
+        target = request.worktree
+        lock = await self._worktree_lock(target.worktree_id.value)
         async with lock:
-            snapshot, _ = await self._prove_handle(handle, allow_lock_reason=None)
-            projection = await self._capture(handle)
-            fingerprint = workspace_projection_fingerprint(handle, projection)
+            repository, _ = await self._prove_target(target, allow_lock_reason=None)
+            projection = await self._capture(target)
+            fingerprint = workspace_projection_fingerprint(target, projection)
             checkpoint_id = request.checkpoint_id or self._checkpoint_id_factory()
             if not isinstance(checkpoint_id, CheckpointId):
                 raise TypeError("checkpoint id factory must return CheckpointId")
             intent = WorkspaceCheckpoint(
                 checkpoint_id=checkpoint_id,
-                worktree_id=handle.worktree_id,
-                repository=snapshot.repository,
-                canonical_path=handle.path,
+                worktree_id=target.worktree_id,
+                repository=repository,
+                canonical_path=target.path,
                 head_sha=projection.head_sha,
                 branch=projection.branch,
                 detached=projection.detached,
@@ -171,21 +190,97 @@ class WorkspaceCheckpointApplicationService:
                 await self._artifacts.remove_temporary_capture(checkpoint_id)
                 raise
 
-    async def inspect(self, handle: WorktreeHandle, /) -> WorkspaceProjection:
+    async def inspect(self, handle: CheckpointTarget, /) -> WorkspaceProjection:
         """Inspect one owned worktree without creating or restoring a checkpoint."""
 
         self._require_initialized()
-        if not isinstance(handle, WorktreeHandle):
-            raise TypeError("workspace inspection requires a canonical worktree handle")
+        if not isinstance(handle, (WorktreeHandle, SourceWorkspaceCheckpointGrant)):
+            raise TypeError("workspace inspection requires a canonical workspace grant")
         lock = await self._worktree_lock(handle.worktree_id.value)
         async with lock:
-            _, status = await self._prove_handle(handle, allow_lock_reason=None)
+            _, status = await self._prove_target(handle, allow_lock_reason=None)
             if status.locked:
                 raise WorkspaceCheckpointError(
                     "locked managed worktree cannot be inspected for a writable result",
                     kind=CheckpointFailureKind.LOCKED,
                 )
             return await self._capture(handle)
+
+    async def authorize_source_workspace(
+        self,
+        path: Path,
+        /,
+    ) -> SourceWorkspaceCheckpointGrant:
+        """Issue a source-checkout grant from current Git identity facts.
+
+        ``path`` is only a bootstrap candidate.  The returned grant is the
+        authority consumed by checkpoint operations, and every operation
+        proves it again against Git before touching the workspace.
+        """
+
+        self._require_initialized()
+        if not isinstance(path, Path):
+            raise TypeError("source workspace candidate must be a pathlib.Path")
+        try:
+            canonical_path = await asyncio.to_thread(_resolve_path, path)
+            repository = await self._git.repository_identity(canonical_path)
+            records = await self._git.list_worktrees(canonical_path)
+            status = await self._git.inspect_status(canonical_path)
+        except (OSError, RuntimeError, WorktreeError) as error:
+            raise WorkspaceCheckpointError(
+                "source checkout Git identity could not be proven",
+                kind=CheckpointFailureKind.IDENTITY_MISMATCH,
+            ) from error
+        if repository.source_worktree != canonical_path or status.path != canonical_path:
+            raise WorkspaceCheckpointError(
+                "checkpoint target must be the repository source checkout",
+                kind=CheckpointFailureKind.IDENTITY_MISMATCH,
+            )
+        record = next((item for item in records if item.path == canonical_path), None)
+        if record is None or record.head_sha != status.head_sha:
+            raise WorkspaceCheckpointError(
+                "source checkout is not a current Git worktree",
+                kind=CheckpointFailureKind.IDENTITY_MISMATCH,
+            )
+        if status.locked or record.locked:
+            raise WorkspaceCheckpointError(
+                "locked source checkout cannot be protected safely",
+                kind=CheckpointFailureKind.LOCKED,
+            )
+        return SourceWorkspaceCheckpointGrant.issue(
+            repository,
+            path=canonical_path,
+            head_sha=status.head_sha,
+            branch=status.branch,
+            detached=status.detached,
+        )
+
+    async def ignored_source_paths(
+        self,
+        grant: SourceWorkspaceCheckpointGrant,
+        paths: tuple[str, ...],
+        /,
+    ) -> tuple[str, ...]:
+        """Ask Git whether prepared source targets are ignored.
+
+        The Git adapter owns ignore-file interpretation.  Tracked paths are
+        excluded by that adapter so a matching ignore rule cannot weaken the
+        tracked projection guarantee.
+        """
+
+        self._require_initialized()
+        if not isinstance(grant, SourceWorkspaceCheckpointGrant):
+            raise TypeError("ignored-path checks require a source workspace grant")
+        if not isinstance(paths, tuple):
+            raise TypeError("ignored source paths must be a tuple")
+        await self._prove_source_grant(grant, allow_lock_reason=None)
+        try:
+            return await self._workspace_git.ignored_paths(grant.path, paths)
+        except AttributeError as error:
+            raise WorkspaceCheckpointError(
+                "Git ignored-path capability is unavailable",
+                kind=CheckpointFailureKind.NOT_AVAILABLE,
+            ) from error
 
     async def get(self, checkpoint_id: CheckpointId, /) -> WorkspaceCheckpoint | None:
         """Read one checkpoint metadata record for internal reconciliation."""
@@ -221,6 +316,7 @@ class WorkspaceCheckpointApplicationService:
         self,
         checkpoint_id: CheckpointId,
         *,
+        target: CheckpointTarget | None = None,
         attempt_id: RollbackAttemptId | None = None,
     ) -> RollbackAttempt:
         self._require_initialized()
@@ -228,6 +324,10 @@ class WorkspaceCheckpointApplicationService:
             raise TypeError("checkpoint id must be canonical")
         if attempt_id is not None and not isinstance(attempt_id, RollbackAttemptId):
             raise TypeError("rollback attempt id must be canonical")
+        if target is not None and not isinstance(
+            target, (WorktreeHandle, SourceWorkspaceCheckpointGrant)
+        ):
+            raise TypeError("rollback target must be a canonical workspace grant")
         checkpoint = await self._checkpoints.get(checkpoint_id)
         if checkpoint is None or checkpoint.state is not CheckpointState.READY:
             raise WorkspaceCheckpointError(
@@ -235,18 +335,23 @@ class WorkspaceCheckpointApplicationService:
                 kind=CheckpointFailureKind.UNMANAGED,
             )
         projection = await self._artifacts.load(checkpoint)
-        snapshot = await self._worktrees.get(checkpoint.worktree_id.value)
-        if snapshot is None:
+        snapshot: WorktreeSnapshot | None = None
+        if target is None:
+            snapshot = await self._worktrees.get(checkpoint.worktree_id.value)
+            if snapshot is None:
+                raise WorkspaceCheckpointError(
+                    "checkpoint worktree ownership record is missing",
+                    kind=CheckpointFailureKind.UNMANAGED,
+                )
+            target = snapshot.handle
+        elif target.worktree_id != checkpoint.worktree_id:
             raise WorkspaceCheckpointError(
-                "checkpoint worktree ownership record is missing",
-                kind=CheckpointFailureKind.UNMANAGED,
+                "rollback target does not match the checkpoint identity",
+                kind=CheckpointFailureKind.IDENTITY_MISMATCH,
             )
-        lock = await self._worktree_lock(snapshot.worktree_id.value)
+        lock = await self._worktree_lock(target.worktree_id.value)
         async with lock:
-            current_snapshot, status = await self._prove_handle(
-                snapshot.handle, allow_lock_reason=None
-            )
-            del current_snapshot
+            _, status = await self._prove_target(target, allow_lock_reason=None)
             if status.head_sha != checkpoint.head_sha:
                 raise WorkspaceCheckpointError(
                     "managed worktree HEAD no longer matches checkpoint HEAD",
@@ -259,10 +364,10 @@ class WorkspaceCheckpointApplicationService:
                 )
             attempt = await self._get_or_start_attempt(
                 checkpoint,
-                snapshot,
+                target.worktree_id,
                 attempt_id,
             )
-            return await self._resume_attempt(checkpoint, projection, snapshot, attempt)
+            return await self._resume_attempt(checkpoint, projection, target, attempt)
 
     async def reconcile(self) -> tuple[RollbackAttempt, ...]:
         self._require_initialized()
@@ -290,14 +395,29 @@ class WorkspaceCheckpointApplicationService:
         for active in await self._checkpoints.list_active_attempts():
             active_checkpoint = await self._checkpoints.get(active.checkpoint_id)
             snapshot = await self._worktrees.get(active.worktree_id.value)
+            source_target: SourceWorkspaceCheckpointGrant | None = None
+            if snapshot is None and active_checkpoint is not None:
+                try:
+                    source_target = SourceWorkspaceCheckpointGrant.from_checkpoint(
+                        active_checkpoint
+                    )
+                except (TypeError, ValueError):
+                    source_target = None
             if (
                 active_checkpoint is None
                 or active_checkpoint.state is not CheckpointState.READY
-                or snapshot is None
+                or (snapshot is None and source_target is None)
             ):
                 results.append(active)
                 continue
             if active.owner_token != self._owner_token and _owner_is_alive(active.owner_pid):
+                results.append(active)
+                continue
+            if snapshot is not None:
+                target: CheckpointTarget = snapshot.handle
+            elif source_target is not None:
+                target = source_target
+            else:
                 results.append(active)
                 continue
             lock = await self._worktree_lock(active.worktree_id.value)
@@ -325,7 +445,7 @@ class WorkspaceCheckpointApplicationService:
                     result = await self._resume_attempt(
                         active_checkpoint,
                         projection,
-                        snapshot,
+                        target,
                         active_attempt,
                     )
                 except WorkspaceCheckpointError as error:
@@ -336,7 +456,7 @@ class WorkspaceCheckpointApplicationService:
                 results.append(result)
         return tuple(results)
 
-    async def _capture(self, handle: WorktreeHandle) -> WorkspaceProjection:
+    async def _capture(self, handle: CheckpointTarget) -> WorkspaceProjection:
         try:
             async with asyncio.timeout(MAX_CHECKPOINT_CAPTURE_SECONDS):
                 return await self._state.inspect(handle)
@@ -349,10 +469,10 @@ class WorkspaceCheckpointApplicationService:
     async def _get_or_start_attempt(
         self,
         checkpoint: WorkspaceCheckpoint,
-        snapshot: WorktreeSnapshot,
+        worktree_id: WorktreeId,
         requested_attempt_id: RollbackAttemptId | None,
     ) -> RollbackAttempt:
-        active = await self._checkpoints.active_attempt(snapshot.worktree_id.value)
+        active = await self._checkpoints.active_attempt(worktree_id.value)
         if active is not None:
             if active.checkpoint_id != checkpoint.checkpoint_id:
                 raise WorkspaceCheckpointError(
@@ -379,7 +499,7 @@ class WorkspaceCheckpointApplicationService:
             RollbackAttempt(
                 attempt_id=identifier,
                 checkpoint_id=checkpoint.checkpoint_id,
-                worktree_id=snapshot.worktree_id,
+                worktree_id=worktree_id,
                 state=RollbackState.STARTED,
                 started_at=self._clock().astimezone(UTC),
                 completed_at=None,
@@ -405,48 +525,52 @@ class WorkspaceCheckpointApplicationService:
         self,
         checkpoint: WorkspaceCheckpoint,
         projection: WorkspaceProjection,
-        snapshot: WorktreeSnapshot,
+        target: CheckpointTarget,
         attempt: RollbackAttempt,
     ) -> RollbackAttempt:
         reason = f"neuro-code-checkpoint:{attempt.attempt_id.value}"
         destructive_started = False
         try:
-            _, status = await self._prove_handle(snapshot.handle, allow_lock_reason=reason)
+            _, status = await self._prove_target(target, allow_lock_reason=reason)
             if status.head_sha != checkpoint.head_sha:
                 raise WorkspaceCheckpointError(
                     "managed worktree HEAD no longer matches checkpoint HEAD",
                     kind=CheckpointFailureKind.HEAD_MISMATCH,
                 )
-            if not status.locked:
-                await self._workspace_git.lock_worktree(snapshot.canonical_path, reason)
+            if not status.locked and isinstance(target, WorktreeHandle):
+                await self._workspace_git.lock_worktree(target.path, reason)
                 destructive_started = True
-                _, status = await self._prove_handle(snapshot.handle, allow_lock_reason=reason)
-            else:
+                _, status = await self._prove_target(target, allow_lock_reason=reason)
+            elif status.locked:
                 # An existing lock with this exact attempt reason means a
                 # previous owner may already have entered the destructive
                 # phase before dying.
                 destructive_started = True
-            actual = await self._state.inspect(snapshot.handle)
-            actual_fingerprint = workspace_projection_fingerprint(snapshot.handle, actual)
+            if isinstance(target, SourceWorkspaceCheckpointGrant):
+                # Source checkouts have no managed-worktree lock.  Once their
+                # identity proof has passed, any later inspection or restore
+                # failure must be treated conservatively as potentially
+                # destructive during reconciliation.
+                destructive_started = True
+            actual = await self._state.inspect(target)
+            actual_fingerprint = workspace_projection_fingerprint(target, actual)
             if actual_fingerprint != checkpoint.source_fingerprint:
-                await self._state.restore(snapshot.handle, projection)
-                actual = await self._state.inspect(snapshot.handle)
-                actual_fingerprint = workspace_projection_fingerprint(snapshot.handle, actual)
+                await self._state.restore(target, projection)
+                actual = await self._state.inspect(target)
+                actual_fingerprint = workspace_projection_fingerprint(target, actual)
             if actual_fingerprint != checkpoint.source_fingerprint:
                 raise WorkspaceCheckpointError(
                     "rollback final workspace fingerprint does not match checkpoint",
                     kind=CheckpointFailureKind.ROLLBACK_VERIFICATION_FAILED,
                 )
-            _, final_status = await self._prove_handle(
-                snapshot.handle,
-                allow_lock_reason=reason,
-            )
-            if not final_status.locked:
-                raise WorkspaceCheckpointError(
-                    "managed worktree rollback lock disappeared before completion",
-                    kind=CheckpointFailureKind.LOCKED,
-                )
-            await self._workspace_git.unlock_worktree(snapshot.canonical_path)
+            _, final_status = await self._prove_target(target, allow_lock_reason=reason)
+            if isinstance(target, WorktreeHandle):
+                if not final_status.locked:
+                    raise WorkspaceCheckpointError(
+                        "managed worktree rollback lock disappeared before completion",
+                        kind=CheckpointFailureKind.LOCKED,
+                    )
+                await self._workspace_git.unlock_worktree(target.path)
             completed = replace(
                 attempt,
                 state=RollbackState.COMPLETED,
@@ -578,6 +702,75 @@ class WorkspaceCheckpointApplicationService:
                     kind=CheckpointFailureKind.LOCKED,
                 )
         return snapshot, status
+
+    async def _prove_target(
+        self,
+        target: CheckpointTarget,
+        *,
+        allow_lock_reason: str | None,
+    ) -> tuple[WorktreeRepositoryIdentity, WorktreeStatus]:
+        if isinstance(target, WorktreeHandle):
+            snapshot, status = await self._prove_handle(
+                target,
+                allow_lock_reason=allow_lock_reason,
+            )
+            return snapshot.repository, status
+        if isinstance(target, SourceWorkspaceCheckpointGrant):
+            return await self._prove_source_grant(
+                target,
+                allow_lock_reason=allow_lock_reason,
+            )
+        raise TypeError("checkpoint target must be a canonical workspace grant")
+
+    async def _prove_source_grant(
+        self,
+        grant: SourceWorkspaceCheckpointGrant,
+        *,
+        allow_lock_reason: str | None,
+    ) -> tuple[WorktreeRepositoryIdentity, WorktreeStatus]:
+        del allow_lock_reason
+        try:
+            repository = await self._git.repository_identity(grant.path)
+            records = await self._git.list_worktrees(grant.path)
+            status = await self._git.inspect_status(grant.path)
+        except WorktreeError as error:
+            raise WorkspaceCheckpointError(
+                "source checkout identity could not be proven",
+                kind=CheckpointFailureKind.IDENTITY_MISMATCH,
+            ) from error
+        if (
+            grant.path != grant.repository.source_worktree
+            or repository.source_worktree != grant.path
+            or not _same_repository_identity(grant.repository, repository)
+            or status.path != grant.path
+        ):
+            raise WorkspaceCheckpointError(
+                "source checkout repository identity changed",
+                kind=CheckpointFailureKind.IDENTITY_MISMATCH,
+            )
+        record = next((item for item in records if item.path == grant.path), None)
+        if record is None or record.head_sha != status.head_sha:
+            raise WorkspaceCheckpointError(
+                "source checkout is missing from the Git worktree boundary",
+                kind=CheckpointFailureKind.IDENTITY_MISMATCH,
+            )
+        if (
+            status.head_sha != grant.head_sha
+            or status.branch != grant.branch
+            or status.detached is not grant.detached
+            or record.branch != (None if grant.detached else f"refs/heads/{grant.branch}")
+            or record.detached is not grant.detached
+        ):
+            raise WorkspaceCheckpointError(
+                "source checkout HEAD or branch identity changed",
+                kind=CheckpointFailureKind.HEAD_MISMATCH,
+            )
+        if status.locked or record.locked:
+            raise WorkspaceCheckpointError(
+                "source checkout is locked by an external owner",
+                kind=CheckpointFailureKind.LOCKED,
+            )
+        return repository, status
 
     async def _worktree_lock(self, worktree_id: str) -> asyncio.Lock:
         async with self._worktree_locks_guard:
