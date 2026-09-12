@@ -61,6 +61,7 @@ class TurnEventRecorderTests(unittest.IsolatedAsyncioTestCase):
         session_task: SessionTask | None = None,
         turn_id: str | None = None,
         sink: object | None = None,
+        workspace_undo_sealer: object | None = None,
     ) -> TurnEventRecorder:
         return TurnEventRecorder(
             sink=sink,  # type: ignore[arg-type]
@@ -76,6 +77,7 @@ class TurnEventRecorderTests(unittest.IsolatedAsyncioTestCase):
             session_task=session_task,
             pristine_cancel_eligible=False,
             turn_id=turn_id,
+            workspace_undo_sealer=workspace_undo_sealer,  # type: ignore[arg-type]
         )
 
     async def test_recovery_markers_are_noops_without_a_persisted_turn(self) -> None:
@@ -298,6 +300,69 @@ class TurnEventRecorderTests(unittest.IsolatedAsyncioTestCase):
                 "verification_workspace_generation": 4,
             },
         )
+
+    async def test_workspace_undo_is_sealed_after_durable_terminal_resolution(self) -> None:
+        calls: list[str] = []
+
+        class Store:
+            async def finalize_turn(self, *_args: object, **_kwargs: object) -> None:
+                calls.append("finalize")
+
+            async def finalize_turn_failure(self, *_args: object, **_kwargs: object) -> None:
+                calls.append("failure")
+
+        async def seal(session_id: str | None, turn_id: str | None) -> None:
+            calls.append(f"seal:{session_id}:{turn_id}")
+
+        async def sink(event: AgentEvent) -> None:
+            calls.append(f"sink:{event.kind.value}")
+
+        recorder = self._recorder(
+            store=Store(),
+            session_id="session-1",
+            turn_id="turn-1",
+            sink=sink,
+            workspace_undo_sealer=seal,
+        )
+        committed = FinalResponseContract.committed(
+            "done",
+            source=ResponseSource.NORMAL_MODEL,
+            verification=VerificationReport(VerificationState.NOT_APPLICABLE, (), 0, False),
+        )
+        outcome = AgentExecutionOutcome(
+            AgentExecutionStatus.COMPLETED,
+            None,
+            finalized=False,
+            recoverable=False,
+        )
+
+        await recorder.finalize_turn_completion(
+            outcome,
+            {},
+            (),
+            response_contract=committed,
+            committed_response="done",
+        )
+
+        self.assertEqual(
+            calls,
+            [
+                "finalize",
+                "seal:session-1:turn-1",
+                "sink:text_delta",
+                "sink:turn_completed",
+            ],
+        )
+
+        calls.clear()
+        failure_recorder = self._recorder(
+            store=Store(),
+            session_id="session-1",
+            turn_id="turn-2",
+            workspace_undo_sealer=seal,
+        )
+        await failure_recorder.record_turn_failure(ProviderError("failed"))
+        self.assertEqual(calls, ["failure", "seal:session-1:turn-2"])
 
     async def test_legacy_task_finisher_maps_each_terminal_status(self) -> None:
         class TaskStore:

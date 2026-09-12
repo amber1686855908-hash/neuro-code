@@ -19,6 +19,8 @@ from neuro_code.application.ports.checkpoints import (
 )
 from neuro_code.application.ports.worktree import GitWorktreePort, WorktreeError
 from neuro_code.domain.checkpoints import (
+    CheckpointTarget,
+    SourceWorkspaceCheckpointGrant,
     WorkspaceFileEntry,
     WorkspaceFileKind,
     WorkspaceFileScope,
@@ -169,9 +171,9 @@ class LocalWorkspaceStateAdapter(WorkspaceStatePort):
         self._git = git
         self._workspace_git = workspace_git
 
-    async def inspect(self, handle: WorktreeHandle, /) -> WorkspaceProjection:
-        if not isinstance(handle, WorktreeHandle):
-            raise TypeError("workspace inspection requires a managed worktree handle")
+    async def inspect(self, handle: CheckpointTarget, /) -> WorkspaceProjection:
+        if not isinstance(handle, (WorktreeHandle, SourceWorkspaceCheckpointGrant)):
+            raise TypeError("workspace inspection requires a canonical workspace grant")
         root = handle.path
         _assert_root(root)
         try:
@@ -391,12 +393,12 @@ class LocalWorkspaceStateAdapter(WorkspaceStatePort):
 
     async def restore(
         self,
-        handle: WorktreeHandle,
+        handle: CheckpointTarget,
         projection: WorkspaceProjection,
         /,
     ) -> None:
-        if not isinstance(handle, WorktreeHandle):
-            raise TypeError("workspace restoration requires a managed worktree handle")
+        if not isinstance(handle, (WorktreeHandle, SourceWorkspaceCheckpointGrant)):
+            raise TypeError("workspace restoration requires a canonical workspace grant")
         if not isinstance(projection, WorkspaceProjection):
             raise TypeError("workspace restoration requires a canonical projection")
         current = await self.inspect(handle)

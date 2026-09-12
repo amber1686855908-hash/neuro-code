@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypeVar
 
+from neuro_code.application.checkpoints.turn_undo import TurnWorkspaceCheckpointCoordinator
 from neuro_code.application.memory.compaction import ProviderContextWindow
 from neuro_code.application.memory.compaction_runtime import (
     ContextCompactionCommandResult,
@@ -98,6 +99,11 @@ from neuro_code.domain.ultracode import (
     MAX_ULTRACODE_RESULT_BYTES,
     UltracodeDelegationDecision,
 )
+from neuro_code.domain.workspace_undo import (
+    WorkspaceUndoReason,
+    WorkspaceUndoResult,
+    WorkspaceUndoState,
+)
 from neuro_code.shared.errors import ConfigurationError
 
 _T = TypeVar("_T")
@@ -126,6 +132,7 @@ class AgentConversation:
         source_model: str | None = None,
         source_context_affinity: str | None = None,
         execution_record: SessionExecutionRecord | None = None,
+        workspace_undo: TurnWorkspaceCheckpointCoordinator | None = None,
     ) -> None:
         self._runtime = runtime
         self._store = store
@@ -135,6 +142,11 @@ class AgentConversation:
         self._source_model = source_model
         self._source_context_affinity = source_context_affinity
         self._execution_record = execution_record
+        self._workspace_undo = (
+            workspace_undo
+            if workspace_undo is not None
+            else getattr(runtime, "workspace_undo", None)
+        )
         self._turn_lock = asyncio.Lock()
 
     @classmethod
@@ -360,6 +372,18 @@ class AgentConversation:
             ultracode_execution_id=ultracode_execution_id,
         )
         async with self._turn_lock:
+            verification_handoff = None
+            if (
+                verification_workspace_mutation_id is None
+                and turn_source is TurnSource.USER
+                and ultracode_execution_id is None
+                and self._workspace_undo is not None
+            ):
+                verification_handoff = await self._workspace_undo.prepare_verification_handoff(
+                    self._session_id
+                )
+                if verification_handoff is not None:
+                    verification_workspace_mutation_id = verification_handoff.mutation_id
 
             async def capture_session(event: AgentEvent) -> None:
                 if event.kind is AgentEventKind.SESSION_STARTED:
@@ -402,10 +426,32 @@ class AgentConversation:
                 raise
             self._items = result.items
             self._session_id = result.session_id
+            if verification_handoff is not None:
+                await verification_handoff.commit()
             await self._reload_plan_state()
             await self._reload_provider_origin()
             await self._reload_execution_record()
             return result
+
+    async def undo_workspace(
+        self,
+        *,
+        live_terminal: bool = False,
+        live_background: bool = False,
+    ) -> WorkspaceUndoResult:
+        """Restore the latest safe source-checkout checkpoint without an LLM turn."""
+
+        if self._workspace_undo is None:
+            return WorkspaceUndoResult(
+                WorkspaceUndoState.UNAVAILABLE,
+                WorkspaceUndoReason.CAPABILITY_UNAVAILABLE,
+            )
+        async with self._turn_lock:
+            return await self._workspace_undo.undo(
+                self._session_id,
+                live_terminal=live_terminal,
+                live_background=live_background,
+            )
 
     async def ensure_persisted_session(self) -> str:
         """Create the parent session before an application-owned delegation."""

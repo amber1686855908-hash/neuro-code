@@ -36,6 +36,10 @@ from neuro_code.infrastructure.workspace.paths import workspaces_match
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 MCP_FIXTURE = REPOSITORY_ROOT / "tests" / "fixtures" / "mcp_stdio_server.py"
+# These are positive-progress deadlines for a real ACP subprocess, not a
+# product latency contract. Negative framing assertions keep their short,
+# explicit timeout at the call site.
+ACP_SUBPROCESS_POSITIVE_TIMEOUT_SECONDS = 30.0
 
 
 class ProviderServer:
@@ -262,7 +266,7 @@ class E2eClient:
                 if len(self.updates) < count:
                     await self._update_event.wait()
 
-        await asyncio.wait_for(wait(), timeout=5)
+        await asyncio.wait_for(wait(), timeout=ACP_SUBPROCESS_POSITIVE_TIMEOUT_SECONDS)
 
 
 class AcpSubprocessTests(unittest.IsolatedAsyncioTestCase):
@@ -581,15 +585,24 @@ context_window_tokens = 32000
                         [TextContentBlock(type="text", text="WAIT_FOR_CANCEL")],
                     )
                 )
-                received = await asyncio.to_thread(
-                    self.server.cancel_request_received.wait,
-                    5,
-                )
-                self.assertTrue(received)
-                await connection.cancel(created.session_id)
-                response = await asyncio.wait_for(prompt_task, timeout=5)
-                self.assertEqual(response.stop_reason, "cancelled")
-                self.server.release_cancel_request.set()
+                try:
+                    received = await asyncio.to_thread(
+                        self.server.cancel_request_received.wait,
+                        ACP_SUBPROCESS_POSITIVE_TIMEOUT_SECONDS,
+                    )
+                    self.assertTrue(received)
+                    await connection.cancel(created.session_id)
+                    response = await asyncio.wait_for(
+                        prompt_task,
+                        timeout=ACP_SUBPROCESS_POSITIVE_TIMEOUT_SECONDS,
+                    )
+                    self.assertEqual(response.stop_reason, "cancelled")
+                finally:
+                    self.server.release_cancel_request.set()
+                    if not prompt_task.done():
+                        prompt_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await prompt_task
 
     async def test_official_client_drives_session_owned_stdio_mcp_tool(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -703,7 +716,10 @@ context_window_tokens = 32000
                 )
                 await client.wait_for_updates(2)
                 await connection.cancel(created.session_id)
-                response = await asyncio.wait_for(prompt_task, timeout=8)
+                response = await asyncio.wait_for(
+                    prompt_task,
+                    timeout=ACP_SUBPROCESS_POSITIVE_TIMEOUT_SECONDS,
+                )
 
                 self.assertEqual(response.stop_reason, "cancelled")
                 states = [

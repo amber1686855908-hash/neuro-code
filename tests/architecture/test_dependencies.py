@@ -276,6 +276,7 @@ _BOOTSTRAP_COMPOSITION_MIXIN_OWNERS = {
             {
                 "create_worktree_service",
                 "create_workspace_checkpoint_service",
+                "create_workspace_undo_coordinator",
                 "create_result_adoption_service",
                 "create_tool_output_artifact_service",
                 "bind_provider_controller",

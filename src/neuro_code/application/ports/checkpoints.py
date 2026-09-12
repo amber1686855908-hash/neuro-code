@@ -8,15 +8,17 @@ from typing import Protocol
 
 from neuro_code.domain.checkpoints import (
     CheckpointCreateRequest,
+    CheckpointFingerprint,
     CheckpointId,
     CheckpointState,
+    CheckpointTarget,
     RollbackAttempt,
     RollbackAttemptId,
     RollbackState,
+    SourceWorkspaceCheckpointGrant,
     WorkspaceCheckpoint,
     WorkspaceProjection,
 )
-from neuro_code.domain.worktree import WorktreeHandle
 
 MAX_CHECKPOINT_FILES = 10_000
 MAX_CHECKPOINT_UNTRACKED_FILES = 5_000
@@ -66,6 +68,8 @@ class WorkspaceGitPort(Protocol):
 
     async def nonignored_untracked_paths(self, path: Path, /) -> bytes: ...
 
+    async def ignored_paths(self, path: Path, paths: tuple[str, ...], /) -> tuple[str, ...]: ...
+
     async def status_porcelain(self, path: Path, /) -> bytes: ...
 
     async def config_bool(self, path: Path, key: str, /) -> bool: ...
@@ -82,11 +86,11 @@ class WorkspaceGitPort(Protocol):
 class WorkspaceStatePort(Protocol):
     """Read and mutate only the projection bound to one managed handle."""
 
-    async def inspect(self, handle: WorktreeHandle, /) -> WorkspaceProjection: ...
+    async def inspect(self, handle: CheckpointTarget, /) -> WorkspaceProjection: ...
 
     async def restore(
         self,
-        handle: WorktreeHandle,
+        handle: CheckpointTarget,
         projection: WorkspaceProjection,
         /,
     ) -> None: ...
@@ -169,7 +173,13 @@ class WorkspaceCheckpointApplication(Protocol):
 
     async def create(self, request: CheckpointCreateRequest) -> WorkspaceCheckpoint: ...
 
-    async def inspect(self, handle: WorktreeHandle, /) -> WorkspaceProjection: ...
+    async def inspect(self, handle: CheckpointTarget, /) -> WorkspaceProjection: ...
+
+    async def authorize_source_workspace(
+        self,
+        path: Path,
+        /,
+    ) -> SourceWorkspaceCheckpointGrant: ...
 
     async def get(self, checkpoint_id: CheckpointId, /) -> WorkspaceCheckpoint | None: ...
 
@@ -183,7 +193,17 @@ class WorkspaceCheckpointApplication(Protocol):
         self,
         checkpoint_id: CheckpointId,
         *,
+        target: CheckpointTarget | None = None,
         attempt_id: RollbackAttemptId | None = None,
+        expected_current_fingerprint: CheckpointFingerprint | None = None,
+    ) -> RollbackAttempt: ...
+
+    async def retire_source_rollback_attempt(
+        self,
+        attempt_id: RollbackAttemptId,
+        checkpoint_id: CheckpointId,
+        *,
+        target: SourceWorkspaceCheckpointGrant,
     ) -> RollbackAttempt: ...
 
     async def reconcile(self) -> tuple[RollbackAttempt, ...]: ...
@@ -198,6 +218,7 @@ __all__ = [
     "MAX_CHECKPOINT_UNTRACKED_FILES",
     "CheckpointArtifactStore",
     "CheckpointFailureKind",
+    "CheckpointTarget",
     "WorkspaceCheckpointApplication",
     "WorkspaceCheckpointError",
     "WorkspaceCheckpointStore",

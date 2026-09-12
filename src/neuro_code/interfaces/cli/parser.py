@@ -253,7 +253,7 @@ def build_parser() -> argparse.ArgumentParser:
     sessions_parser.add_argument(
         "session_action",
         nargs="?",
-        choices=("list", "search", "rename", "compact", "artifacts", "recover"),
+        choices=("list", "search", "rename", "compact", "artifacts", "recover", "undo"),
         default="list",
         help="session operation (default: list)",
     )

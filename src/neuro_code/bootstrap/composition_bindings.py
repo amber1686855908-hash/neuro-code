@@ -16,6 +16,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
+from neuro_code.application.checkpoints import TurnWorkspaceCheckpointCoordinator
 from neuro_code.application.execution_policy import ExecutionBudgetPolicy
 from neuro_code.application.memory.compaction import ProviderContextWindow
 from neuro_code.application.memory.compaction_runtime import ContextCompactionRuntimeGate
@@ -258,6 +259,7 @@ class CompositionBindingMixin(CompositionRootMixin):
         if self._closed:
             raise RuntimeError("application composition is closed")
         selected_config = config or self.config
+        effective_reasoning_effort = reasoning_effort or self.settings.reasoning_effort
         if parent_context_relay is not None:
             if not isinstance(parent_context_relay, ParentContextRelay):
                 raise ConfigurationError("parent context relay must be canonical")
@@ -611,6 +613,22 @@ class CompositionBindingMixin(CompositionRootMixin):
         ) = await prepare_provider_and_tools()
         self._lsp_services.add(lsp_service)
         try:
+            workspace_undo: TurnWorkspaceCheckpointCoordinator | None = None
+            if (
+                normal_requirements_enabled
+                and effective_reasoning_effort is not ReasoningEffort.ULTRACODE
+                and client_file_system is None
+                and client_terminal is None
+                and parent_context_relay is None
+                and dag_result_relay is None
+            ):
+                workspace_undo = self.create_workspace_undo_coordinator(
+                    config=selected_config,
+                    enabled=True,
+                    background_tasks=task_scope,
+                    interactive_terminals=interactive_terminals,
+                )
+                await workspace_undo.initialize()
             compaction_persistence = ContextCompactionApplicationService(
                 self.store,
                 provider,
@@ -698,7 +716,7 @@ class CompositionBindingMixin(CompositionRootMixin):
                 session_store=self.store,
                 workspace_mutation_tool=ExactWorkspaceMutationTool(),
                 execution_budget=selected_execution_budget,
-                reasoning_effort=reasoning_effort or self.settings.reasoning_effort,
+                reasoning_effort=effective_reasoning_effort,
                 execution_control_mode=self.settings.execution_control_mode,
                 final_output_gate_enabled=final_output_gate_enabled,
                 normal_requirements_enabled=normal_requirements_enabled,
@@ -710,6 +728,7 @@ class CompositionBindingMixin(CompositionRootMixin):
                 provider_max_output_tokens=provider_max_output_tokens,
                 instruction_provider=instruction_provider,
                 skill_provider=skill_provider,
+                workspace_undo=workspace_undo,
                 parent_relay_message=(
                     Message(
                         Role.USER,

@@ -19,6 +19,7 @@ from neuro_code.domain.execution import (
     TurnRecoveryStatus,
 )
 from neuro_code.domain.session_tasks import SessionTaskStatus
+from neuro_code.domain.workspace_undo import WorkspaceUndoReason
 from neuro_code.interfaces.tui.contracts import SessionController
 from neuro_code.interfaces.tui.controllers.base import TuiAppControllerMixin
 from neuro_code.interfaces.tui.screens import (
@@ -149,6 +150,12 @@ class CommandControllerMixin(TuiAppControllerMixin):
             return
         if command == "recover":
             await self._dispatch_recovery_command(arguments)
+            return
+        if command == "undo":
+            if arguments.strip():
+                self._write_ui_entry("error", "command.arguments", command=command)
+                return
+            await self._undo_workspace()
             return
         if command in {"rename", "title"}:
             await self._rename_session(arguments)
@@ -357,6 +364,30 @@ class CommandControllerMixin(TuiAppControllerMixin):
             "context.compaction_result",
             status=result.status.value,
         )
+
+    async def _undo_workspace(self) -> None:
+        if self._turn_worker is not None and self._turn_worker.is_running:
+            self._write_ui_entry("error", "turn.running")
+            return
+        try:
+            result = await self._runner.undo_workspace()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            self._write_entry("error", f"{type(error).__name__}: {error}")
+            return
+        if result.restored:
+            self._write_ui_entry("status", "workspace_undo.restored")
+        elif result.reason is WorkspaceUndoReason.LIVE_MUTATOR:
+            self._write_ui_entry("error", "workspace_undo.live")
+        elif result.reason is WorkspaceUndoReason.NO_CHECKPOINT:
+            self._write_ui_entry("status", "workspace_undo.none")
+        else:
+            self._write_ui_entry(
+                "error",
+                "workspace_undo.unavailable",
+                reason=result.reason.value if result.reason is not None else "unknown",
+            )
 
     async def _run_read_only_subagent(self, raw_prompt: str) -> None:
         """Start one explicit, bounded read-only child without parent transcript reuse.

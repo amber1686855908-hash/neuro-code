@@ -42,6 +42,7 @@ from neuro_code.application.tools.service import (
     ReadSessionToolOutputArtifactRequest,
     SessionToolOutputArtifactApplicationService,
 )
+from neuro_code.domain.workspace_undo import WorkspaceUndoReason, WorkspaceUndoResult
 from neuro_code.interfaces.cli.serialization import (
     serialize_execution_record,
     serialize_session_search_page,
@@ -67,6 +68,8 @@ class SessionCliBinding(Protocol):
 
     @property
     def runner(self) -> SessionCliRunner: ...
+
+    async def undo_workspace(self) -> WorkspaceUndoResult: ...
 
 
 class SessionCliApplication(Protocol):
@@ -106,6 +109,42 @@ async def run_sessions_command(args: argparse.Namespace, services: SessionCliSer
     store = await services.create_session_store(config)
     session_lifecycle = SessionLifecycleService(store)
     session_catalog = SessionCatalogApplicationService(store)
+    if args.session_action == "undo":
+        if args.query is None or not args.query.strip():
+            raise ConfigurationError("sessions undo requires a session ID")
+        if (
+            args.title is not None
+            or args.action != "inspect"
+            or args.limit != 50
+            or args.offset != 0
+            or args.include_content
+            or args.max_bytes != MAX_TOOL_OUTPUT_ARTIFACT_READ_BYTES
+            or args.prune
+            or args.reason != "explicit_user_resolution"
+        ):
+            raise ConfigurationError("sessions undo accepts only a session ID")
+        application = await services.open_application(
+            ApplicationSettings(cwd=args.cwd, resume_id=args.query)
+        )
+        try:
+            await application.config_for_session_resume(args.query)
+            binding = await application.create_binding(resume_id=args.query)
+            result = await binding.undo_workspace()
+            payload = result.to_dict()
+            if args.json:
+                print(json.dumps(payload, ensure_ascii=False))
+            elif result.restored:
+                print("Workspace restored to the state before the latest turn.")
+            elif result.reason is WorkspaceUndoReason.LIVE_MUTATOR:
+                print("Workspace undo is unavailable while a live mutator is running.")
+            elif result.reason is WorkspaceUndoReason.NO_CHECKPOINT:
+                print("No workspace undo is available.")
+            else:
+                reason = result.reason.value if result.reason is not None else "unknown"
+                print(f"Workspace undo is unavailable: {reason}.")
+            return 0
+        finally:
+            await asyncio.shield(application.close())
     if args.session_action == "recover":
         if args.query is None or not args.query.strip():
             raise ConfigurationError("sessions recover requires a session ID")

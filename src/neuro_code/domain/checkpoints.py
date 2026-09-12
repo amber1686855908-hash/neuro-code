@@ -16,7 +16,11 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
 
-from neuro_code.domain.worktree import WorktreeHandle, WorktreeId, WorktreeRepositoryIdentity
+from neuro_code.domain.worktree import (
+    WorktreeHandle,
+    WorktreeId,
+    WorktreeRepositoryIdentity,
+)
 
 MAX_CHECKPOINT_ID_BYTES = 128
 MAX_ROLLBACK_ATTEMPT_ID_BYTES = 128
@@ -27,6 +31,7 @@ MAX_CHECKPOINT_INDEX_BYTES = 64 * 1024 * 1024
 _CHECKPOINT_ID_PATTERN = re.compile(r"^cp-[a-z0-9][a-z0-9_-]{0,124}$")
 _ROLLBACK_ATTEMPT_ID_PATTERN = re.compile(r"^rb-[a-z0-9][a-z0-9_-]{0,124}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40,64}$")
 
 
 def _bounded_text(value: str, *, name: str, limit: int) -> str:
@@ -255,8 +260,101 @@ class WorkspaceProjection:
         object.__setattr__(self, "entries", entries)
 
 
+@dataclass(frozen=True, slots=True)
+class SourceWorkspaceCheckpointGrant:
+    """A re-proved capability for the user's current Git source checkout.
+
+    A source checkout is not a managed worktree and must never be represented
+    as one.  Bootstrap obtains this grant through the Git authority; the
+    checkpoint service re-proves its repository, path, HEAD, and branch before
+    every capture or rollback.  The stable ``src-`` identifier is only an
+    opaque association key and is not path authority.
+
+    表示用户当前 Git source checkout 的重新证明能力. source checkout 不是受管
+    worktree,绝不能伪装成受管 worktree. grant 只在 Git authority 证明后产生,
+    checkpoint service 在每次捕获或回滚前重新证明仓库、路径、HEAD 和分支.
+    """
+
+    worktree_id: WorktreeId
+    repository: WorktreeRepositoryIdentity
+    path: Path
+    head_sha: str
+    branch: str | None
+    detached: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.worktree_id, WorktreeId) or not self.worktree_id.value.startswith(
+            "src-"
+        ):
+            raise TypeError("source checkpoint grant must carry a source workspace id")
+        if not isinstance(self.repository, WorktreeRepositoryIdentity):
+            raise TypeError("source checkpoint grant repository must be canonical")
+        object.__setattr__(self, "path", _canonical_path(self.path, name="source workspace path"))
+        if self.path != self.repository.source_worktree:
+            raise ValueError("source checkpoint grant path must be the repository source checkout")
+        normalized_head = _bounded_text(self.head_sha, name="source workspace HEAD", limit=128)
+        if _COMMIT_SHA_PATTERN.fullmatch(normalized_head.casefold()) is None:
+            raise ValueError("source workspace HEAD must be a hexadecimal Git commit SHA")
+        object.__setattr__(self, "head_sha", normalized_head.casefold())
+        if self.branch is not None:
+            _bounded_text(self.branch, name="source workspace branch", limit=512)
+        if not isinstance(self.detached, bool):
+            raise TypeError("source workspace detached flag must be boolean")
+        if self.detached and self.branch is not None:
+            raise ValueError("detached source workspace cannot expose a branch")
+        if not self.detached and self.branch is None:
+            raise ValueError("attached source workspace must expose a branch")
+
+    @classmethod
+    def issue(
+        cls,
+        repository: WorktreeRepositoryIdentity,
+        *,
+        path: Path,
+        head_sha: str,
+        branch: str | None,
+        detached: bool,
+    ) -> SourceWorkspaceCheckpointGrant:
+        """Issue a stable source target only after a Git boundary check."""
+
+        canonical_path = _canonical_path(path, name="source workspace path")
+        source_key = hashlib.sha256(
+            f"{repository.repository_id}\0{canonical_path}".encode()
+        ).hexdigest()[:40]
+        return cls(
+            worktree_id=WorktreeId(f"src-{source_key}"),
+            repository=repository,
+            path=canonical_path,
+            head_sha=head_sha,
+            branch=branch,
+            detached=detached,
+        )
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        checkpoint: WorkspaceCheckpoint,
+    ) -> SourceWorkspaceCheckpointGrant:
+        """Reconstruct a typed source candidate from durable checkpoint facts.
+
+        The application service still performs the live Git proof; this
+        method does not turn persisted path text into authority by itself.
+        """
+
+        return cls.issue(
+            checkpoint.repository,
+            path=checkpoint.canonical_path,
+            head_sha=checkpoint.head_sha,
+            branch=checkpoint.branch,
+            detached=checkpoint.detached,
+        )
+
+
+CheckpointTarget = WorktreeHandle | SourceWorkspaceCheckpointGrant
+
+
 def workspace_projection_payload(
-    handle: WorktreeHandle,
+    handle: CheckpointTarget,
     projection: WorkspaceProjection,
     *,
     include_path: bool = True,
@@ -309,7 +407,7 @@ def workspace_projection_payload(
 
 
 def workspace_projection_fingerprint(
-    handle: WorktreeHandle,
+    handle: CheckpointTarget,
     projection: WorkspaceProjection,
 ) -> CheckpointFingerprint:
     """Hash repository/worktree identity plus the complete in-scope projection."""
@@ -325,14 +423,14 @@ def workspace_projection_fingerprint(
 
 @dataclass(frozen=True, slots=True)
 class CheckpointCreateRequest:
-    """Capture request bound to a managed handle, never a raw user path."""
+    """Capture request bound to a typed managed or source workspace grant."""
 
-    worktree: WorktreeHandle
+    worktree: CheckpointTarget
     checkpoint_id: CheckpointId | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.worktree, WorktreeHandle):
-            raise TypeError("checkpoint request must carry a managed worktree handle")
+        if not isinstance(self.worktree, (WorktreeHandle, SourceWorkspaceCheckpointGrant)):
+            raise TypeError("checkpoint request must carry a canonical workspace grant")
         if self.checkpoint_id is not None and not isinstance(self.checkpoint_id, CheckpointId):
             raise TypeError("checkpoint id must be canonical")
 
@@ -461,9 +559,11 @@ __all__ = [
     "CheckpointFingerprint",
     "CheckpointId",
     "CheckpointState",
+    "CheckpointTarget",
     "RollbackAttempt",
     "RollbackAttemptId",
     "RollbackState",
+    "SourceWorkspaceCheckpointGrant",
     "WorkspaceCheckpoint",
     "WorkspaceFileEntry",
     "WorkspaceFileKind",

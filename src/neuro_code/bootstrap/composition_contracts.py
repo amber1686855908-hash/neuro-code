@@ -14,15 +14,22 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from neuro_code.application.checkpoints import WorkspaceCheckpointApplicationService
+    from neuro_code.application.checkpoints import (
+        TurnWorkspaceCheckpointCoordinator,
+        WorkspaceCheckpointApplicationService,
+    )
     from neuro_code.application.ports.approval import PermissionApprover
-    from neuro_code.application.ports.background_tasks import BackgroundTaskSupervisor
+    from neuro_code.application.ports.background_tasks import (
+        BackgroundTaskManager,
+        BackgroundTaskSupervisor,
+    )
     from neuro_code.application.ports.client_filesystem import ClientFileSystem
     from neuro_code.application.ports.client_terminal import ClientTerminal
     from neuro_code.application.ports.configuration import AppConfig
     from neuro_code.application.ports.instructions import InstructionDiscovery
     from neuro_code.application.ports.skills import SkillDiscovery
     from neuro_code.application.ports.storage import SessionStore
+    from neuro_code.application.ports.terminal import InteractiveTerminalManager
     from neuro_code.application.ports.tools import Tool
     from neuro_code.application.ports.user_interaction import UserInteractionPort
     from neuro_code.application.sessions import SessionApplicationService
@@ -109,7 +116,18 @@ class CompositionRootMixin:
 
         def create_workspace_checkpoint_service(
             self,
+            *,
+            config: AppConfig | None = None,
         ) -> WorkspaceCheckpointApplicationService: ...
+
+        def create_workspace_undo_coordinator(
+            self,
+            *,
+            config: AppConfig | None = None,
+            enabled: bool = True,
+            background_tasks: BackgroundTaskManager | None = None,
+            interactive_terminals: InteractiveTerminalManager | None = None,
+        ) -> TurnWorkspaceCheckpointCoordinator: ...
 
         def create_result_adoption_service(
             self,

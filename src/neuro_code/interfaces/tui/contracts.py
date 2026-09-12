@@ -30,6 +30,7 @@ from neuro_code.domain.conversation.reasoning import ReasoningEffort
 from neuro_code.domain.execution import TurnCancellationPolicy
 from neuro_code.domain.plans import PlanComment, SessionPlan
 from neuro_code.domain.session_tasks import SessionTask
+from neuro_code.domain.workspace_undo import WorkspaceUndoResult
 
 
 class ConversationRunner(Protocol):
@@ -57,6 +58,8 @@ class ConversationRunner(Protocol):
     async def save_background_wake_state(self, state: BackgroundWakeState) -> None: ...
 
     async def compact_now(self) -> ContextCompactionCommandResult: ...
+
+    async def undo_workspace(self) -> WorkspaceUndoResult: ...
 
 
 class ApprovalController(Protocol):

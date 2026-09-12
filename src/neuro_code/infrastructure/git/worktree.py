@@ -697,6 +697,41 @@ class LocalGitWorktreeAdapter:
         )
         return result.stdout
 
+    async def ignored_paths(self, path: Path, paths: tuple[str, ...], /) -> tuple[str, ...]:
+        """Return ignored *untracked* targets from one prepared path set.
+
+        Tracked files remain part of the checkpoint projection even when a
+        repository-wide ignore rule also matches their name.  Git is the
+        canonical owner of that distinction; callers never parse ignore files
+        themselves.
+        """
+
+        if not isinstance(paths, tuple) or any(
+            not isinstance(value, str) or not value or "\x00" in value for value in paths
+        ):
+            raise WorktreeError(
+                "Git ignored-path query received invalid paths",
+                kind=WorktreeFailureKind.PROTOCOL,
+            )
+        if not paths:
+            return ()
+        encoded_paths = tuple(os.fsencode(value) for value in paths)
+        ignored_result = await self._run_git(
+            path,
+            ("check-ignore", "-z", "--no-index", "--stdin"),
+            stdin=b"".join(value + b"\0" for value in encoded_paths),
+            accepted_returncodes=frozenset({1}),
+            failure_kind=WorktreeFailureKind.PROTOCOL,
+        )
+        ignored = {os.fsdecode(value) for value in ignored_result.stdout.split(b"\0") if value}
+        tracked_result = await self._run_git(
+            path,
+            ("ls-files", "-z", "--full-name", "--", *paths),
+            failure_kind=WorktreeFailureKind.PROTOCOL,
+        )
+        tracked = {os.fsdecode(value) for value in tracked_result.stdout.split(b"\0") if value}
+        return tuple(value for value in paths if value in ignored and value not in tracked)
+
     async def status_porcelain(self, path: Path, /) -> bytes:
         result = await self._run_git(
             path,

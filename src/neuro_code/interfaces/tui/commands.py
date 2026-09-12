@@ -47,6 +47,7 @@ _COMMANDS = (
     _Command("queue-plan"),
     _Command("sessions", "QUERY"),
     _Command("resume", "SESSION_ID"),
+    _Command("undo"),
     _Command("rename", "TITLE"),
     _Command("title", "TITLE"),
     _Command("tasks"),

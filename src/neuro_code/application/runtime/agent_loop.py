@@ -134,6 +134,7 @@ from neuro_code.shared.redaction import redact_sensitive_arguments, redact_sensi
 LOGGER = logging.getLogger(__name__)
 
 EventSink = Callable[[AgentEvent], Awaitable[None] | None]
+WorkspaceUndoSealer = Callable[[str | None, str | None], Awaitable[None]]
 
 
 def _redacted_persisted_tool_calls(
@@ -228,6 +229,7 @@ class AgentLoopRunner:
         "_tool_executor",
         "_tool_scheduler",
         "_tools",
+        "_workspace_undo_sealer",
     )
 
     def __init__(
@@ -250,6 +252,7 @@ class AgentLoopRunner:
         provider_context_window: ProviderContextWindow | None,
         provider_max_output_tokens: int | None = None,
         final_output_gate_enabled: bool = True,
+        workspace_undo_sealer: WorkspaceUndoSealer | None = None,
     ) -> None:
         self._provider = provider
         self._tools = tools
@@ -294,6 +297,7 @@ class AgentLoopRunner:
         self._provider_context_window = provider_context_window
         self._active_provider_window = provider_context_window
         self._provider_max_output_tokens = provider_max_output_tokens
+        self._workspace_undo_sealer = workspace_undo_sealer
 
     @property
     def provider_context_window(self) -> ProviderContextWindow | None:
@@ -530,10 +534,17 @@ class AgentLoopRunner:
             session_task=session_task,
             pristine_cancel_eligible=pristine_cancel_eligible,
             turn_id=turn_id,
+            workspace_undo_sealer=self._workspace_undo_sealer,
         )
         emit = recorder.emit
         record_turn_failure = recorder.record_turn_failure
         finalize_turn_completion = recorder.finalize_turn_completion
+
+        async def persist_workspace_undo_event(
+            kind: AgentEventKind,
+            data: dict[str, object],
+        ) -> None:
+            await recorder.persist_internal_event(kind, data)
 
         supervisor: AgentExecutionSupervisor | None = None
         # Keep the binding-lifetime request budget separate from the currently
@@ -960,6 +971,8 @@ class AgentLoopRunner:
                 emit,
                 session_id,
                 interrupted_observation_sink=verification_tracker.observe,
+                turn_id=turn_id,
+                workspace_undo_event_sink=persist_workspace_undo_event,
                 workspace_change_sink=(
                     record_workspace_evidence
                     if self._execution_control_mode is ExecutionControlMode.FINALIZE_TERMINAL
@@ -1768,6 +1781,8 @@ class AgentLoopRunner:
                             target_context_items,
                             emit,
                             session_id,
+                            turn_id=turn_id,
+                            workspace_undo_event_sink=persist_workspace_undo_event,
                             interrupted_observation_sink=record_interrupted_tool_outcome,
                             workspace_change_sink=(
                                 record_workspace_evidence

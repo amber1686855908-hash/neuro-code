@@ -118,7 +118,8 @@ infrastructure. See [ADR 0145](adr/0145-acp-prompt-content-boundary.md),
 [ADR 0150](adr/0150-acp-session-runtime-ownership-boundary.md), and
 [ADR 0151](adr/0151-acp-transport-boundary.md),
 [ADR 0153](adr/0153-architecture-completion.md), and
-[ADR 0154](adr/0154-normal-agent-verification-acquisition-boundary.md).
+[ADR 0154](adr/0154-normal-agent-verification-acquisition-boundary.md), and
+[ADR 0158](adr/0158-turn-workspace-checkpoint-undo.md).
 
 Agent harness behavior currently lives in the explicit canonical submodules of
 `neuro_code.application.runtime`: `background_task_reminders`, `agent`,
@@ -263,7 +264,8 @@ runtime event stream.
 
 See [ADR 0049](adr/0049-progressive-architecture-boundaries.md),
 [ADR 0153](adr/0153-architecture-completion.md), and
-[ADR 0154](adr/0154-normal-agent-verification-acquisition-boundary.md) for the
+[ADR 0154](adr/0154-normal-agent-verification-acquisition-boundary.md), and
+[ADR 0158](adr/0158-turn-workspace-checkpoint-undo.md) for the
 complete dependency rules, compatibility migration policy, and allowlist
 discipline.
 
@@ -3377,3 +3379,35 @@ files remain untouched. Partial or uncertain operations are durable
 `INDETERMINATE` and can be reconciled after process death; READY checkpoint
 targets are immutable and CAS-protected. See [ADR
 0130](adr/0130-managed-workspace-checkpoint-rollback.md).
+
+## B1 turn workspace checkpoint and undo
+
+B1 adds a user-controlled, latest-only undo projection for the normal source
+checkout. It does not turn that checkout into a managed worktree: bootstrap
+obtains a typed `SourceWorkspaceCheckpointGrant` after proving the canonical
+Git repository identity, source path, current HEAD, and branch/detached state.
+The checkpoint service re-proves that grant before every capture and rollback,
+while the existing managed-worktree proof remains unchanged.
+
+The protected projection is exactly the existing checkpoint projection: tracked
+and non-ignored untracked file bytes, the Git index/staged state, binary data,
+supported symlinks, and supported modes. Ignored files, external side effects,
+nested repositories, submodules, special files, empty directories, and
+arbitrary external-process changes remain outside the guarantee. A normal
+mutating tool creates one durable checkpoint after permission approval and
+before its first eligible mutation; later eligible mutations in that turn
+reuse it. Read-only and denied operations create no checkpoint. If a target is
+unbounded, ignored, unsupported, or cannot be proven, the coordinator durably
+records `UNAVAILABLE` before allowing that mutation; failure to persist the
+invalidation fails closed.
+
+The session event `WORKSPACE_UNDO_STATE` stores only the bounded latest
+association and its `AVAILABLE`, `UNAVAILABLE`, or `ROLLED_BACK` state. A later
+unsafe turn supersedes an older guarantee, while restart can reuse an
+`AVAILABLE` checkpoint only after the same proof succeeds. `/undo` and
+`sessions undo <SESSION_ID>` are idle-only user actions; they never invoke the
+model or kill live terminals/background mutators. Rollback consumes the latest
+association, verifies the exact projection, and hands one external workspace
+mutation fact to the existing verification tracker. It does not rewrite turn
+history, create a second generation owner, or promise whole-filesystem undo.
+See [ADR 0158](adr/0158-turn-workspace-checkpoint-undo.md).

@@ -115,6 +115,10 @@ from neuro_code.domain.plans import PlanComment, PlanStep, PlanStepStatus, Sessi
 from neuro_code.domain.sandbox import SandboxProfile
 from neuro_code.domain.session_tasks import SessionTask, SessionTaskKind, SessionTaskStatus
 from neuro_code.domain.sessions import SessionSummary
+from neuro_code.domain.workspace_undo import (
+    WorkspaceUndoResult,
+    WorkspaceUndoState,
+)
 from neuro_code.infrastructure.providers.provider_settings import JsonProviderSettingsStore
 from neuro_code.interfaces.tui import recoverable_terminal_status
 from neuro_code.interfaces.tui.app import NeuroCodeApp
@@ -274,6 +278,17 @@ class TuiConversation:
             events,
             1,
         )
+
+
+class UndoTuiConversation(TuiConversation):
+    def __init__(self, result: WorkspaceUndoResult) -> None:
+        super().__init__()
+        self.undo_result = result
+        self.undo_calls = 0
+
+    async def undo_workspace(self) -> WorkspaceUndoResult:
+        self.undo_calls += 1
+        return self.undo_result
 
     async def run_background_wake(self, *, sink: EventSink | None = None) -> AgentRunResult:
         return await self.run("background wake", sink=sink)
@@ -4988,6 +5003,27 @@ class NeuroCodeAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual([entry.text for entry in app.entries], ["Transcript cleared."])
             self.assertEqual(runner.prompts, [])
+
+    async def test_undo_slash_command_projects_a_bounded_local_result(self) -> None:
+        runner = UndoTuiConversation(
+            WorkspaceUndoResult(WorkspaceUndoState.ROLLED_BACK, restored=True)
+        )
+        app = NeuroCodeApp(
+            runner,
+            provider_name="fixture",
+            model_name="fixture-model",
+            cwd=Path("/workspace"),
+        )
+
+        async with app.run_test(size=(100, 30)) as pilot:
+            prompt = app.query_one("#prompt", PromptInput)
+            prompt.value = "/undo"
+            await pilot.press("enter")
+            await pilot.pause()
+
+        self.assertEqual(runner.undo_calls, 1)
+        self.assertEqual(runner.prompts, [])
+        self.assertIn("Workspace restored", app.entries[-1].text)
 
     async def test_subagent_command_uses_safe_projection_without_parent_transcript_details(
         self,
