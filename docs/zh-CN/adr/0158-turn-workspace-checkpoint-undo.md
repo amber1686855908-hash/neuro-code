@@ -21,8 +21,8 @@ capture 和 rollback 前重新证明该 grant；managed worktree handle 继续�
 checkpoint。同一回合后续符合条件的 mutation 复用它；Read-only 和 denied operation 不创建 checkpoint。
 Unbounded、ignored、unsupported 或无法证明的 mutation 必须先追加 durable `UNAVAILABLE` association；若
 写入失败，则拒绝该 mutation。Association 是有界的 `WORKSPACE_UNDO_STATE` session event，只保留
-`AVAILABLE`、`UNAVAILABLE` 和 `ROLLED_BACK` 三种最新状态。不增加 checkpoint stack，也不在用户界面暴露
-checkpoint ID。
+`AVAILABLE`、`ROLLING_BACK`、`UNAVAILABLE` 和 `ROLLED_BACK` 四种最新状态。`ROLLING_BACK` 是内部 durable
+transition，绝不会被作为用户可用的 checkpoint 展示。不增加 checkpoint stack，也不在用户界面暴露 checkpoint ID。
 
 受保护的 image 使用现有 projection：tracked 与 non-ignored untracked 文件内容、staged/index 字节、binary
 file、平台支持的 symlink 和 mode。Ignored file、工作区外副作用、nested repository、submodule、special
@@ -34,10 +34,18 @@ turn recovery，也不创建第二个 verification generation owner。
 ## Recovery 与兼容性
 
 进程重启后，`AVAILABLE` association 只有在 source grant、Git identity、HEAD 和 projection safety checks
-均精确通过后才有资格使用；`UNAVAILABLE` 与 `ROLLED_BACK` 保持终态。Restore 开始前会先持久化 rollback
-guard，因此进程退出或 association 写入失败都不能再次执行 destructive rollback。`MODEL_OUTPUT_STARTED`、
-turn recovery 与 committed assistant history 仍是彼此独立的事实。既有 managed checkpoint API、provider/tool
-contract、SQLite session schema 和 ACP protocol 不变；不增加 model-visible undo tool。
+均精确通过后才有资格使用。Rollback 开始前，association 会记录 expected post-turn projection fingerprint
+以及精确的 rollback-attempt identity。Idle claim 与 `ROLLING_BACK` transition 在 durable 层原子完成，因此新
+回合不能与 destructive operation 竞争。`UNAVAILABLE` 与 `ROLLED_BACK` 保持终态。
+
+如果 source rollback 中断，并且当前 projection 既不匹配 expected post-turn fingerprint，也不匹配 checkpoint
+source，coordinator 不会 restore 或猜测。它要求 checkpoint service 重新证明类型化 source grant、确认没有
+live owner，并把精确的 `STARTED` 或 `INDETERMINATE` attempt 通过 compare-and-swap 转换到既有的非活动
+`FAILED` 状态。Retirement 只记录被放弃的 attempt 供审计，不表示工作区已经恢复。Live owner 或无法证明的
+source identity 会阻止 retirement。对于未知 source state，不执行自动 destructive reconciliation。
+
+`MODEL_OUTPUT_STARTED`、turn recovery 与 committed assistant history 仍是彼此独立的事实。既有 managed checkpoint
+API、provider/tool contract、SQLite session schema 和 ACP protocol 不变；不增加 model-visible undo tool。
 
 ## Validation
 

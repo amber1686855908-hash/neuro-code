@@ -18,11 +18,17 @@ from unittest.mock import patch
 from neuro_code.application.checkpoints import WorkspaceCheckpointApplicationService
 from neuro_code.application.checkpoints import service as checkpoint_service
 from neuro_code.application.checkpoints.service import _owner_is_alive
+from neuro_code.application.checkpoints.turn_undo import TurnWorkspaceCheckpointCoordinator
 from neuro_code.application.ports.checkpoints import (
     MAX_CHECKPOINT_MANIFEST_BYTES,
     MAX_CHECKPOINT_SINGLE_FILE_BYTES,
     CheckpointFailureKind,
     WorkspaceCheckpointError,
+)
+from neuro_code.application.ports.workspace import (
+    FilesystemAccessOperation,
+    FilesystemAccessPlan,
+    FilesystemAccessTarget,
 )
 from neuro_code.application.ports.worktree import (
     MINIMUM_GIT_VERSION,
@@ -46,6 +52,7 @@ from neuro_code.domain.checkpoints import (
     WorkspaceProjection,
     workspace_projection_fingerprint,
 )
+from neuro_code.domain.workspace_undo import WorkspaceUndoReason, WorkspaceUndoState
 from neuro_code.domain.worktree import (
     WorktreeCreateRequest,
     WorktreeId,
@@ -57,6 +64,7 @@ from neuro_code.infrastructure.persistence.checkpoint_artifacts import (
     LocalCheckpointArtifactStore,
 )
 from neuro_code.infrastructure.persistence.managed_worktrees import SqliteManagedWorktreeStore
+from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionStore
 from neuro_code.infrastructure.persistence.workspace_checkpoints import (
     SqliteWorkspaceCheckpointStore,
 )
@@ -401,6 +409,23 @@ def _source_checkout_evidence(fixture: _CheckpointFixture) -> tuple[object, ...]
     )
 
 
+def _source_mutation_plan(root: Path) -> FilesystemAccessPlan:
+    return FilesystemAccessPlan(
+        "update_file",
+        (
+            FilesystemAccessTarget(
+                requested_path="tracked.txt",
+                canonical_path=root / "tracked.txt",
+                owning_workspace_root=root,
+                policy_path="tracked.txt",
+                operation=FilesystemAccessOperation.UPDATE,
+                exists=True,
+                is_primary_workspace=True,
+            ),
+        ),
+    )
+
+
 def _prepare_multi_difference_checkpoint(fixture: _CheckpointFixture) -> WorkspaceCheckpoint:
     target = fixture.target
     (target / ".gitignore").write_bytes(b"ignored.tmp\n")
@@ -585,6 +610,94 @@ class WorkspaceCheckpointIntegrationTests(unittest.TestCase):
         result = _run(fixture.checkpoints.rollback(checkpoint.checkpoint_id, target=grant))
         self.assertIs(result.state, RollbackState.COMPLETED)
         self.assertEqual((fixture.repository / "tracked.txt").read_bytes(), b"base\n")
+
+    def test_interrupted_source_rollback_retirement_unblocks_next_real_undo(self) -> None:
+        fixture = _CheckpointFixture()
+        self.addCleanup(fixture.close)
+        session_store = SqliteSessionStore(fixture.state / "sessions.db")
+        _run(session_store.initialize())
+        session_id = _run(
+            session_store.create_session(str(fixture.repository), "provider", "model")
+        )
+        coordinator = TurnWorkspaceCheckpointCoordinator(
+            checkpoint_service=fixture.checkpoints,
+            store=session_store,
+            source_workspace=fixture.repository,
+        )
+        _run(coordinator.initialize())
+        plan = _source_mutation_plan(fixture.repository)
+        _run(
+            coordinator.prepare(
+                session_id=session_id,
+                turn_id="turn-source-a",
+                plan=plan,
+                client_file_system=None,
+                client_terminal=None,
+            )
+        )
+        _run(coordinator.seal_turn(session_id, "turn-source-a"))
+        available = _run(coordinator._ledger.latest(session_id))
+        self.assertIsNotNone(available)
+        assert available is not None
+        self.assertIsNotNone(available.checkpoint_id)
+        checkpoint_id = available.checkpoint_id
+        assert checkpoint_id is not None
+        checkpoint = _run(fixture.checkpoint_store.get(checkpoint_id))
+        self.assertIsNotNone(checkpoint)
+        assert checkpoint is not None
+        grant = SourceWorkspaceCheckpointGrant.from_checkpoint(checkpoint)
+        attempt = RollbackAttempt(
+            attempt_id=RollbackAttemptId("rb-source-restart"),
+            checkpoint_id=checkpoint_id,
+            worktree_id=grant.worktree_id,
+            state=RollbackState.STARTED,
+            started_at=datetime.now(UTC),
+            completed_at=None,
+            expected_fingerprint=checkpoint.source_fingerprint,
+            owner_pid=None,
+            owner_token="dead-source-owner",
+        )
+        _run(fixture.checkpoint_store.start_attempt(attempt))
+        rolling = replace(
+            available,
+            state=WorkspaceUndoState.ROLLING_BACK,
+            rollback_attempt_id=attempt.attempt_id,
+        )
+        self.assertTrue(_run(coordinator._ledger.claim(available, rolling)))
+
+        (fixture.repository / "tracked.txt").write_bytes(b"unknown-source-state\n")
+        preserved = _source_checkout_evidence(fixture)
+        restarted = TurnWorkspaceCheckpointCoordinator(
+            checkpoint_service=fixture.checkpoints,
+            store=session_store,
+            source_workspace=fixture.repository,
+        )
+        _run(restarted.initialize())
+        result = _run(restarted.undo(session_id))
+        self.assertIs(result.reason, WorkspaceUndoReason.ROLLBACK_INDETERMINATE)
+        self.assertEqual(_source_checkout_evidence(fixture), preserved)
+        self.assertIsNone(_run(fixture.checkpoint_store.active_attempt(grant.worktree_id.value)))
+        latest = _run(restarted._ledger.latest(session_id))
+        self.assertIsNotNone(latest)
+        assert latest is not None
+        self.assertIs(latest.state, WorkspaceUndoState.UNAVAILABLE)
+
+        _run(
+            restarted.prepare(
+                session_id=session_id,
+                turn_id="turn-source-b",
+                plan=plan,
+                client_file_system=None,
+                client_terminal=None,
+            )
+        )
+        (fixture.repository / "tracked.txt").write_bytes(b"after-source-b\n")
+        _run(restarted.seal_turn(session_id, "turn-source-b"))
+        restored = _run(restarted.undo(session_id))
+        self.assertIs(restored.state, WorkspaceUndoState.ROLLED_BACK)
+        self.assertEqual(
+            (fixture.repository / "tracked.txt").read_bytes(), b"unknown-source-state\n"
+        )
 
     def test_repeated_rollback_is_a_verified_no_op(self) -> None:
         fixture = _CheckpointFixture()
@@ -2057,6 +2170,225 @@ class WorkspaceCheckpointServiceBoundaryTests(unittest.TestCase):
                 )
             )
         self.assertEqual(raised.exception.kind, CheckpointFailureKind.CONCURRENT_MODIFICATION)
+
+    def test_source_attempt_retirement_preserves_workspace_and_unblocks_next_checkpoint(
+        self,
+    ) -> None:
+        fixture = _CheckpointFixture()
+        self.addCleanup(fixture.close)
+        grant = _run(fixture.checkpoints.authorize_source_workspace(fixture.repository))
+        checkpoint_a = _run(
+            fixture.checkpoints.create(CheckpointCreateRequest(grant, CheckpointId("cp-retire-a")))
+        )
+        (fixture.repository / "tracked.txt").write_bytes(b"unknown-after-interruption\n")
+        preserved = _source_checkout_evidence(fixture)
+        attempt = RollbackAttempt(
+            attempt_id=RollbackAttemptId("rb-retire-a"),
+            checkpoint_id=checkpoint_a.checkpoint_id,
+            worktree_id=grant.worktree_id,
+            state=RollbackState.STARTED,
+            started_at=datetime.now(UTC),
+            completed_at=None,
+            expected_fingerprint=checkpoint_a.source_fingerprint,
+            owner_pid=None,
+            owner_token="interrupted-owner",
+        )
+        _run(fixture.checkpoint_store.start_attempt(attempt))
+
+        retired = _run(
+            fixture.checkpoints.retire_source_rollback_attempt(
+                attempt.attempt_id,
+                checkpoint_a.checkpoint_id,
+                target=grant,
+            )
+        )
+        self.assertIs(retired.state, RollbackState.FAILED)
+        self.assertIsNotNone(retired.completed_at)
+        self.assertIsNone(retired.observed_fingerprint)
+        self.assertEqual(_source_checkout_evidence(fixture), preserved)
+        self.assertIsNone(_run(fixture.checkpoint_store.active_attempt(grant.worktree_id.value)))
+        self.assertEqual(
+            _run(
+                fixture.checkpoints.retire_source_rollback_attempt(
+                    attempt.attempt_id,
+                    checkpoint_a.checkpoint_id,
+                    target=grant,
+                )
+            ),
+            retired,
+        )
+
+        checkpoint_b = _run(
+            fixture.checkpoints.create(CheckpointCreateRequest(grant, CheckpointId("cp-retire-b")))
+        )
+        (fixture.repository / "tracked.txt").write_bytes(b"after-checkpoint-b\n")
+        restored = _run(fixture.checkpoints.rollback(checkpoint_b.checkpoint_id, target=grant))
+        self.assertIs(restored.state, RollbackState.COMPLETED)
+        self.assertEqual(
+            (fixture.repository / "tracked.txt").read_bytes(), b"unknown-after-interruption\n"
+        )
+
+    def test_source_indeterminate_attempt_can_be_retired_without_restore(self) -> None:
+        fixture = _CheckpointFixture()
+        self.addCleanup(fixture.close)
+        grant = _run(fixture.checkpoints.authorize_source_workspace(fixture.repository))
+        checkpoint = _run(
+            fixture.checkpoints.create(
+                CheckpointCreateRequest(grant, CheckpointId("cp-retire-indeterminate"))
+            )
+        )
+        (fixture.repository / "tracked.txt").write_bytes(b"preserve-indeterminate\n")
+        attempt = RollbackAttempt(
+            attempt_id=RollbackAttemptId("rb-retire-indeterminate"),
+            checkpoint_id=checkpoint.checkpoint_id,
+            worktree_id=grant.worktree_id,
+            state=RollbackState.STARTED,
+            started_at=datetime.now(UTC),
+            completed_at=None,
+            expected_fingerprint=checkpoint.source_fingerprint,
+            owner_pid=None,
+            owner_token="interrupted-owner",
+        )
+        started = _run(fixture.checkpoint_store.start_attempt(attempt))
+        indeterminate = _run(
+            fixture.checkpoint_store.compare_and_transition_attempt(
+                replace(started, state=RollbackState.INDETERMINATE),
+                expected_version=started.version,
+                expected_state=RollbackState.STARTED,
+            )
+        )
+        preserved = _source_checkout_evidence(fixture)
+
+        retired = _run(
+            fixture.checkpoints.retire_source_rollback_attempt(
+                indeterminate.attempt_id,
+                checkpoint.checkpoint_id,
+                target=grant,
+            )
+        )
+        self.assertIs(retired.state, RollbackState.FAILED)
+        self.assertEqual(_source_checkout_evidence(fixture), preserved)
+        self.assertIsNone(_run(fixture.checkpoint_store.active_attempt(grant.worktree_id.value)))
+
+    def test_source_attempt_retirement_refuses_live_owner_and_wrong_identity(self) -> None:
+        fixture = _CheckpointFixture()
+        self.addCleanup(fixture.close)
+        grant = _run(fixture.checkpoints.authorize_source_workspace(fixture.repository))
+        checkpoint = _run(
+            fixture.checkpoints.create(
+                CheckpointCreateRequest(grant, CheckpointId("cp-retire-guards"))
+            )
+        )
+        attempt = RollbackAttempt(
+            attempt_id=RollbackAttemptId("rb-retire-live"),
+            checkpoint_id=checkpoint.checkpoint_id,
+            worktree_id=grant.worktree_id,
+            state=RollbackState.STARTED,
+            started_at=datetime.now(UTC),
+            completed_at=None,
+            expected_fingerprint=checkpoint.source_fingerprint,
+            owner_pid=os.getpid(),
+            owner_token="live-owner",
+        )
+        _run(fixture.checkpoint_store.start_attempt(attempt))
+        before = _source_checkout_evidence(fixture)
+        with self.assertRaises(WorkspaceCheckpointError) as raised:
+            _run(
+                fixture.checkpoints.retire_source_rollback_attempt(
+                    attempt.attempt_id,
+                    checkpoint.checkpoint_id,
+                    target=grant,
+                )
+            )
+        self.assertEqual(raised.exception.kind, CheckpointFailureKind.ALREADY_ROLLING_BACK)
+        self.assertEqual(_source_checkout_evidence(fixture), before)
+        self.assertEqual(
+            _run(fixture.checkpoint_store.active_attempt(grant.worktree_id.value)),
+            attempt,
+        )
+
+        with self.assertRaises(WorkspaceCheckpointError) as raised:
+            _run(
+                fixture.checkpoints.retire_source_rollback_attempt(
+                    RollbackAttemptId("rb-missing"),
+                    checkpoint.checkpoint_id,
+                    target=grant,
+                )
+            )
+        self.assertEqual(raised.exception.kind, CheckpointFailureKind.CONCURRENT_MODIFICATION)
+        with self.assertRaises(WorkspaceCheckpointError) as raised:
+            _run(
+                fixture.checkpoints.retire_source_rollback_attempt(
+                    attempt.attempt_id,
+                    CheckpointId("cp-missing"),
+                    target=grant,
+                )
+            )
+        self.assertEqual(raised.exception.kind, CheckpointFailureKind.UNMANAGED)
+        wrong_grant = replace(grant, head_sha="b" * 40)
+        with self.assertRaises(WorkspaceCheckpointError) as raised:
+            _run(
+                fixture.checkpoints.retire_source_rollback_attempt(
+                    attempt.attempt_id,
+                    checkpoint.checkpoint_id,
+                    target=wrong_grant,
+                )
+            )
+        self.assertEqual(raised.exception.kind, CheckpointFailureKind.IDENTITY_MISMATCH)
+
+    def test_new_source_expected_fingerprint_mismatch_is_terminal_before_restore(self) -> None:
+        fixture = _CheckpointFixture()
+        self.addCleanup(fixture.close)
+        service = self._new_service(
+            fixture,
+            attempt_id_factory=lambda: RollbackAttemptId("rb-fresh-race"),
+        )
+        _run(service.initialize())
+        grant = _run(service.authorize_source_workspace(fixture.repository))
+        checkpoint = _run(
+            service.create(CheckpointCreateRequest(grant, CheckpointId("cp-fresh-race")))
+        )
+        (fixture.repository / "tracked.txt").write_bytes(b"current-before-race\n")
+        preserved = _source_checkout_evidence(fixture)
+        with self.assertRaises(WorkspaceCheckpointError) as raised:
+            _run(
+                service.rollback(
+                    checkpoint.checkpoint_id,
+                    target=grant,
+                    expected_current_fingerprint=CheckpointFingerprint("0" * 64),
+                )
+            )
+        self.assertEqual(raised.exception.kind, CheckpointFailureKind.CONCURRENT_MODIFICATION)
+        attempt = _run(fixture.checkpoint_store.get_attempt(RollbackAttemptId("rb-fresh-race")))
+        self.assertIsNotNone(attempt)
+        assert attempt is not None
+        self.assertIs(attempt.state, RollbackState.FAILED)
+        self.assertIsNone(_run(fixture.checkpoint_store.active_attempt(grant.worktree_id.value)))
+        self.assertEqual(_source_checkout_evidence(fixture), preserved)
+
+    def test_completed_source_attempt_is_never_rewritten_by_retirement(self) -> None:
+        fixture = _CheckpointFixture()
+        self.addCleanup(fixture.close)
+        service = self._new_service(
+            fixture,
+            attempt_id_factory=lambda: RollbackAttemptId("rb-completed-retire"),
+        )
+        _run(service.initialize())
+        grant = _run(service.authorize_source_workspace(fixture.repository))
+        checkpoint = _run(
+            service.create(CheckpointCreateRequest(grant, CheckpointId("cp-completed-retire")))
+        )
+        (fixture.repository / "tracked.txt").write_bytes(b"before-complete\n")
+        completed = _run(service.rollback(checkpoint.checkpoint_id, target=grant))
+        retired = _run(
+            service.retire_source_rollback_attempt(
+                completed.attempt_id,
+                checkpoint.checkpoint_id,
+                target=grant,
+            )
+        )
+        self.assertEqual(retired, completed)
+        self.assertIs(retired.state, RollbackState.COMPLETED)
 
     def test_service_records_indeterminate_verification_and_git_failures(self) -> None:
         fixture = _CheckpointFixture()

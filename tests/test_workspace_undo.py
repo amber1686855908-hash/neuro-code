@@ -164,6 +164,7 @@ class _FakeCheckpointService:
         self.create_calls = 0
         self.rollback_calls = 0
         self.restore_calls = 0
+        self.retire_calls = 0
         self.completed_attempts: set[str] = set()
         self.fail_rollback = False
 
@@ -220,6 +221,19 @@ class _FakeCheckpointService:
             attempt_id=attempt_id,
             state=RollbackState.COMPLETED,
         )
+
+    async def retire_source_rollback_attempt(
+        self,
+        attempt_id: RollbackAttemptId,
+        checkpoint_id: CheckpointId,
+        *,
+        target: SourceWorkspaceCheckpointGrant,
+    ) -> SimpleNamespace:
+        assert checkpoint_id == self.checkpoint.checkpoint_id
+        assert target == self.grant
+        del attempt_id
+        self.retire_calls += 1
+        return SimpleNamespace(state=RollbackState.FAILED)
 
 
 def _plan(root: Path) -> FilesystemAccessPlan:
@@ -346,6 +360,7 @@ class WorkspaceUndoCoordinatorTests(unittest.TestCase):
 
         self.assertIs(result.reason, WorkspaceUndoReason.WORKSPACE_CHANGED)
         self.assertEqual(self.service.rollback_calls, 0)
+        self.assertEqual(self.service.retire_calls, 1)
         self.assertEqual(self.service.restore_calls, 0)
         self.assertEqual(self.service.projection.index_bytes, b"manual-index")
         latest = _run(self.coordinator._ledger.latest("session-1"))

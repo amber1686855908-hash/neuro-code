@@ -198,6 +198,14 @@ class WorkspaceCheckpointApplication(Protocol):
         expected_current_fingerprint: CheckpointFingerprint | None = None,
     ) -> RollbackAttempt: ...
 
+    async def retire_source_rollback_attempt(
+        self,
+        attempt_id: RollbackAttemptId,
+        checkpoint_id: CheckpointId,
+        *,
+        target: SourceWorkspaceCheckpointGrant,
+    ) -> RollbackAttempt: ...
+
     async def reconcile(self) -> tuple[RollbackAttempt, ...]: ...
 
 

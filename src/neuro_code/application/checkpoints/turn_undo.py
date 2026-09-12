@@ -30,6 +30,7 @@ from neuro_code.domain.background_tasks.models import BackgroundTaskStatus
 from neuro_code.domain.checkpoints import (
     CheckpointCreateRequest,
     CheckpointFingerprint,
+    CheckpointId,
     RollbackAttemptId,
     RollbackState,
     SourceWorkspaceCheckpointGrant,
@@ -574,6 +575,19 @@ class TurnWorkspaceCheckpointCoordinator:
             elif current_fingerprint == expected:
                 service_expected = expected
             else:
+                if not await self._retire_source_rollback_attempt(
+                    checkpoint_id,
+                    grant,
+                    attempt_id,
+                ):
+                    # A live owner or a failed identity proof means the old
+                    # attempt is still the only safe durable owner.  Do not
+                    # hide it behind UNAVAILABLE while it may still mutate.
+                    self._turn_association = association
+                    return WorkspaceUndoResult(
+                        WorkspaceUndoState.UNAVAILABLE,
+                        mismatch_reason,
+                    )
                 await self._prepare_unavailable(
                     session_id,
                     association.turn_id,
@@ -601,6 +615,12 @@ class TurnWorkspaceCheckpointCoordinator:
                 )
         except WorkspaceCheckpointError as error:
             reason = self._rollback_reason(error)
+            if error.kind == CheckpointFailureKind.ALREADY_ROLLING_BACK:
+                # Do not replace a still-owned rollback with a terminal
+                # session projection.  The owner must finish or be proven
+                # dead before the exact attempt can be retired.
+                self._turn_association = association
+                return WorkspaceUndoResult(WorkspaceUndoState.UNAVAILABLE, reason)
             await self._prepare_unavailable(
                 session_id,
                 association.turn_id,
@@ -650,6 +670,22 @@ class TurnWorkspaceCheckpointCoordinator:
             )
         self._turn_association = rolled_back
         return WorkspaceUndoResult(WorkspaceUndoState.ROLLED_BACK, restored=True)
+
+    async def _retire_source_rollback_attempt(
+        self,
+        checkpoint_id: CheckpointId,
+        grant: SourceWorkspaceCheckpointGrant,
+        attempt_id: RollbackAttemptId,
+    ) -> bool:
+        try:
+            retired = await self._checkpoint_service.retire_source_rollback_attempt(
+                attempt_id,
+                checkpoint_id,
+                target=grant,
+            )
+        except (AttributeError, TypeError, ValueError, WorkspaceCheckpointError):
+            return False
+        return retired.state in {RollbackState.COMPLETED, RollbackState.FAILED}
 
     async def prepare_verification_handoff(
         self,

@@ -369,7 +369,7 @@ class WorkspaceCheckpointApplicationService:
                     "managed worktree is already locked by another owner",
                     kind=CheckpointFailureKind.LOCKED,
                 )
-            attempt = await self._get_or_start_attempt(
+            attempt, fresh_attempt = await self._get_or_start_attempt(
                 checkpoint,
                 target.worktree_id,
                 attempt_id,
@@ -390,7 +390,90 @@ class WorkspaceCheckpointApplicationService:
                 target,
                 attempt,
                 expected_current_fingerprint=expected_current_fingerprint,
+                fresh_attempt=fresh_attempt,
             )
+
+    async def retire_source_rollback_attempt(
+        self,
+        attempt_id: RollbackAttemptId,
+        checkpoint_id: CheckpointId,
+        *,
+        target: SourceWorkspaceCheckpointGrant,
+    ) -> RollbackAttempt:
+        """Retire one unsafe source rollback without touching the workspace.
+
+        Retirement is intentionally narrower than reconciliation: the caller
+        has already proved that it will not resume this exact operation.  This
+        method re-proves the source grant, refuses a live owner, and performs a
+        compare-and-swap to the existing non-active ``FAILED`` terminal state.
+        It never claims that the checkpoint projection was restored.
+        """
+
+        self._require_initialized()
+        if not isinstance(attempt_id, RollbackAttemptId):
+            raise TypeError("rollback attempt id must be canonical")
+        if not isinstance(checkpoint_id, CheckpointId):
+            raise TypeError("checkpoint id must be canonical")
+        if not isinstance(target, SourceWorkspaceCheckpointGrant):
+            raise TypeError("source rollback retirement requires a source workspace grant")
+        checkpoint = await self._checkpoints.get(checkpoint_id)
+        if checkpoint is None or checkpoint.state is not CheckpointState.READY:
+            raise WorkspaceCheckpointError(
+                "checkpoint is not a ready Neuro Code-owned target",
+                kind=CheckpointFailureKind.UNMANAGED,
+            )
+        expected_target = SourceWorkspaceCheckpointGrant.from_checkpoint(checkpoint)
+        if target != expected_target:
+            raise WorkspaceCheckpointError(
+                "source rollback retirement target does not match the checkpoint identity",
+                kind=CheckpointFailureKind.IDENTITY_MISMATCH,
+            )
+        lock = await self._worktree_lock(target.worktree_id.value)
+        async with lock:
+            await self._prove_source_grant(target, allow_lock_reason=None)
+            attempt = await self._checkpoints.get_attempt(attempt_id)
+            if attempt is None:
+                raise WorkspaceCheckpointError(
+                    "rollback attempt does not exist",
+                    kind=CheckpointFailureKind.CONCURRENT_MODIFICATION,
+                )
+            if attempt.checkpoint_id != checkpoint_id or attempt.worktree_id != target.worktree_id:
+                raise WorkspaceCheckpointError(
+                    "rollback attempt identity does not match the source checkpoint",
+                    kind=CheckpointFailureKind.IDENTITY_MISMATCH,
+                )
+            if attempt.state in {RollbackState.COMPLETED, RollbackState.FAILED}:
+                return attempt
+            if attempt.state not in {RollbackState.STARTED, RollbackState.INDETERMINATE}:
+                raise WorkspaceCheckpointError(
+                    "rollback attempt is not retireable",
+                    kind=CheckpointFailureKind.CONCURRENT_MODIFICATION,
+                )
+            if attempt.owner_token != self._owner_token and _owner_is_alive(attempt.owner_pid):
+                raise WorkspaceCheckpointError(
+                    "another process is still rolling back this source workspace",
+                    kind=CheckpointFailureKind.ALREADY_ROLLING_BACK,
+                )
+            retired = replace(
+                attempt,
+                state=RollbackState.FAILED,
+                completed_at=self._clock().astimezone(UTC),
+                error_kind=str(CheckpointFailureKind.CONCURRENT_MODIFICATION),
+            )
+            try:
+                return await self._checkpoints.compare_and_transition_attempt(
+                    retired,
+                    expected_version=attempt.version,
+                    expected_state=attempt.state,
+                )
+            except WorkspaceCheckpointError:
+                latest = await self._checkpoints.get_attempt(attempt_id)
+                if latest is not None and latest.state in {
+                    RollbackState.COMPLETED,
+                    RollbackState.FAILED,
+                }:
+                    return latest
+                raise
 
     async def reconcile(self) -> tuple[RollbackAttempt, ...]:
         self._require_initialized()
@@ -494,7 +577,7 @@ class WorkspaceCheckpointApplicationService:
         checkpoint: WorkspaceCheckpoint,
         worktree_id: WorktreeId,
         requested_attempt_id: RollbackAttemptId | None,
-    ) -> RollbackAttempt:
+    ) -> tuple[RollbackAttempt, bool]:
         active = await self._checkpoints.active_attempt(worktree_id.value)
         if active is not None:
             if active.checkpoint_id != checkpoint.checkpoint_id:
@@ -514,7 +597,7 @@ class WorkspaceCheckpointApplicationService:
                         kind=CheckpointFailureKind.ALREADY_ROLLING_BACK,
                     )
                 active = await self._claim_attempt(active)
-            return active
+            return active, False
         identifier = requested_attempt_id or self._attempt_id_factory()
         if not isinstance(identifier, RollbackAttemptId):
             raise TypeError("rollback attempt factory must return RollbackAttemptId")
@@ -527,12 +610,12 @@ class WorkspaceCheckpointApplicationService:
                         kind=CheckpointFailureKind.CONCURRENT_MODIFICATION,
                     )
                 if existing.state is RollbackState.COMPLETED:
-                    return existing
+                    return existing, False
                 raise WorkspaceCheckpointError(
                     "requested rollback attempt is no longer resumable",
                     kind=CheckpointFailureKind.CONCURRENT_MODIFICATION,
                 )
-        return await self._checkpoints.start_attempt(
+        started = await self._checkpoints.start_attempt(
             RollbackAttempt(
                 attempt_id=identifier,
                 checkpoint_id=checkpoint.checkpoint_id,
@@ -545,6 +628,7 @@ class WorkspaceCheckpointApplicationService:
                 owner_token=self._owner_token,
             )
         )
+        return started, True
 
     async def _claim_attempt(self, attempt: RollbackAttempt) -> RollbackAttempt:
         return await self._checkpoints.compare_and_transition_attempt(
@@ -566,9 +650,13 @@ class WorkspaceCheckpointApplicationService:
         attempt: RollbackAttempt,
         *,
         expected_current_fingerprint: CheckpointFingerprint | None = None,
+        fresh_attempt: bool = False,
     ) -> RollbackAttempt:
         reason = f"neuro-code-checkpoint:{attempt.attempt_id.value}"
-        destructive_started = False
+        # A newly claimed source attempt has not written anything before its
+        # first restore call.  Existing/reclaimed attempts remain conservative:
+        # a previous owner may have entered restore before process death.
+        destructive_started = not fresh_attempt
         try:
             _, status = await self._prove_target(target, allow_lock_reason=reason)
             if status.head_sha != checkpoint.head_sha:
@@ -585,12 +673,6 @@ class WorkspaceCheckpointApplicationService:
                 # previous owner may already have entered the destructive
                 # phase before dying.
                 destructive_started = True
-            if isinstance(target, SourceWorkspaceCheckpointGrant):
-                # Source checkouts have no managed-worktree lock.  Once their
-                # identity proof has passed, any later inspection or restore
-                # failure must be treated conservatively as potentially
-                # destructive during reconciliation.
-                destructive_started = True
             actual = await self._state.inspect(target)
             actual_fingerprint = workspace_projection_fingerprint(target, actual)
             if (
@@ -602,6 +684,7 @@ class WorkspaceCheckpointApplicationService:
                     kind=CheckpointFailureKind.CONCURRENT_MODIFICATION,
                 )
             if actual_fingerprint != checkpoint.source_fingerprint:
+                destructive_started = True
                 await self._state.restore(target, projection)
                 actual = await self._state.inspect(target)
                 actual_fingerprint = workspace_projection_fingerprint(target, actual)
@@ -658,6 +741,7 @@ class WorkspaceCheckpointApplicationService:
                 CheckpointFailureKind.LOCKED,
                 CheckpointFailureKind.IDENTITY_MISMATCH,
                 CheckpointFailureKind.UNMANAGED,
+                CheckpointFailureKind.CONCURRENT_MODIFICATION,
             }
             else RollbackState.INDETERMINATE
         )
