@@ -14,6 +14,10 @@ from neuro_code.infrastructure.persistence.sqlite_session import SqliteSessionSt
 from neuro_code.shared.errors import SessionError
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+# A real ACP subprocess may need longer than a unit-test-sized deadline to
+# reach its next protocol response on a busy cross-platform runner.
+ACP_SUBPROCESS_POSITIVE_TIMEOUT_SECONDS = 30.0
+ACP_SUBPROCESS_CLEANUP_TIMEOUT_SECONDS = 3.0
 
 
 class RawAcpProcess:
@@ -84,7 +88,11 @@ proxy_mode = "direct"
             if task.done() and self._readline_task is task:
                 self._readline_task = None
 
-    async def response(self, *, wait_seconds: float = 5.0) -> dict[str, Any]:
+    async def response(
+        self,
+        *,
+        wait_seconds: float = ACP_SUBPROCESS_POSITIVE_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
         line = await self._next_line(wait_seconds=wait_seconds)
         if not line:
             raise AssertionError("ACP process closed stdout before returning a response")
@@ -124,7 +132,9 @@ proxy_mode = "direct"
         self.stdin.close()
         await self.stdin.wait_closed()
         try:
-            await asyncio.wait_for(self.process.wait(), timeout=3)
+            await asyncio.wait_for(
+                self.process.wait(), timeout=ACP_SUBPROCESS_CLEANUP_TIMEOUT_SECONDS
+            )
         except TimeoutError:
             self.process.terminate()
             await self.process.wait()
