@@ -410,13 +410,14 @@ def _source_checkout_evidence(fixture: _CheckpointFixture) -> tuple[object, ...]
 
 
 def _source_mutation_plan(root: Path) -> FilesystemAccessPlan:
+    canonical_root = root.expanduser().resolve(strict=False)
     return FilesystemAccessPlan(
         "update_file",
         (
             FilesystemAccessTarget(
                 requested_path="tracked.txt",
-                canonical_path=root / "tracked.txt",
-                owning_workspace_root=root,
+                canonical_path=canonical_root / "tracked.txt",
+                owning_workspace_root=canonical_root,
                 policy_path="tracked.txt",
                 operation=FilesystemAccessOperation.UPDATE,
                 exists=True,

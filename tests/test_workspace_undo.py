@@ -242,13 +242,14 @@ class _FakeCheckpointService:
 
 
 def _plan(root: Path) -> FilesystemAccessPlan:
+    canonical_root = root.expanduser().resolve(strict=False)
     return FilesystemAccessPlan(
         "update_file",
         (
             FilesystemAccessTarget(
                 requested_path="tracked.py",
-                canonical_path=root / "tracked.py",
-                owning_workspace_root=root,
+                canonical_path=canonical_root / "tracked.py",
+                owning_workspace_root=canonical_root,
                 policy_path="tracked.py",
                 operation=FilesystemAccessOperation.UPDATE,
                 exists=True,
@@ -449,11 +450,15 @@ class WorkspaceUndoCoordinatorTests(unittest.TestCase):
         self._prepare()
         available = _run(self.coordinator._ledger.latest("session-1"))
         assert available is not None
+        self.assertIs(available.state, WorkspaceUndoState.AVAILABLE)
+        self.assertIsNotNone(available.checkpoint_id)
+        self.assertIsNotNone(available.expected_current_fingerprint)
+        expected_current_fingerprint = available.expected_current_fingerprint
         attempt_id = RollbackAttemptId("rb-interrupted")
         rolling_back = replace(
             available,
             state=WorkspaceUndoState.ROLLING_BACK,
-            expected_current_fingerprint=available.expected_current_fingerprint,
+            expected_current_fingerprint=expected_current_fingerprint,
             rollback_attempt_id=attempt_id,
         )
         self.assertTrue(_run(self.store.claim_workspace_undo(available, rolling_back)))
@@ -479,6 +484,9 @@ class WorkspaceUndoCoordinatorTests(unittest.TestCase):
         self._prepare()
         available = _run(self.coordinator._ledger.latest("session-1"))
         assert available is not None
+        self.assertIs(available.state, WorkspaceUndoState.AVAILABLE)
+        self.assertIsNotNone(available.checkpoint_id)
+        self.assertIsNotNone(available.expected_current_fingerprint)
         rolling_back = replace(
             available,
             state=WorkspaceUndoState.ROLLING_BACK,
