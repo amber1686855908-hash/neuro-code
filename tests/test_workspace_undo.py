@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from neuro_code.application.checkpoints.turn_undo import (
     TurnWorkspaceCheckpointCoordinator,
     WorkspaceUndoPreparationError,
+    _WorkspaceUndoLedger,
     binding_has_live_mutators,
 )
 from neuro_code.application.ports.checkpoints import (
@@ -39,6 +40,7 @@ from neuro_code.domain.conversation.events import AgentEvent, AgentEventKind
 from neuro_code.domain.workspace_undo import (
     WorkspaceUndoAssociation,
     WorkspaceUndoReason,
+    WorkspaceUndoResult,
     WorkspaceUndoState,
 )
 from neuro_code.domain.worktree import WorktreeRepositoryIdentity
@@ -167,6 +169,7 @@ class _FakeCheckpointService:
         self.retire_calls = 0
         self.completed_attempts: set[str] = set()
         self.fail_rollback = False
+        self.checkpoint_error: WorkspaceCheckpointError | None = None
 
     async def initialize(self) -> None:
         return
@@ -186,6 +189,8 @@ class _FakeCheckpointService:
 
     async def create(self, request: object) -> SimpleNamespace:
         assert request.worktree == self.grant  # type: ignore[union-attr]
+        if self.checkpoint_error is not None:
+            raise self.checkpoint_error
         self.create_calls += 1
         return self.checkpoint
 
@@ -527,6 +532,276 @@ class WorkspaceUndoCoordinatorTests(unittest.TestCase):
             )
         self.assertEqual(self.service.create_calls, 0)
 
+    def test_disabled_and_invalid_inputs_are_safe_noops(self) -> None:
+        disabled = TurnWorkspaceCheckpointCoordinator(
+            checkpoint_service=self.service,  # type: ignore[arg-type]
+            store=self.store,  # type: ignore[arg-type]
+            source_workspace=self.root,
+            enabled=False,
+        )
+        _run(disabled.initialize())
+        _run(
+            disabled.prepare(
+                session_id="session-1",
+                turn_id="turn-1",
+                plan=_plan(self.root),
+                client_file_system=None,
+                client_terminal=None,
+            )
+        )
+        disabled_result = _run(disabled.undo("session-1"))
+        self.assertIs(disabled_result.reason, WorkspaceUndoReason.CAPABILITY_UNAVAILABLE)
+
+        for session_id, turn_id in (
+            (None, "turn-1"),
+            ("", "turn-1"),
+            ("session-1", None),
+        ):
+            _run(
+                self.coordinator.prepare(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    plan=_plan(self.root),
+                    client_file_system=None,
+                    client_terminal=None,
+                )
+            )
+        self.assertEqual(self.store.events, [])
+
+    def test_capability_initialization_failure_marks_next_turn_unavailable(self) -> None:
+        service = _FakeCheckpointService(self.root)
+
+        async def fail_initialize() -> None:
+            raise RuntimeError("checkpoint capability unavailable")
+
+        service.initialize = fail_initialize  # type: ignore[method-assign]
+        coordinator = TurnWorkspaceCheckpointCoordinator(
+            checkpoint_service=service,  # type: ignore[arg-type]
+            store=self.store,  # type: ignore[arg-type]
+            source_workspace=self.root,
+        )
+        _run(coordinator.initialize())
+        _run(
+            coordinator.prepare(
+                session_id="session-1",
+                turn_id="turn-1",
+                plan=_plan(self.root),
+                client_file_system=None,
+                client_terminal=None,
+            )
+        )
+        latest = _run(coordinator._ledger.latest("session-1"))
+        self.assertIsNotNone(latest)
+        assert latest is not None
+        self.assertIs(latest.state, WorkspaceUndoState.UNAVAILABLE)
+        self.assertIs(latest.reason, WorkspaceUndoReason.CAPABILITY_UNAVAILABLE)
+
+    def test_prepare_uses_event_sink_and_rejects_ignored_targets(self) -> None:
+        captured: list[tuple[AgentEventKind, dict[str, object]]] = []
+
+        async def ignored_paths(
+            grant: SourceWorkspaceCheckpointGrant,
+            paths: tuple[str, ...],
+        ) -> tuple[str, ...]:
+            assert grant == self.service.grant
+            assert paths == ("tracked.py",)
+            return paths
+
+        async def event_sink(kind: AgentEventKind, data: dict[str, object]) -> None:
+            captured.append((kind, data))
+
+        self.service.ignored_source_paths = ignored_paths  # type: ignore[method-assign]
+        _run(
+            self.coordinator.prepare(
+                session_id="session-1",
+                turn_id="turn-1",
+                plan=_plan(self.root),
+                client_file_system=None,
+                client_terminal=None,
+                event_sink=event_sink,
+            )
+        )
+        self.assertEqual(self.store.events, [])
+        self.assertEqual(len(captured), 1)
+        self.assertIs(captured[0][0], AgentEventKind.WORKSPACE_UNDO_STATE)
+        self.assertEqual(captured[0][1]["reason"], WorkspaceUndoReason.IGNORED_TARGET.value)
+
+    def test_checkpoint_failure_kinds_map_to_bounded_undo_reasons(self) -> None:
+        for kind, expected in (
+            (
+                CheckpointFailureKind.CHECKPOINT_TOO_LARGE,
+                WorkspaceUndoReason.CHECKPOINT_TOO_LARGE,
+            ),
+            (
+                CheckpointFailureKind.UNSUPPORTED_WORKSPACE_STATE,
+                WorkspaceUndoReason.UNSUPPORTED_WORKSPACE,
+            ),
+            (CheckpointFailureKind.COMMAND_FAILED, WorkspaceUndoReason.CHECKPOINT_FAILED),
+        ):
+            with self.subTest(kind=kind):
+                service = _FakeCheckpointService(self.root)
+                store = _MemorySessionStore()
+                service.checkpoint_error = WorkspaceCheckpointError("checkpoint failed", kind=kind)
+                coordinator = TurnWorkspaceCheckpointCoordinator(
+                    checkpoint_service=service,  # type: ignore[arg-type]
+                    store=store,  # type: ignore[arg-type]
+                    source_workspace=self.root,
+                )
+                _run(coordinator.initialize())
+                _run(
+                    coordinator.prepare(
+                        session_id="session-1",
+                        turn_id="turn-1",
+                        plan=_plan(self.root),
+                        client_file_system=None,
+                        client_terminal=None,
+                    )
+                )
+                latest = _run(coordinator._ledger.latest("session-1"))
+                self.assertIsNotNone(latest)
+                assert latest is not None
+                self.assertIs(latest.reason, expected)
+
+    def test_undo_claim_failure_and_race_remain_fail_closed(self) -> None:
+        self._prepare()
+        _run(self.coordinator.seal_turn("session-1", "turn-1"))
+        self.store.fail_on_append = self.store.append_count + 1
+        failed = _run(self.coordinator.undo("session-1"))
+        self.assertIs(failed.reason, WorkspaceUndoReason.PERSISTENCE_FAILED)
+        self.assertEqual(self.service.rollback_calls, 0)
+
+        class _RollingRaceStore(_MemorySessionStore):
+            def __init__(self, *, publish_rolling: bool) -> None:
+                super().__init__()
+                self.publish_rolling = publish_rolling
+                self.expected: WorkspaceUndoAssociation | None = None
+                self.rolling: WorkspaceUndoAssociation | None = None
+
+            async def claim_workspace_undo(
+                self,
+                expected: WorkspaceUndoAssociation,
+                rolling_back: WorkspaceUndoAssociation,
+            ) -> bool:
+                self.expected = expected
+                self.rolling = rolling_back
+                if self.publish_rolling:
+                    sequence = await self.next_event_sequence(expected.session_id)
+                    self._append_event(
+                        AgentEvent.create(
+                            sequence,
+                            AgentEventKind.WORKSPACE_UNDO_STATE,
+                            rolling_back.to_event_data(),
+                        )
+                    )
+                return False
+
+        for publish_rolling, expected_reason in (
+            (False, WorkspaceUndoReason.CONCURRENT_MODIFICATION),
+            (True, WorkspaceUndoReason.ROLLBACK_INDETERMINATE),
+        ):
+            with self.subTest(publish_rolling=publish_rolling):
+                store = _RollingRaceStore(publish_rolling=publish_rolling)
+                service = _FakeCheckpointService(self.root)
+                coordinator = TurnWorkspaceCheckpointCoordinator(
+                    checkpoint_service=service,  # type: ignore[arg-type]
+                    store=store,  # type: ignore[arg-type]
+                    source_workspace=self.root,
+                )
+                _run(coordinator.initialize())
+                _run(
+                    coordinator.prepare(
+                        session_id="session-1",
+                        turn_id="turn-1",
+                        plan=_plan(self.root),
+                        client_file_system=None,
+                        client_terminal=None,
+                    )
+                )
+                available = _run(coordinator._ledger.latest("session-1"))
+                assert available is not None
+                sealed = replace(
+                    available,
+                    expected_current_fingerprint=CheckpointFingerprint("a" * 64),
+                )
+                store.events.append(
+                    AgentEvent.create(
+                        2,
+                        AgentEventKind.WORKSPACE_UNDO_STATE,
+                        sealed.to_event_data(),
+                    ).to_dict()
+                )
+                result = _run(coordinator.undo("session-1"))
+                self.assertIs(result.reason, expected_reason)
+
+    def test_ledger_handles_malformed_events_and_missing_atomic_operations(self) -> None:
+        association = WorkspaceUndoAssociation(
+            session_id="session-1",
+            turn_id="turn-1",
+            state=WorkspaceUndoState.AVAILABLE,
+            updated_at=datetime.now(UTC),
+            checkpoint_id=CheckpointId("cp-fixture"),
+        )
+
+        class _ReadOnlyStore:
+            def __init__(self, events: list[object]) -> None:
+                self.events = events
+
+            async def load_events(self, session_id: str) -> list[object]:
+                del session_id
+                return self.events
+
+        valid_event = AgentEvent.create(
+            1,
+            AgentEventKind.WORKSPACE_UNDO_STATE,
+            association.to_event_data(),
+        ).to_dict()
+        for malformed in (
+            [object()],
+            [{**valid_event, "created_at": datetime.now(UTC).replace(tzinfo=None)}],
+            [{**valid_event, "sequence": True}],
+            [{**valid_event, "data": {}}],
+        ):
+            with self.subTest(malformed=malformed):
+                ledger = _WorkspaceUndoLedger(_ReadOnlyStore(malformed))  # type: ignore[arg-type]
+                with self.assertRaises(WorkspaceUndoPreparationError):
+                    _run(ledger.latest("session-1"))
+
+        rolling_back = replace(
+            association,
+            state=WorkspaceUndoState.ROLLING_BACK,
+            expected_current_fingerprint=CheckpointFingerprint("a" * 64),
+            rollback_attempt_id=RollbackAttemptId("rb-fixture"),
+        )
+        sealed = replace(
+            association,
+            expected_current_fingerprint=CheckpointFingerprint("a" * 64),
+        )
+        ledger = _WorkspaceUndoLedger(_ReadOnlyStore([]))  # type: ignore[arg-type]
+        with self.assertRaises(WorkspaceUndoPreparationError):
+            _run(ledger.claim(association, rolling_back))
+        with self.assertRaises(WorkspaceUndoPreparationError):
+            _run(ledger.seal(association, sealed))
+
+    def test_rollback_and_checkpoint_error_projection_is_bounded(self) -> None:
+        cases = (
+            (CheckpointFailureKind.HEAD_MISMATCH, WorkspaceUndoReason.HEAD_CHANGED),
+            (CheckpointFailureKind.CONCURRENT_MODIFICATION, WorkspaceUndoReason.WORKSPACE_CHANGED),
+            (
+                CheckpointFailureKind.ALREADY_ROLLING_BACK,
+                WorkspaceUndoReason.ROLLBACK_INDETERMINATE,
+            ),
+            (
+                CheckpointFailureKind.ROLLBACK_VERIFICATION_FAILED,
+                WorkspaceUndoReason.ROLLBACK_INDETERMINATE,
+            ),
+            (CheckpointFailureKind.COMMAND_FAILED, WorkspaceUndoReason.ROLLBACK_INDETERMINATE),
+            (CheckpointFailureKind.IDENTITY_MISMATCH, WorkspaceUndoReason.ROLLBACK_FAILED),
+        )
+        for kind, expected in cases:
+            with self.subTest(kind=kind):
+                error = WorkspaceCheckpointError("bounded error", kind=kind)
+                self.assertIs(self.coordinator._rollback_reason(error), expected)
+
     def test_restart_can_undo_available_checkpoint(self) -> None:
         self._prepare()
         restarted = TurnWorkspaceCheckpointCoordinator(
@@ -611,6 +886,158 @@ class WorkspaceUndoDomainTests(unittest.TestCase):
                 verification_handoff_consumed=True,
             )
 
+    def test_association_states_round_trip_their_durable_optional_fields(self) -> None:
+        timestamp = datetime(2026, 9, 12, 12, 0, tzinfo=UTC)
+        available = WorkspaceUndoAssociation(
+            session_id="session-1",
+            turn_id="turn-1",
+            state=WorkspaceUndoState.AVAILABLE,
+            updated_at=timestamp,
+            checkpoint_id=CheckpointId("cp-fixture"),
+        )
+        rolling_back = replace(
+            available,
+            state=WorkspaceUndoState.ROLLING_BACK,
+            expected_current_fingerprint=CheckpointFingerprint("a" * 64),
+            rollback_attempt_id=RollbackAttemptId("rb-fixture"),
+        )
+        unavailable = WorkspaceUndoAssociation(
+            session_id="session-1",
+            turn_id="turn-1",
+            state=WorkspaceUndoState.UNAVAILABLE,
+            updated_at=timestamp,
+            reason=WorkspaceUndoReason.CAPABILITY_UNAVAILABLE,
+        )
+        rolled_back = replace(
+            rolling_back,
+            state=WorkspaceUndoState.ROLLED_BACK,
+            verification_mutation_id="undo-mutation",
+        )
+
+        for association in (available, rolling_back, unavailable, rolled_back):
+            with self.subTest(state=association.state):
+                restored = WorkspaceUndoAssociation.from_event_data(
+                    association.session_id,
+                    association.to_event_data(),
+                    updated_at=timestamp,
+                )
+                self.assertEqual(restored, association)
+
+    def test_association_rejects_untrusted_types_bounds_and_state_combinations(self) -> None:
+        timestamp = datetime.now(UTC)
+        available = WorkspaceUndoAssociation(
+            session_id="session-1",
+            turn_id="turn-1",
+            state=WorkspaceUndoState.AVAILABLE,
+            updated_at=timestamp.replace(tzinfo=UTC),
+            checkpoint_id=CheckpointId("cp-fixture"),
+        )
+        expected = CheckpointFingerprint("a" * 64)
+        rolling_back = replace(
+            available,
+            state=WorkspaceUndoState.ROLLING_BACK,
+            expected_current_fingerprint=expected,
+            rollback_attempt_id=RollbackAttemptId("rb-fixture"),
+        )
+        unavailable = WorkspaceUndoAssociation(
+            session_id="session-1",
+            turn_id="turn-1",
+            state=WorkspaceUndoState.UNAVAILABLE,
+            updated_at=timestamp.replace(tzinfo=UTC),
+            reason=WorkspaceUndoReason.NO_CHECKPOINT,
+        )
+        rolled_back = replace(
+            rolling_back,
+            state=WorkspaceUndoState.ROLLED_BACK,
+            verification_mutation_id="undo-mutation",
+        )
+
+        type_cases = (
+            {"session_id": ""},
+            {"turn_id": "\x00"},
+            {"session_id": "é" * 129},
+            {"state": "available"},
+            {"updated_at": datetime.now(UTC).replace(tzinfo=None)},
+            {"checkpoint_id": "cp-fixture"},
+            {"reason": "no_checkpoint"},
+            {"expected_current_fingerprint": "a" * 64},
+            {"rollback_attempt_id": "rb-fixture"},
+            {"verification_mutation_id": object()},
+            {"verification_handoff_consumed": 1},
+        )
+        for changes in type_cases:
+            with self.subTest(changes=changes), self.assertRaises((TypeError, ValueError)):
+                replace(available, **changes)
+
+        invalid_states = (
+            (available, {"checkpoint_id": None}),
+            (available, {"reason": WorkspaceUndoReason.NO_CHECKPOINT}),
+            (available, {"verification_mutation_id": "mutation"}),
+            (available, {"rollback_attempt_id": RollbackAttemptId("rb-extra")}),
+            (rolling_back, {"checkpoint_id": None}),
+            (rolling_back, {"reason": WorkspaceUndoReason.NO_CHECKPOINT}),
+            (rolling_back, {"expected_current_fingerprint": None}),
+            (rolling_back, {"rollback_attempt_id": None}),
+            (rolling_back, {"verification_mutation_id": "mutation"}),
+            (rolling_back, {"verification_handoff_consumed": True}),
+            (unavailable, {"reason": None}),
+            (unavailable, {"checkpoint_id": CheckpointId("cp-extra")}),
+            (unavailable, {"verification_mutation_id": "mutation"}),
+            (unavailable, {"verification_handoff_consumed": True}),
+            (unavailable, {"expected_current_fingerprint": expected}),
+            (unavailable, {"rollback_attempt_id": RollbackAttemptId("rb-extra")}),
+            (rolled_back, {"checkpoint_id": None}),
+            (rolled_back, {"reason": WorkspaceUndoReason.NO_CHECKPOINT}),
+            (rolled_back, {"verification_mutation_id": None}),
+        )
+        for association, changes in invalid_states:
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                replace(association, **changes)
+
+    def test_event_data_rejects_malformed_fields_and_unknown_states(self) -> None:
+        association = WorkspaceUndoAssociation(
+            session_id="session-1",
+            turn_id="turn-1",
+            state=WorkspaceUndoState.AVAILABLE,
+            updated_at=datetime.now(UTC),
+            checkpoint_id=CheckpointId("cp-fixture"),
+        )
+        base = association.to_event_data()
+        malformed = (
+            [],
+            {**base, "schema": 2},
+            {**base, "turn_id": 1},
+            {**base, "state": 1},
+            {**base, "checkpoint_id": 1},
+            {**base, "reason": 1},
+            {**base, "verification_mutation_id": 1},
+            {**base, "expected_current_fingerprint": 1},
+            {**base, "rollback_attempt_id": 1},
+            {**base, "verification_handoff_consumed": 1},
+            {**base, "state": "unknown"},
+        )
+        for data in malformed:
+            with self.subTest(data=data), self.assertRaises((TypeError, ValueError)):
+                WorkspaceUndoAssociation.from_event_data(
+                    "session-1",
+                    data,
+                    updated_at=datetime.now(UTC),
+                )
+
+    def test_result_projection_rejects_invalid_state_and_restore_combinations(self) -> None:
+        with self.assertRaises(TypeError):
+            WorkspaceUndoResult("available")  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            WorkspaceUndoResult(WorkspaceUndoState.AVAILABLE, reason="no_checkpoint")  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            WorkspaceUndoResult(WorkspaceUndoState.AVAILABLE, restored=1)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            WorkspaceUndoResult(WorkspaceUndoState.AVAILABLE, restored=True)
+        with self.assertRaises(ValueError):
+            WorkspaceUndoResult(WorkspaceUndoState.UNAVAILABLE, restored=True)
+        with self.assertRaises(ValueError):
+            WorkspaceUndoResult(WorkspaceUndoState.ROLLED_BACK)
+
 
 class WorkspaceUndoMutatorProbeTests(unittest.TestCase):
     def test_probe_detects_live_resources_without_terminating_them(self) -> None:
@@ -641,6 +1068,20 @@ class WorkspaceUndoMutatorProbeTests(unittest.TestCase):
         self.assertEqual(terminal.wait_calls, 1)
         self.assertEqual(terminal.close_calls, 0)
 
+    def test_probe_treats_terminal_probe_failure_as_live(self) -> None:
+        terminal = _ProbeTerminalSession(
+            exit_code=None,
+            error=OSError("terminal state unavailable"),
+        )
+        terminals = _ProbeTerminalManager((terminal,))
+
+        live_background, live_terminal = _run(binding_has_live_mutators(None, terminals))
+
+        self.assertFalse(live_background)
+        self.assertTrue(live_terminal)
+        self.assertEqual(terminal.wait_calls, 1)
+        self.assertEqual(terminal.close_calls, 0)
+
 
 class _ProbeBackgroundManager:
     def __init__(self, snapshots: tuple[object, ...]) -> None:
@@ -651,14 +1092,17 @@ class _ProbeBackgroundManager:
 
 
 class _ProbeTerminalSession:
-    def __init__(self, *, exit_code: int | None) -> None:
+    def __init__(self, *, exit_code: int | None, error: Exception | None = None) -> None:
         self.exit_code = exit_code
+        self.error = error
         self.wait_calls = 0
         self.close_calls = 0
 
     async def wait(self, *, timeout_seconds: float | None = None) -> int | None:
         del timeout_seconds
         self.wait_calls += 1
+        if self.error is not None:
+            raise self.error
         return self.exit_code
 
     async def close(self) -> None:

@@ -2390,6 +2390,125 @@ class WorkspaceCheckpointServiceBoundaryTests(unittest.TestCase):
         self.assertEqual(retired, completed)
         self.assertIs(retired.state, RollbackState.COMPLETED)
 
+    def test_source_retirement_guards_identity_and_handles_terminal_cas_races(self) -> None:
+        fixture = _CheckpointFixture()
+        self.addCleanup(fixture.close)
+        grant = _run(fixture.checkpoints.authorize_source_workspace(fixture.repository))
+        first = _run(
+            fixture.checkpoints.create(
+                CheckpointCreateRequest(grant, CheckpointId("cp-retire-boundary-a"))
+            )
+        )
+
+        with self.assertRaises(TypeError):
+            _run(
+                fixture.checkpoints.retire_source_rollback_attempt(
+                    "raw",  # type: ignore[arg-type]
+                    first.checkpoint_id,
+                    target=grant,
+                )
+            )
+        with self.assertRaises(TypeError):
+            _run(
+                fixture.checkpoints.retire_source_rollback_attempt(
+                    RollbackAttemptId("rb-retire-boundary"),
+                    "raw",  # type: ignore[arg-type]
+                    target=grant,
+                )
+            )
+        with self.assertRaises(TypeError):
+            _run(
+                fixture.checkpoints.retire_source_rollback_attempt(
+                    RollbackAttemptId("rb-retire-boundary"),
+                    first.checkpoint_id,
+                    target=fixture.snapshot.handle,  # type: ignore[arg-type]
+                )
+            )
+
+        capturing = _run(
+            fixture.checkpoint_store.compare_and_transition_checkpoint(
+                replace(first, state=CheckpointState.CAPTURING),
+                expected_version=first.version,
+                expected_state=CheckpointState.READY,
+            )
+        )
+        with self.assertRaises(WorkspaceCheckpointError) as raised:
+            _run(
+                fixture.checkpoints.retire_source_rollback_attempt(
+                    RollbackAttemptId("rb-retire-boundary"),
+                    capturing.checkpoint_id,
+                    target=grant,
+                )
+            )
+        self.assertEqual(raised.exception.kind, CheckpointFailureKind.UNMANAGED)
+
+        first = _run(
+            fixture.checkpoints.create(
+                CheckpointCreateRequest(grant, CheckpointId("cp-retire-boundary-b"))
+            )
+        )
+        second = _run(
+            fixture.checkpoints.create(
+                CheckpointCreateRequest(grant, CheckpointId("cp-retire-boundary-c"))
+            )
+        )
+        attempt = _run(
+            fixture.checkpoint_store.start_attempt(
+                RollbackAttempt(
+                    attempt_id=RollbackAttemptId("rb-retire-boundary"),
+                    checkpoint_id=first.checkpoint_id,
+                    worktree_id=grant.worktree_id,
+                    state=RollbackState.STARTED,
+                    started_at=datetime.now(UTC),
+                    completed_at=None,
+                    expected_fingerprint=first.source_fingerprint,
+                    owner_pid=None,
+                    owner_token="interrupted-owner",
+                )
+            )
+        )
+        with self.assertRaises(WorkspaceCheckpointError) as raised:
+            _run(
+                fixture.checkpoints.retire_source_rollback_attempt(
+                    attempt.attempt_id,
+                    second.checkpoint_id,
+                    target=grant,
+                )
+            )
+        self.assertEqual(raised.exception.kind, CheckpointFailureKind.IDENTITY_MISMATCH)
+
+        terminal = replace(
+            attempt,
+            state=RollbackState.FAILED,
+            completed_at=datetime.now(UTC),
+            error_kind=str(CheckpointFailureKind.CONCURRENT_MODIFICATION),
+        )
+        cas_error = WorkspaceCheckpointError(
+            "retirement lost a compare-and-swap race",
+            kind=CheckpointFailureKind.CONCURRENT_MODIFICATION,
+        )
+        with (
+            patch.object(
+                fixture.checkpoint_store,
+                "compare_and_transition_attempt",
+                side_effect=cas_error,
+            ),
+            patch.object(
+                fixture.checkpoint_store,
+                "get_attempt",
+                side_effect=(attempt, terminal),
+            ),
+        ):
+            retired = _run(
+                fixture.checkpoints.retire_source_rollback_attempt(
+                    attempt.attempt_id,
+                    first.checkpoint_id,
+                    target=grant,
+                )
+            )
+        self.assertEqual(retired, terminal)
+        self.assertIs(retired.state, RollbackState.FAILED)
+
     def test_service_records_indeterminate_verification_and_git_failures(self) -> None:
         fixture = _CheckpointFixture()
         self.addCleanup(fixture.close)
